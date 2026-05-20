@@ -1,5 +1,5 @@
 #app/main.py
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
@@ -95,6 +95,10 @@ socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
 @app.get("/pingtest")
 async def pingtest():
     return {"status": "ok"}
+
+@app.head("/pingtest")
+async def pingtest_head():
+    return Response(status_code=200)
 
 app.add_middleware(SessionMiddleware, secret_key="supersecret")
 # CORS setup
