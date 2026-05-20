@@ -80,7 +80,7 @@ async def list_gmail_accounts(
     if not ObjectId.is_valid(company_id):
         raise HTTPException(status_code=400, detail="Invalid company ID")
     
-    # ✅ check membership
+    # Check membership
     membership = await db["memberships"].find_one(
         {"user_id": current_user["_id"], "company_id": ObjectId(company_id)}
     )
@@ -115,7 +115,7 @@ async def list_gmail_accounts(
                 }
         accounts.append(account_data)
 
-    # ✅ fetch stores properly
+    # Fetch stores properly
     stores_cursor = db.shopify_cred.find({"user_id": current_user["_id"]})
     stores = []
 
@@ -371,7 +371,7 @@ async def google_oauth_callback(
 
     history_id = watch_response["historyId"]
 
-    # ✅ Ensure Pub/Sub subscription exists
+    # Ensure Pub/Sub subscription exists
     service_account_info = json.loads(settings.SERVICE_ACCOUNT_JSON)
 
     credentials = service_account.Credentials.from_service_account_info(
@@ -418,7 +418,7 @@ async def google_oauth_callback(
         "token_issued_at": datetime.utcnow(),
         "provider": "google",
         "history_id": history_id,
-        "subscription": subscription_path,  # ✅ store subscription
+        "subscription": subscription_path,
     }
 
     if existing:
@@ -456,7 +456,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
         logger.warning("Pub/Sub payload missing emailAddress or historyId: %s", data)
         return Response(status_code=200)
 
-    logger.info("📩 Gmail change detected", extra={"email": email_address, "historyId": history_id})
+    logger.info("Gmail change detected", extra={"email": email_address, "historyId": history_id})
 
     account = await db["gmail_accounts"].find_one({"email": email_address})
     if not account:
@@ -643,8 +643,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
         {"$set": {"history_id": history_id}}
     )
 
-    logger.info("✅ Processed Gmail Pub/Sub for %s up to historyId=%s", email_address, history_id)
+    logger.info("Processed Gmail Pub/Sub for %s up to historyId=%s", email_address, history_id)
     return Response(status_code=200)
-
 
 

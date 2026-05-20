@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
 import os
+import certifi
 from dotenv import load_dotenv
 load_dotenv()  # Load from .env at startup
 from app.db.mongodb import get_database
@@ -23,8 +24,8 @@ sio = socketio.AsyncServer(
 )
 
 # CORS origins
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
-DB_NAME = os.getenv("DB_NAME", "attentify")
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017").strip()
+DB_NAME = os.getenv("DB_NAME", "attentify").strip()
 from starlette.middleware.sessions import SessionMiddleware
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -65,21 +66,25 @@ async def set_gmail_watches_periodically():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        mongo_client = AsyncIOMotorClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+        mongo_options = {"serverSelectionTimeoutMS": 20000}
+        if MONGO_URL.startswith("mongodb+srv://"):
+            mongo_options["tlsCAFile"] = certifi.where()
+
+        mongo_client = AsyncIOMotorClient(MONGO_URL, **mongo_options)
         # Try to ping the server to check connection
         await mongo_client.admin.command("ping")
-        print("✅ Connected to MongoDB")
+        print("Connected to MongoDB")
         app.state.mongo_client = mongo_client
         app.state.db = mongo_client[DB_NAME]
     except Exception as e:
-        print("❌ Failed to connect to MongoDB:", e)
+        print("Failed to connect to MongoDB:", e)
         raise e  # Optional: prevent app from starting if DB fails
 
     asyncio.create_task(set_gmail_watches_periodically())
 
     yield  # App runs
 
-    print("🔌 Closing MongoDB connection")
+    print("Closing MongoDB connection")
     mongo_client.close()
 
 app = FastAPI(title="Attentify APP", lifespan=lifespan)

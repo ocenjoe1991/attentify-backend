@@ -172,7 +172,7 @@ async def accept_invitation(db=Depends(get_database), current_user=Depends(get_c
     return {
         "token": token,
         "user": {
-            "id": str(current_user["_id"]),  # ✅ FIXED: convert ObjectId to str
+            "id": str(current_user["_id"]),
             "name": f"{current_user['first_name']} {current_user['last_name']}".strip(),
             "email": current_user["email"],
             "company_id": str(invitation["company_id"]),

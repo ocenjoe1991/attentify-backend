@@ -144,7 +144,7 @@ def shopify_callback(request: Request):
         {"shop": shop, "user_id": ObjectId(user_id)},
         {
             "$set": {
-                "shop": shop,  # ← add this
+                "shop": shop,
                 "access_token": access_token,
                 "status": "connected",
                 "user_id": ObjectId(user_id),
@@ -232,7 +232,7 @@ async def list_company_shopify_cred(
 async def delete_shopify_cred(shopify_id: str, request: Request):
     db = request.app.state.db
 
-    # 1️⃣ Find the credential by ID
+    # Find the credential by ID
     cred = await db.shopify_cred.find_one({"_id": ObjectId(shopify_id)})
     if not cred:
         raise HTTPException(status_code=404, detail="Shopify credential not found")
@@ -241,7 +241,7 @@ async def delete_shopify_cred(shopify_id: str, request: Request):
     shop = cred.get("shop")
     access_token = cred.get("access_token")
 
-    # 2️⃣ If webhook_id exists, attempt to delete the webhook from Shopify
+    # If webhook_id exists, attempt to delete the webhook from Shopify
     if webhook_id and shop and access_token:
         webhook_url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/webhooks/{webhook_id}.json"
         headers = {
@@ -252,7 +252,7 @@ async def delete_shopify_cred(shopify_id: str, request: Request):
         try:
             response = requests.delete(webhook_url, headers=headers)
             if response.status_code == 200:
-                print(f"[✓] Webhook {webhook_id} deleted successfully for {shop}")
+                print(f"[OK] Webhook {webhook_id} deleted successfully for {shop}")
             elif response.status_code == 404:
                 print(f"[!] Webhook {webhook_id} not found in Shopify (may already be deleted).")
             else:
@@ -260,7 +260,7 @@ async def delete_shopify_cred(shopify_id: str, request: Request):
         except requests.RequestException as e:
             print(f"[!] Webhook delete exception: {e}")
 
-    # 3️⃣ Delete the credential document from MongoDB
+    # Delete the credential document from MongoDB
     result = await db.shopify_cred.delete_one({"_id": ObjectId(shopify_id)})
 
     if result.deleted_count == 0:
@@ -292,8 +292,8 @@ def register_shopify_webhook(shop: str, access_token: str):
     if response.status_code == 201:
         webhook = response.json().get("webhook", {})
         webhook_id = webhook.get("id")
-        print(f"[✓] Webhook registered for {shop} (ID: {webhook_id})")
-        return webhook_id  # ✅ Return the ID
+        print(f"[OK] Webhook registered for {shop} (ID: {webhook_id})")
+        return webhook_id
     else:
         print(f"[!] Webhook failed: {response.status_code} {response.text}")
         return None
@@ -313,7 +313,7 @@ def delete_shopify_webhook(shop: str, access_token: str, webhook_id: str):
         return False
 
     if response.status_code == 200:
-        print(f"[✓] Webhook {webhook_id} deleted successfully for {shop}")
+        print(f"[OK] Webhook {webhook_id} deleted successfully for {shop}")
         return True
     else:
         print(f"[!] Webhook delete failed: {response.status_code} {response.text}")
@@ -336,15 +336,15 @@ async def shopify_orders_create_webhook(
                 hashlib.sha256
             ).digest()
         ).decode()
-        print(f"[✓] x_shopify_hmac_sha256: {x_shopify_hmac_sha256}")
-        print(f"[✓] Computed HMAC: {computed_hmac}")
+        print(f"[OK] x_shopify_hmac_sha256: {x_shopify_hmac_sha256}")
+        print(f"[OK] Computed HMAC: {computed_hmac}")
         # Shopify sends the HMAC header as base64 (case-insensitive)
         if not hmac.compare_digest(computed_hmac, x_shopify_hmac_sha256):
             print("[!] Invalid HMAC received")
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid HMAC")
         
         data = json.loads(raw_body)
-        print(f"[✓] x_shopify_shop_domain: {x_shopify_shop_domain}")
+        print(f"[OK] x_shopify_shop_domain: {x_shopify_shop_domain}")
 
         db = await get_database()
         user_id, company_id = None, None
@@ -404,9 +404,9 @@ async def shopify_orders_create_webhook(
 
         
         # async Motor: must await db operations
-        print(f"[✓] Inserting/updating order: {order_document['order_id']} in shop: {order_document['shop']}")
+        print(f"[OK] Inserting/updating order: {order_document['order_id']} in shop: {order_document['shop']}")
         if not await db.orders.find_one({"order_id": order_document["order_id"]}):
-            print(f"[✓] Order {order_document['order_id']} not found, inserting new document.")
+            print(f"[OK] Order {order_document['order_id']} not found, inserting new document.")
             await db.orders.insert_one(order_document)
 
         return {"success": True}
@@ -535,8 +535,8 @@ async def refund_order(payload: dict = Body(...)):
             json=calculate_payload,
         )
 
-    print("🟨 Calculate Status:", calc_response.status_code)
-    print("🟨 Calculate Body:", calc_response.text)
+    print("Calculate Status:", calc_response.status_code)
+    print("Calculate Body:", calc_response.text)
 
     if calc_response.status_code >= 400:
         return JSONResponse(status_code=calc_response.status_code, content=calc_response.json())
@@ -553,7 +553,7 @@ async def refund_order(payload: dict = Body(...)):
             "gateway": t["gateway"]
         })
 
-    # STEP 3: Use Shopify’s calculated refund EXACTLY
+    # STEP 3: Use Shopify's calculated refund exactly
     final_payload = {
         "refund": {
             "note": note or "Refund processed via API",
@@ -577,8 +577,8 @@ async def refund_order(payload: dict = Body(...)):
             json=final_payload,
         )
 
-    print("🟩 Refund Status:", refund_response.status_code)
-    print("🟩 Refund Body:", refund_response.text)
+    print("Refund Status:", refund_response.status_code)
+    print("Refund Body:", refund_response.text)
 
     if refund_response.status_code >= 400:
         return JSONResponse(status_code=refund_response.status_code, content=refund_response.json())

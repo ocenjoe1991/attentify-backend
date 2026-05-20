@@ -120,7 +120,7 @@ async def get_company_messages(
     if not ObjectId.is_valid(company_id):
         raise HTTPException(status_code=400, detail="Invalid company ID")
 
-    # ✅ Verify membership
+    # Verify membership
     membership = await db["memberships"].find_one(
         {"user_id": current_user["_id"], "company_id": ObjectId(company_id)}
     )
@@ -129,7 +129,7 @@ async def get_company_messages(
 
     role = membership.get("role")
 
-    # ✅ Base query depending on role
+    # Base query depending on role
     query = {"company_id": ObjectId(company_id)}
     if role == "store_owner":
         query["user_id"] = current_user["_id"]
@@ -138,7 +138,7 @@ async def get_company_messages(
     elif role not in ["company_owner", "store_owner", "agent"]:
         query["user_id"] = current_user["_id"]
 
-    # ✅ Apply search filter (case-insensitive)
+    # Apply search filter (case-insensitive)
     if search.strip():
         search_regex = {"$regex": search.strip(), "$options": "i"}
         query["$or"] = [
@@ -150,7 +150,7 @@ async def get_company_messages(
     total_count = await db["messages"].count_documents(query)
     totalPages = ceil(total_count / size)
 
-    # ✅ Pagination
+    # Pagination
     skip = (page - 1) * size
 
     cursor = (
@@ -167,11 +167,11 @@ async def get_company_messages(
         doc["user_id"] = str(doc["user_id"])
         doc["company_id"] = str(doc["company_id"])
 
-        # ✅ Clean client name
+        # Clean client name
         raw_client = doc.get("client", "")
         doc["client"] = extract_name(raw_client)
 
-        # ✅ Get assigned member details
+        # Get assigned member details
         assigned_member_id = doc.get("assigned_member_id")
         member = None
         if assigned_member_id:
@@ -189,7 +189,7 @@ async def get_company_messages(
                 member = None
         doc["assigned_to"] = member
 
-        # ✅ Cleanup unused fields
+        # Cleanup unused fields
         doc.pop("assigned_member_id", None)
         doc.pop("messages", None)
         doc.pop("comments", None)
@@ -210,7 +210,7 @@ async def get_message(id: str, db: AsyncIOMotorDatabase = Depends(get_database))
     if not doc:
         raise HTTPException(status_code=404, detail="Message not found")
 
-    # Convert ObjectIds → strings
+    # Convert ObjectIds to strings
     doc["_id"] = str(doc["_id"])
     doc["user_id"] = str(doc["user_id"])
     doc["company_id"] = str(doc["company_id"])

@@ -11,7 +11,7 @@ class UserBase(BaseModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     last_login: Optional[datetime] = None
-    auth_provider: Optional[str]
+    auth_provider: Optional[str] = None
 
 class UserCreate(UserBase):
     password: str
@@ -37,5 +37,4 @@ class UserPublic(BaseModel):
         populate_by_name = True
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
-
 
