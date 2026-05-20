@@ -199,8 +199,6 @@ async def list_company_members(
             "status": "pending"
         })
 
-    if not memberships:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active members found for this company")
     return memberships
 
 #GET /api/v1/company/{company_id}/active_members
@@ -231,8 +229,6 @@ async def active_members(
                 "status": "active"
             })
    
-    if not members:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No active members found for this company")
     return members
 
 @router.delete("/delete-member")
