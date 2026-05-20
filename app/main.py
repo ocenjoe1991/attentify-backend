@@ -92,6 +92,10 @@ app = FastAPI(title="Attentify APP", lifespan=lifespan)
 # Mount Socket.IO app inside FastAPI
 socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
 
+@app.get("/pingtest")
+async def pingtest():
+    return {"status": "ok"}
+
 app.add_middleware(SessionMiddleware, secret_key="supersecret")
 # CORS setup
 app.add_middleware(
