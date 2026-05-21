@@ -513,10 +513,28 @@ async def analyze_email_message(
     if not (order_info := message_doc.get('order_info')):
         result = await analyze_emails_with_ai(message_doc)
         # result is now a single dict, not a list
+
+        if isinstance(result, dict) and result.get("error"):
+            return {
+                "order_id": "",
+                "type": "",
+                "status": 0,
+                "msg": result["error"],
+                "shopify_order": {},
+            }
         
         response = getattr(result, 'content', str(result))
         print("Email AI process response: ", response)
-        order_info = clean_json_response(response)
+        try:
+            order_info = clean_json_response(response)
+        except ValueError as exc:
+            return {
+                "order_id": "",
+                "type": "",
+                "status": 0,
+                "msg": str(exc),
+                "shopify_order": {},
+            }
 
         if (order_info.get('order_id')):
             await db["messages"].update_one(
@@ -534,10 +552,13 @@ async def analyze_email_message(
     db_order = await db["orders"].find_one({"name": order_name})
     
     if db_order:
-        match = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', message_doc.get('client'))
-        email = match[0]
+        match = re.findall(
+            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b',
+            message_doc.get("client") or "",
+        )
+        email = match[0] if match else ""
 
-        if (db_order.get("customer", {}).get("email", "") == email):
+        if email and db_order.get("customer", {}).get("email", "") == email:
             db_order["_id"] = str(db_order["_id"])
             db_order["user_id"] = str(db_order.get("user_id", ""))
             db_order["company_id"] = str(db_order.get("company_id", ""))
@@ -545,9 +566,11 @@ async def analyze_email_message(
 
         else:
             order_info["msg"] = "Email not matched"
+            order_info["shopify_order"] = {}
 
     else:
         order_info["msg"] = "Order not found"
+        order_info["shopify_order"] = {}
 
     return order_info
 
