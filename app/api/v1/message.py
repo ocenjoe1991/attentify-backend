@@ -16,7 +16,7 @@ from email.utils import formatdate, format_datetime
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
 from email.utils import parseaddr
-from pymongo import DESCENDING
+from pymongo import ASCENDING, DESCENDING
 from app.core.security import get_current_user
 
 from math import ceil
@@ -114,6 +114,10 @@ async def get_company_messages(
     search: str = Query("", description="Search by message title or client name/email"),
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(10, ge=1, le=100, description="Page size"),
+    assigned_filter: str = Query("all", description="all, assigned, or unassigned"),
+    status_filter: str = Query("all", description="Message status or all"),
+    sort_by: str = Query("last_updated", description="started_at or last_updated"),
+    sort_order: str = Query("desc", description="asc or desc"),
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict = Depends(get_current_user)
 ):
@@ -144,7 +148,37 @@ async def get_company_messages(
         query["$or"] = [
             {"title": search_regex},
             {"client": search_regex},
+            {"ticket": search_regex},
         ]
+
+    if assigned_filter == "assigned":
+        query["assigned_member_id"] = {"$exists": True, "$ne": None}
+    elif assigned_filter == "unassigned":
+        query["$and"] = query.get("$and", [])
+        query["$and"].append({
+            "$or": [
+                {"assigned_member_id": {"$exists": False}},
+                {"assigned_member_id": None},
+                {"assigned_member_id": ""},
+            ]
+        })
+
+    allowed_statuses = {
+        "Open",
+        "Closed",
+        "Pending",
+        "Resolved",
+        "Escalated",
+        "Awaiting Approval",
+        "Cancelled",
+    }
+    if status_filter != "all":
+        if status_filter not in allowed_statuses:
+            raise HTTPException(status_code=400, detail="Invalid status filter")
+        query["status"] = status_filter
+
+    sort_field = "started_at" if sort_by == "started_at" else "last_updated"
+    sort_direction = ASCENDING if sort_order == "asc" else DESCENDING
 
     # Count total documents for pagination
     total_count = await db["messages"].count_documents(query)
@@ -153,19 +187,29 @@ async def get_company_messages(
     # Pagination
     skip = (page - 1) * size
 
-    cursor = (
-        db["messages"]
-        .find(query)
-        .sort("last_updated", DESCENDING)
-        .skip(skip)
-        .limit(size)
-    )
+    pipeline = [
+        {"$match": query},
+        {
+            "$addFields": {
+                "_sort_date": {
+                    "$ifNull": [
+                        f"${sort_field}",
+                        {"$ifNull": ["$last_updated", "$started_at"]},
+                    ]
+                }
+            }
+        },
+        {"$sort": {"_sort_date": sort_direction, "_id": sort_direction}},
+        {"$skip": skip},
+        {"$limit": size},
+    ]
 
     messages = []
-    async for doc in cursor:
+    async for doc in db["messages"].aggregate(pipeline):
         doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
         doc["company_id"] = str(doc["company_id"])
+        doc.pop("_sort_date", None)
 
         # Clean client name
         raw_client = doc.get("client", "")
