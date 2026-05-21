@@ -14,8 +14,22 @@ class UserBase(BaseModel):
     auth_provider: Optional[str] = None
 
 class UserCreate(UserBase):
-    password: str
+    password: Optional[str] = None
     invitation_token: Optional[str] = None
+
+class AdminUserCreate(UserCreate):
+    role: Optional[Literal["admin", "company_owner", "store_owner", "agent", "readonly"]] = "readonly"
+    status: Optional[Literal["active", "invited", "suspended"]] = "invited"
+    team_id: Optional[str] = None
+
+class AdminUserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[Literal["admin", "company_owner", "store_owner", "agent", "readonly"]] = None
+    status: Optional[Literal["active", "invited", "suspended"]] = None
+    team_id: Optional[str] = None
 
 class UserInDB(UserBase):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
@@ -31,10 +45,12 @@ class UserPublic(BaseModel):
     email: str
     first_name: str
     last_name: str
+    role: Optional[str] = None
+    status: Optional[str] = None
+    team_id: Optional[str] = None
     last_login: Optional[datetime] = None
 
     class Config:
         populate_by_name = True
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
-

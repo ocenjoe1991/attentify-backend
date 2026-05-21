@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List
 from pymongo.collection import Collection
-from app.models.user import UserCreate, UserPublic
+from app.models.user import AdminUserCreate, AdminUserUpdate, UserPublic
 from app.db.mongodb import get_database
 from datetime import datetime
 from bson import ObjectId
@@ -28,18 +28,21 @@ async def list_users(db: Collection = Depends(get_database)):
 # POST /users - Create New User (identity only)
 # -------------------
 @router.post("/", response_model=UserPublic)
-async def create_user(user: UserCreate, db: Collection = Depends(get_database)):
+async def create_user(user: AdminUserCreate, db: Collection = Depends(get_database)):
     existing_user = await db["users"].find_one({"email": user.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already exists")
 
     now = datetime.utcnow()
-    hashed_pw = pwd_context.hash(user.password)
+    hashed_pw = pwd_context.hash(user.password or "changeme")
 
     user_doc = {
         "email": user.email,
         "first_name": user.first_name,
         "last_name": user.last_name,
+        "role": user.role or "readonly",
+        "status": user.status or "invited",
+        "team_id": user.team_id,
         "hashed_password": hashed_pw,
         "created_at": now,
         "updated_at": now,
@@ -56,7 +59,7 @@ async def create_user(user: UserCreate, db: Collection = Depends(get_database)):
 # PUT /users/{user_id} - Update User
 # -------------------
 @router.put("/{user_id}", response_model=UserPublic)
-async def update_user(user_id: str, user: UserCreate, db: Collection = Depends(get_database)):
+async def update_user(user_id: str, user: AdminUserUpdate, db: Collection = Depends(get_database)):
     try:
         oid = ObjectId(user_id)
     except Exception:
@@ -66,12 +69,12 @@ async def update_user(user_id: str, user: UserCreate, db: Collection = Depends(g
     if not existing:
         raise HTTPException(status_code=404, detail="User not found")
 
-    update_data = {
-        "email": user.email,
-        "first_name": user.first_name,
-        "last_name": user.last_name,
-        "updated_at": datetime.utcnow(),
-    }
+    update_data = {"updated_at": datetime.utcnow()}
+
+    for field in ["email", "first_name", "last_name", "role", "status", "team_id"]:
+        value = getattr(user, field)
+        if value is not None:
+            update_data[field] = value
 
     if user.password:
         update_data["hashed_password"] = pwd_context.hash(user.password)
