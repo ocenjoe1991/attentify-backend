@@ -136,6 +136,8 @@ from app.api.v1 import shopify
 app.include_router(shopify.router, prefix="/api/v1/shopify", tags=["Shopify"])
 from app.api.v1 import users
 app.include_router(users.router, prefix="/api/v1/users", tags=["Users"])
+from app.api.v1 import admin
+app.include_router(admin.router, prefix="/api/v1/admin", tags=["Admin"])
 from app.api.v1 import company
 app.include_router(company.router, prefix="/api/v1/company", tags=["Company"])
 from app.api.v1 import membership

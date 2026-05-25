@@ -3,19 +3,30 @@ from typing import List
 from pymongo.collection import Collection
 from app.models.user import AdminUserCreate, AdminUserUpdate, UserPublic
 from app.db.mongodb import get_database
+from app.core.security import get_current_user
 from datetime import datetime
 from bson import ObjectId
 from app.utils.bson import PyObjectId  # helper to handle ObjectId correctly
 from passlib.context import CryptContext
+from app.api.v1.admin import default_settings
 
 router = APIRouter()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def ensure_admin(current_user: dict):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
 
 # -------------------
 # GET /users - List Users
 # -------------------
 @router.get("/", response_model=List[UserPublic])
-async def list_users(db: Collection = Depends(get_database)):
+async def list_users(
+    db: Collection = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_admin(current_user)
     cursor = db["users"].find()
     users = []
     async for user in cursor:
@@ -65,7 +76,12 @@ async def list_users(db: Collection = Depends(get_database)):
 # POST /users - Create New User (identity only)
 # -------------------
 @router.post("/", response_model=UserPublic)
-async def create_user(user: AdminUserCreate, db: Collection = Depends(get_database)):
+async def create_user(
+    user: AdminUserCreate,
+    db: Collection = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_admin(current_user)
     existing_user = await db["users"].find_one({"email": user.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already exists")
@@ -88,6 +104,22 @@ async def create_user(user: AdminUserCreate, db: Collection = Depends(get_databa
 
     result = await db["users"].insert_one(user_doc)
     created_user = await db["users"].find_one({"_id": result.inserted_id})
+
+    settings = await db["admin_settings"].find_one({"key": "admin_governance"})
+    notification_settings = (settings or default_settings()).get("notifications", {})
+    if notification_settings.get("admin_new_user", True):
+        await db["admin_notifications"].insert_one(
+            {
+                "type": "admin_user_created",
+                "title": "New user account created",
+                "message": f"{user.email} was created with the {user.role or 'readonly'} role.",
+                "actor_id": current_user["_id"],
+                "actor_email": current_user.get("email"),
+                "created_at": datetime.utcnow(),
+                "read": False,
+            }
+        )
+
     created_user["_id"] = str(created_user["_id"])
     return created_user
 
@@ -96,7 +128,13 @@ async def create_user(user: AdminUserCreate, db: Collection = Depends(get_databa
 # PUT /users/{user_id} - Update User
 # -------------------
 @router.put("/{user_id}", response_model=UserPublic)
-async def update_user(user_id: str, user: AdminUserUpdate, db: Collection = Depends(get_database)):
+async def update_user(
+    user_id: str,
+    user: AdminUserUpdate,
+    db: Collection = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_admin(current_user)
     try:
         oid = ObjectId(user_id)
     except Exception:
@@ -159,7 +197,12 @@ async def update_user(user_id: str, user: AdminUserUpdate, db: Collection = Depe
 # DELETE /users/{user_id}
 # -------------------
 @router.delete("/{user_id}")
-async def delete_user(user_id: str, db: Collection = Depends(get_database)):
+async def delete_user(
+    user_id: str,
+    db: Collection = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    ensure_admin(current_user)
     try:
         oid = ObjectId(user_id)
     except Exception:

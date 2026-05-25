@@ -114,6 +114,7 @@ async def get_company_messages(
     search: str = Query("", description="Search by message title or client name/email"),
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(10, ge=1, le=100, description="Page size"),
+    view_mode: str = Query("inbox", description="inbox, archived, or trashed"),
     assigned_filter: str = Query("all", description="all, assigned, or unassigned"),
     status_filter: str = Query("all", description="Message status or all"),
     sort_by: str = Query("last_updated", description="started_at or last_updated"),
@@ -141,6 +142,28 @@ async def get_company_messages(
         query["assigned_member_id"] = current_user["_id"]
     elif role not in ["company_owner", "store_owner", "agent"]:
         query["user_id"] = current_user["_id"]
+
+    active_statuses = {
+        "Open",
+        "Pending",
+        "Escalated",
+        "Awaiting Approval",
+    }
+    archived_statuses = {
+        "Resolved",
+        "Cancelled",
+    }
+
+    if view_mode == "inbox":
+        query["trashed"] = {"$ne": True}
+        query["status"] = {"$in": list(active_statuses)}
+    elif view_mode == "archived":
+        query["trashed"] = {"$ne": True}
+        query["status"] = {"$in": list(archived_statuses)}
+    elif view_mode == "trashed":
+        query["trashed"] = True
+    else:
+        raise HTTPException(status_code=400, detail="Invalid view mode")
 
     # Apply search filter (case-insensitive)
     if search.strip():
@@ -175,6 +198,10 @@ async def get_company_messages(
     if status_filter != "all":
         if status_filter not in allowed_statuses:
             raise HTTPException(status_code=400, detail="Invalid status filter")
+        if view_mode == "inbox" and status_filter not in active_statuses:
+            raise HTTPException(status_code=400, detail="Invalid status for inbox")
+        if view_mode == "archived" and status_filter not in archived_statuses:
+            raise HTTPException(status_code=400, detail="Invalid status for archive")
         query["status"] = status_filter
 
     sort_field = "started_at" if sort_by == "started_at" else "last_updated"
