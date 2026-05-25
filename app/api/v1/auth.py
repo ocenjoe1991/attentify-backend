@@ -22,6 +22,11 @@ VALID_ROLES = {"admin", "store_owner", "agent", "readonly"}
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret")
 ALGORITHM = "HS256"
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
+GOOGLE_AUTH_REDIRECT_URI = os.getenv(
+    "GOOGLE_AUTH_REDIRECT_URI",
+    f"{BACKEND_URL}/api/v1/auth/google/callback",
+)
 
 # --- OAuth Setup --
 oauth = OAuth()
@@ -36,9 +41,7 @@ oauth.register(
 # /api/v1/auth/google/login
 @router.get("/google/login")
 async def google_login(request: Request):
-    redirect_uri = os.getenv("GOOGLE_AUTH_REDIRECT_URI") or str(request.url_for("google_callback"))
-    print(redirect_uri)
-    return await oauth.google.authorize_redirect(request, redirect_uri)
+    return await oauth.google.authorize_redirect(request, GOOGLE_AUTH_REDIRECT_URI)
 
 # /api/v1/auth/google/callback
 @router.get("/google/callback")

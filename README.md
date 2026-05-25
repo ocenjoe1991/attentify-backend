@@ -44,15 +44,23 @@ SECRET_KEY=your-secret-key
 ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=60
 
+FRONTEND_URL=http://localhost:5173
+BACKEND_URL=http://localhost:8000
+
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+GOOGLE_AUTH_REDIRECT_URI=http://localhost:8000/api/v1/auth/google/callback
+GOOGLE_REDIRECT_URI=http://localhost:8000/api/v1/gmail/oauth/callback
+
 OPENAI_API_KEY=your-openai-key
 SHOPIFY_API_KEY=your-shopify-key
 TWILIO_ACCOUNT_SID=your-twilio-sid
 TWILIO_AUTH_TOKEN=your-twilio-token
-GMAIL_CLIENT_ID=your-gmail-client-id
-GMAIL_CLIENT_SECRET=your-gmail-client-secret
 STRIPE_SECRET_KEY=your-stripe-key
 # ... other keys as needed
 ```
+
+For Google OAuth, add both redirect URIs above to the OAuth client in Google Cloud Console.
 
 ### 4. **Run the server**
 
