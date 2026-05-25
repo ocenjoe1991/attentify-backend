@@ -48,6 +48,9 @@ class UserPublic(BaseModel):
     role: Optional[str] = None
     status: Optional[str] = None
     team_id: Optional[str] = None
+    team_name: Optional[str] = None
+    company_id: Optional[str] = None
+    membership_id: Optional[str] = None
     last_login: Optional[datetime] = None
 
     class Config:
