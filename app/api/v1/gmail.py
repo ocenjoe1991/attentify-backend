@@ -233,7 +233,7 @@ async def delete_gmail_account(account_id: str, request: Request):
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
-FRONTEND_URL = os.getenv("FRONTEND_URL")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email"
@@ -334,6 +334,8 @@ async def google_oauth_callback(
 
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in or 3600)
 
+    db = request.app.state.db
+
     # Get user info
     async with httpx.AsyncClient() as client:
         userinfo_resp = await client.get(
@@ -346,6 +348,16 @@ async def google_oauth_callback(
     if not email:
         raise HTTPException(status_code=400, detail="Failed to retrieve user email")
 
+    existing = await db.gmail_accounts.find_one({"email": email, "user_id": user_id})
+    if not refresh_token and existing:
+        refresh_token = existing.get("refresh_token")
+
+    if not refresh_token:
+        raise HTTPException(
+            status_code=400,
+            detail="Google did not return a refresh token. Please remove access for Attentify in your Google account and connect Gmail again.",
+        )
+
     # Build credentials
     creds = Credentials(
         token=access_token,
@@ -353,7 +365,10 @@ async def google_oauth_callback(
         token_uri="https://oauth2.googleapis.com/token",
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/gmail.readonly"]
+        scopes=[
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+        ],
     )
 
     # Call Gmail API in threadpool (avoid blocking)
@@ -401,9 +416,6 @@ async def google_oauth_callback(
     subscription_path = await loop.run_in_executor(None, ensure_subscription)
 
     # Save/update Gmail account
-    db = request.app.state.db
-    existing = await db.gmail_accounts.find_one({"email": email, "user_id": user_id})
-
     account_data = {
         "email": email,
         "user_id": user_id,
@@ -415,6 +427,11 @@ async def google_oauth_callback(
         "status": "connected",
         "client_id": GOOGLE_CLIENT_ID,
         "client_secret": GOOGLE_CLIENT_SECRET,
+        "scopes": [
+            "https://www.googleapis.com/auth/gmail.readonly",
+            "https://www.googleapis.com/auth/gmail.send",
+        ],
+        "scope": token_data.get("scope"),
         "token_issued_at": datetime.utcnow(),
         "provider": "google",
         "history_id": history_id,
@@ -443,8 +460,10 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
         return Response(status_code=400)
 
     try:
-        # Decode Pub/Sub base64 payload
-        data = json.loads(base64.urlsafe_b64decode(message["data"]).decode("utf-8"))
+        # Decode Pub/Sub base64 payload. Pub/Sub data can arrive without padding.
+        encoded_data = message["data"]
+        encoded_data += "=" * (-len(encoded_data) % 4)
+        data = json.loads(base64.urlsafe_b64decode(encoded_data).decode("utf-8"))
     except Exception:
         logger.error("Failed to decode Pub/Sub data", exc_info=True)
         return Response(status_code=400)
@@ -465,6 +484,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
 
     user_id = account["user_id"]
     company_id = account["company_id"]
+    user_object_id = user_id if isinstance(user_id, ObjectId) else ObjectId(user_id)
+    company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
 
     try:
         service = get_gmail_service(account)
@@ -474,7 +495,24 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
 
     last_history_id = account.get("history_id")
     if not last_history_id:
-        logger.debug("No stored historyId for %s. Skipping history fetch.", email_address)
+        logger.debug("No stored historyId for %s. Fetching latest inbox messages.", email_address)
+        try:
+            latest = service.users().messages().list(
+                userId="me",
+                labelIds=["INBOX"],
+                maxResults=10,
+            ).execute()
+            history = [
+                {
+                    "messagesAdded": [
+                        {"message": item}
+                        for item in latest.get("messages", [])
+                    ]
+                }
+            ]
+        except Exception:
+            logger.error("Failed fetching latest Gmail messages for %s", email_address, exc_info=True)
+            return Response(status_code=500)
     else:
         try:
             results = service.users().history().list(
@@ -484,8 +522,24 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
 
             history = results.get("history", [])
         except Exception:
-            logger.error("Failed fetching Gmail history for %s", email_address, exc_info=True)
-            return Response(status_code=500)
+            logger.error("Failed fetching Gmail history for %s. Falling back to latest inbox messages.", email_address, exc_info=True)
+            try:
+                latest = service.users().messages().list(
+                    userId="me",
+                    labelIds=["INBOX"],
+                    maxResults=10,
+                ).execute()
+                history = [
+                    {
+                        "messagesAdded": [
+                            {"message": item}
+                            for item in latest.get("messages", [])
+                        ]
+                    }
+                ]
+            except Exception:
+                logger.error("Fallback Gmail message fetch failed for %s", email_address, exc_info=True)
+                return Response(status_code=500)
 
         for record in history:
             if "messagesAdded" not in record:
@@ -569,7 +623,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 )
 
                 existing_thread = await db["messages"].find_one(
-                    {"user_id": ObjectId(user_id), "thread_id": thread_id, "channel": "email"}
+                    {"user_id": user_object_id, "thread_id": thread_id, "channel": "email"}
                 )
 
                 if existing_thread:
@@ -601,7 +655,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     # Generate new ticket number
                     today = datetime.utcnow().strftime("%Y-%m-%d")
                     count_today = await db["messages"].count_documents({
-                        "company_id": ObjectId(company_id),
+                        "company_id": company_object_id,
                         "started_at": {"$gte": datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)}
                     })
                     ticket_number = f"CA-{today}-{count_today + 1:04d}"
@@ -609,8 +663,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     logger.info(f"Creating new ticket {ticket_number} for order {shopify_order}")
                     
                     message_doc = {
-                        "user_id": ObjectId(user_id),
-                        "company_id": ObjectId(company_id),
+                        "user_id": user_object_id,
+                        "company_id": company_object_id,
                         "thread_id": thread_id,
                         "participants": list(set([sender, to])),
                         "channel": "email",
@@ -645,5 +699,3 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
 
     logger.info("Processed Gmail Pub/Sub for %s up to historyId=%s", email_address, history_id)
     return Response(status_code=200)
-
-

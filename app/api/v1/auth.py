@@ -21,7 +21,7 @@ VALID_ROLES = {"admin", "store_owner", "agent", "readonly"}
 
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret")
 ALGORITHM = "HS256"
-FRONTEND_URL = os.getenv("FRONTEND_URL")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # --- OAuth Setup --
 oauth = OAuth()
@@ -36,7 +36,7 @@ oauth.register(
 # /api/v1/auth/google/login
 @router.get("/google/login")
 async def google_login(request: Request):
-    redirect_uri = request.url_for("google_callback")
+    redirect_uri = os.getenv("GOOGLE_AUTH_REDIRECT_URI") or str(request.url_for("google_callback"))
     print(redirect_uri)
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
@@ -113,15 +113,8 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
             "role": "admin"
         })
 
-        return {
-            "token": token,
-            "user": {
-                "id": user_id,  
-                "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
-                "email": user["email"],
-                "role": "admin"
-            }
-        }
+        redirect_url = f"{FRONTEND_URL}/oauth/callback/login?token={token}"
+        return RedirectResponse(url=redirect_url)
     
     memberships_cursor = db.memberships.find({
         "user_id": user["_id"],
@@ -131,7 +124,20 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
     memberships = await memberships_cursor.to_list(length=None)
 
     if not memberships:
-        raise HTTPException(status_code=403, detail="No active company membership found")
+        invitation_result = await db.invitations.find_one({
+            "email": email,
+            "status": "pending"
+        })
+
+        redirect_path = "/ask-accept-invitation" if invitation_result else "/register-company"
+        token = create_access_token({
+            "sub": user_id,
+            "user_id": user_id,
+            "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+            "email": user["email"],
+            "redirect_url": redirect_path
+        })
+        return RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/register?token={token}")
     
     selected_membership = memberships[0]
     company_id = selected_membership["company_id"]

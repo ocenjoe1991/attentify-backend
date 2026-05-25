@@ -57,9 +57,12 @@ async def set_gmail_watches_periodically():
         db = app.state.db
         cursor = db["gmail_accounts"].find()
         async for cred in cursor:
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(None, set_gmail_watch, cred)
-            print(response)
+            try:
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(None, set_gmail_watch, cred)
+                print(response)
+            except Exception as e:
+                print(f"Failed to set Gmail watch for {cred.get('email')}: {e}")
             
         await asyncio.sleep(24 * 3600)
 
