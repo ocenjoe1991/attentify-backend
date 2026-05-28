@@ -30,6 +30,9 @@ async def fetch_all(body: dict, db=Depends(get_database), current_user: dict = D
         raise HTTPException(status_code=400, detail="Invalid company ID")
     
     result = await fetch_all_gmail_accounts(db, user_id=str(current_user["_id"]), company_id= company_id)
+    failures = [item for item in result if item.get("status") == "failed"]
+    if failures:
+        raise HTTPException(status_code=424, detail=failures)
     return {"result": result}
 
 def extract_name(email_str: str) -> str:

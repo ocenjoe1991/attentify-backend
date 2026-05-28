@@ -41,15 +41,42 @@ async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str)
         try:
             creds.refresh(Request())
         except Exception as e:
+            error_text = str(e)
             logging.error(f"Failed to refresh token for {account['email']}: {e}")
-            return f"Token refresh failed for {account['email']}"
+            if "invalid_grant" in error_text:
+                await db["gmail_accounts"].update_one(
+                    {"_id": account["account_id"]},
+                    {
+                        "$set": {
+                            "status": "disconnected",
+                            "last_error": "Google refresh token is invalid or revoked. Reconnect this Gmail account.",
+                        }
+                    },
+                )
+                return {
+                    "email": account["email"],
+                    "status": "failed",
+                    "reason": "invalid_grant",
+                    "message": "Google refresh token is invalid or revoked. Reconnect this Gmail account.",
+                }
+            return {
+                "email": account["email"],
+                "status": "failed",
+                "reason": "token_refresh_failed",
+                "message": f"Token refresh failed for {account['email']}",
+            }
 
     try:
         token_info = requests.get(
             f"https://www.googleapis.com/oauth2/v1/tokeninfo?access_token={creds.token}"
         ).json()
         if "https://www.googleapis.com/auth/gmail.readonly" not in token_info.get("scope", ""):
-            return f"Insufficient permissions: 'gmail.readonly' not in token scopes for {account['email']}"
+            return {
+                "email": account["email"],
+                "status": "failed",
+                "reason": "insufficient_permissions",
+                "message": f"Insufficient permissions: 'gmail.readonly' not in token scopes for {account['email']}",
+            }
     except Exception as e:
         logging.warning(f"Token scope check failed: {e}")
 
@@ -168,11 +195,21 @@ async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str)
                 await db["messages"].insert_one(message_doc)
             stored_count += 1
 
-        return f"Fetched and stored {stored_count} new messages (grouped by thread) for {account['email']}"
+        return {
+            "email": account["email"],
+            "status": "ok",
+            "stored_count": stored_count,
+            "message": f"Fetched and stored {stored_count} new messages (grouped by thread) for {account['email']}",
+        }
 
     except Exception as e:
         logging.exception(f"Error fetching emails for {account['email']}: {str(e)}")
-        return f"Failed to fetch emails for {account['email']} due to an error."
+        return {
+            "email": account["email"],
+            "status": "failed",
+            "reason": "fetch_failed",
+            "message": f"Failed to fetch emails for {account['email']} due to an error.",
+        }
     
 async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
     cursor = db["gmail_accounts"].find({"user_id": ObjectId(user_id)})
@@ -180,6 +217,7 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
     async for cred in cursor:
         try:
             token_data = {
+                "account_id": cred["_id"],
                 "email": cred["email"],  # <-- include email here
                 "access_token": cred["access_token"],
                 "refresh_token": cred["refresh_token"],
@@ -189,9 +227,14 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
             }
 
             result = await fetch_and_save_gmail(token_data, db, user_id, company_id)  # now only 2 args
-            results.append({cred["email"]: result})
+            results.append(result)
         except Exception as e:
-            results.append({cred["email"]: f"Error: {str(e)}"})
+            results.append({
+                "email": cred.get("email", "unknown Gmail account"),
+                "status": "failed",
+                "reason": "unexpected_error",
+                "message": f"Error: {str(e)}",
+            })
 
     return results
 
