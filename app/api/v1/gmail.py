@@ -10,6 +10,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 import os
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from google.cloud import pubsub_v1
 from app.core.config import settings
 import asyncio
@@ -236,7 +237,23 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_SCOPE = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email"
+GMAIL_SCOPES = [
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+REQUIRED_GMAIL_SCOPES = {
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+}
+GOOGLE_SCOPE = " ".join(GMAIL_SCOPES)
+
+
+def has_required_gmail_scopes(scope_value: str) -> bool:
+    granted_scopes = set((scope_value or "").split())
+    return REQUIRED_GMAIL_SCOPES.issubset(granted_scopes)
 
 #/api/v1/gmail/oauth/login
 @router.get("/oauth/login")
@@ -250,20 +267,19 @@ async def google_oauth_login(user_id: str, company_id: str):
     if not ObjectId.is_valid(company_id):
         raise HTTPException(status_code=400, detail="Invalid company_id format")
 
-    # Pack user_id and company_id into state (JSON then urlencode)
+    # Pack user_id and company_id into state.
     state = json.dumps({"user_id": user_id, "company_id": company_id})
-    state_encoded = urllib.parse.quote(state)
-
-    auth_url = (
-        "https://accounts.google.com/o/oauth2/v2/auth"
-        f"?client_id={GOOGLE_CLIENT_ID}"
-        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
-        f"&response_type=code"
-        f"&scope=email%20profile%20https://www.googleapis.com/auth/gmail.readonly%20https://www.googleapis.com/auth/gmail.send%20https://www.googleapis.com/auth/userinfo.email"
-        f"&access_type=offline"
-        f"&prompt=consent"
-        f"&state={state_encoded}"
-    )
+    auth_params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": GOOGLE_SCOPE,
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "false",
+        "state": state,
+    }
+    auth_url = f"{GOOGLE_AUTH_URL}?{urlencode(auth_params)}"
 
     return RedirectResponse(url=auth_url)
 
@@ -332,6 +348,17 @@ async def google_oauth_callback(
     if not access_token:
         raise HTTPException(status_code=400, detail="Missing access token")
 
+    granted_scope = token_data.get("scope", "")
+    if not has_required_gmail_scopes(granted_scope):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Gmail permission was not granted. Please reconnect Gmail and approve "
+                "Gmail read/send access. Granted scopes: "
+                f"{granted_scope or 'none'}"
+            ),
+        )
+
     expires_at = datetime.utcnow() + timedelta(seconds=expires_in or 3600)
 
     db = request.app.state.db
@@ -381,7 +408,20 @@ async def google_oauth_callback(
         return gmail.users().watch(userId="me", body=watch_request).execute()
 
     loop = asyncio.get_running_loop()
-    watch_response = await loop.run_in_executor(None, watch_gmail)
+    try:
+        watch_response = await loop.run_in_executor(None, watch_gmail)
+    except HttpError as e:
+        logger.error("Failed to start Gmail watch for OAuth callback", exc_info=True)
+        if getattr(e, "resp", None) and e.resp.status == 403:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Google rejected the Gmail watch request because the connected "
+                    "account does not have Gmail API permission. Remove Attentify "
+                    "from Google third-party access and connect Gmail again."
+                ),
+            )
+        raise HTTPException(status_code=502, detail="Failed to start Gmail watch")
     print(watch_response)
 
     history_id = watch_response["historyId"]
