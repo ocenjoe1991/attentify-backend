@@ -214,10 +214,9 @@ def get_gmail_service(user_credentials: dict):
    # Refresh the credentials
     try:
         creds.refresh(request)
-        print("Credentials refreshed successfully!")
-        print(f"New access token: {creds.token}")
+        logging.info("Credentials refreshed successfully for %s", user_credentials.get("email", "unknown Gmail account"))
     except Exception as e:
-        print(f"Error refreshing credentials: {e}")
+        logging.error("Error refreshing Gmail credentials for %s: %s", user_credentials.get("email", "unknown Gmail account"), e)
 
     service = build('gmail', 'v1', credentials=creds)
     return service

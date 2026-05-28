@@ -398,16 +398,25 @@ async def google_oauth_callback(
         subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
         topic_path = subscriber.topic_path(settings.PUBSUB_PROJECT, settings.PUBSUB_TOPIC)
         subscription_path = subscriber.subscription_path(settings.PUBSUB_PROJECT, settings.PUBSUB_SUBSCRIPTION)
+        push_endpoint = f"{settings.BACKEND_URL}/api/v1/gmail/pubsub/push"
 
         try:
-            subscriber.get_subscription(request={"subscription": subscription_path})
+            subscription = subscriber.get_subscription(request={"subscription": subscription_path})
+            existing_endpoint = subscription.push_config.push_endpoint
+            if existing_endpoint != push_endpoint:
+                subscriber.modify_push_config(
+                    request={
+                        "subscription": subscription_path,
+                        "push_config": {"push_endpoint": push_endpoint},
+                    }
+                )
         except Exception:
             subscriber.create_subscription(
                 request={
                     "name": subscription_path, 
                     "topic": topic_path,
                     "push_config": {
-                        "push_endpoint": f"{settings.BACKEND_URL}/api/v1/gmail/pubsub/push"
+                        "push_endpoint": push_endpoint
                     }
                 }
             )
@@ -541,156 +550,153 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 logger.error("Fallback Gmail message fetch failed for %s", email_address, exc_info=True)
                 return Response(status_code=500)
 
-        for record in history:
-            if "messagesAdded" not in record:
+    for record in history:
+        if "messagesAdded" not in record:
+            continue
+
+        for added in record["messagesAdded"]:
+            gmail_id = added["message"]["id"]
+
+            try:
+                full_msg = service.users().messages().get(
+                    userId="me",
+                    id=gmail_id,
+                    format="full"
+                ).execute()
+            except Exception:
+                logger.error("Failed fetching Gmail message %s", gmail_id, exc_info=True)
                 continue
 
-            for added in record["messagesAdded"]:
-                gmail_id = added["message"]["id"]
+            labels = full_msg.get("labelIds", [])
+            if "INBOX" not in labels:
+                continue
+            thread_id = full_msg.get("threadId", gmail_id)
+            payload = full_msg.get("payload", {}) or {}
+            headers = payload.get("headers", [])
 
-                try:
-                    full_msg = service.users().messages().get(
-                        userId="me",
-                        id=gmail_id,
-                        format="full" 
-                    ).execute()
-                except Exception:
-                    logger.error("Failed fetching Gmail message %s", gmail_id, exc_info=True)
-                    continue
-                
-                labels = full_msg.get("labelIds", [])
-                if "INBOX" not in labels:
-                    continue
-                thread_id = full_msg.get("threadId", gmail_id)
-                payload = full_msg.get("payload", {}) or {}
-                headers = payload.get("headers", [])
+            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
+            sender = next((h["value"] for h in headers if h["name"] == "From"), "")
+            to = next((h["value"] for h in headers if h["name"] == "To"), "")
+            date = next((h["value"] for h in headers if h["name"] == "Date"), "")
 
-                subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
-                sender = next((h["value"] for h in headers if h["name"] == "From"), "")
-                to = next((h["value"] for h in headers if h["name"] == "To"), "")
-                date = next((h["value"] for h in headers if h["name"] == "Date"), "")
+            try:
+                timestamp = parsedate_to_datetime(date)
+            except Exception:
+                timestamp = datetime.utcnow()
 
-                try:
-                    timestamp = parsedate_to_datetime(date)
-                except Exception:
-                    timestamp = datetime.utcnow()
+            text_body, html_body = "", ""
 
-                # --- Extract bodies ---
-                text_body, html_body = "", ""
-
-                def extract_bodies(payload):
-                    nonlocal text_body, html_body
-                    if "parts" in payload:
-                        for part in payload["parts"]:
-                            mime_type = part.get("mimeType")
-                            data = part["body"].get("data", "")
-                            if data:
-                                decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                                if mime_type == "text/plain" and not text_body:
-                                    text_body = decoded
-                                elif mime_type == "text/html" and not html_body:
-                                    html_body = decoded
-                            if "parts" in part:
-                                extract_bodies(part)
-                    else:
-                        data = payload.get("body", {}).get("data", "")
+            def extract_bodies(payload):
+                nonlocal text_body, html_body
+                if "parts" in payload:
+                    for part in payload["parts"]:
+                        mime_type = part.get("mimeType")
+                        data = part["body"].get("data", "")
                         if data:
                             decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
-                            mime_type = payload.get("mimeType")
-                            if mime_type == "text/plain":
+                            if mime_type == "text/plain" and not text_body:
                                 text_body = decoded
-                            elif mime_type == "text/html":
+                            elif mime_type == "text/html" and not html_body:
                                 html_body = decoded
-
-                extract_bodies(payload)
-                content = html_body if html_body else text_body
-
-                chat_entry = ChatEntry(
-                    sender=sender,
-                    recipient=to,
-                    content=content,
-                    title=subject,
-                    timestamp=timestamp,
-                    channel="email",
-                    message_type="html",
-                    metadata={
-                        "gmail_id": gmail_id,
-                        "from": sender,
-                        "to": to,
-                        "subject": subject,
-                        "date": date
-                    }
-                )
-
-                existing_thread = await db["messages"].find_one(
-                    {"user_id": user_object_id, "thread_id": thread_id, "channel": "email"}
-                )
-
-                if existing_thread:
-                    if any(m.get("metadata", {}).get("gmail_id") == gmail_id for m in existing_thread.get("messages", [])):
-                        logger.debug("Duplicate Gmail %s ignored for thread %s", gmail_id, thread_id)
-                        continue
-
-                    participants = existing_thread.get("participants", [])
-                    for p in [sender, to]:
-                        if p not in participants:
-                            participants.append(p)
-
-                    await db["messages"].update_one(
-                        {"_id": existing_thread["_id"]},
-                        {
-                            "$push": {"messages": chat_entry.dict()},
-                            "$set": {
-                                "last_updated": timestamp,
-                                "title": subject,
-                                "participants": participants
-                            }
-                        }
-                    )
+                        if "parts" in part:
+                            extract_bodies(part)
                 else:
+                    data = payload.get("body", {}).get("data", "")
+                    if data:
+                        decoded = base64.urlsafe_b64decode(data).decode("utf-8", errors="ignore")
+                        mime_type = payload.get("mimeType")
+                        if mime_type == "text/plain":
+                            text_body = decoded
+                        elif mime_type == "text/html":
+                            html_body = decoded
 
-                    shopify_order_match = re.search(r"#([A-Z]{2}\d+)", subject or content or "")
-                    shopify_order = shopify_order_match.group(1) if shopify_order_match else None
-                    
-                    # Generate new ticket number
-                    today = datetime.utcnow().strftime("%Y-%m-%d")
-                    count_today = await db["messages"].count_documents({
-                        "company_id": company_object_id,
-                        "started_at": {"$gte": datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)}
-                    })
-                    ticket_number = f"CA-{today}-{count_today + 1:04d}"
+            extract_bodies(payload)
+            content = html_body if html_body else text_body
 
-                    logger.info(f"Creating new ticket {ticket_number} for order {shopify_order}")
-                    
-                    message_doc = {
-                        "user_id": user_object_id,
-                        "company_id": company_object_id,
-                        "thread_id": thread_id,
-                        "participants": list(set([sender, to])),
-                        "channel": "email",
-                        "status": "Open",
-                        "title": subject,
-                        "ticket": ticket_number,
-                        "client": sender,
-                        "agent": to,
-                        "messages": [chat_entry.dict()],
-                        "last_updated": timestamp,
-                        "started_at": timestamp,
-                        "ai_summary": None,
-                        "tags": [],
-                        "resolved_by_ai": False
-                    }
-                    await db["messages"].insert_one(message_doc)
+            chat_entry = ChatEntry(
+                sender=sender,
+                recipient=to,
+                content=content,
+                title=subject,
+                timestamp=timestamp,
+                channel="email",
+                message_type="html",
+                metadata={
+                    "gmail_id": gmail_id,
+                    "from": sender,
+                    "to": to,
+                    "subject": subject,
+                    "date": date
+                }
+            )
 
-                await sio.emit(
-                    "gmail_update",
+            existing_thread = await db["messages"].find_one(
+                {"user_id": user_object_id, "thread_id": thread_id, "channel": "email"}
+            )
+
+            if existing_thread:
+                if any(m.get("metadata", {}).get("gmail_id") == gmail_id for m in existing_thread.get("messages", [])):
+                    logger.debug("Duplicate Gmail %s ignored for thread %s", gmail_id, thread_id)
+                    continue
+
+                participants = existing_thread.get("participants", [])
+                for p in [sender, to]:
+                    if p not in participants:
+                        participants.append(p)
+
+                await db["messages"].update_one(
+                    {"_id": existing_thread["_id"]},
                     {
-                        "user_id": str(user_id),
-                        "company_id": str(company_id),
-                        "email": email_address,
-                        "message": f"New messages pushed for {email_address}"
+                        "$push": {"messages": chat_entry.dict()},
+                        "$set": {
+                            "last_updated": timestamp,
+                            "title": subject,
+                            "participants": participants
+                        }
                     }
                 )
+            else:
+                shopify_order_match = re.search(r"#([A-Z]{2}\d+)", subject or content or "")
+                shopify_order = shopify_order_match.group(1) if shopify_order_match else None
+
+                today = datetime.utcnow().strftime("%Y-%m-%d")
+                count_today = await db["messages"].count_documents({
+                    "company_id": company_object_id,
+                    "started_at": {"$gte": datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)}
+                })
+                ticket_number = f"CA-{today}-{count_today + 1:04d}"
+
+                logger.info(f"Creating new ticket {ticket_number} for order {shopify_order}")
+
+                message_doc = {
+                    "user_id": user_object_id,
+                    "company_id": company_object_id,
+                    "thread_id": thread_id,
+                    "participants": list(set([sender, to])),
+                    "channel": "email",
+                    "status": "Open",
+                    "title": subject,
+                    "ticket": ticket_number,
+                    "client": sender,
+                    "agent": to,
+                    "messages": [chat_entry.dict()],
+                    "last_updated": timestamp,
+                    "started_at": timestamp,
+                    "ai_summary": None,
+                    "tags": [],
+                    "resolved_by_ai": False
+                }
+                await db["messages"].insert_one(message_doc)
+
+            await sio.emit(
+                "gmail_update",
+                {
+                    "user_id": str(user_id),
+                    "company_id": str(company_id),
+                    "email": email_address,
+                    "message": f"New messages pushed for {email_address}"
+                }
+            )
                 
     await db["gmail_accounts"].update_one(
         {"_id": account["_id"]},

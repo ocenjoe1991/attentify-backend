@@ -12,8 +12,11 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from app.core.config import settings
 import asyncio
+import json
 
 import socketio
+from google.cloud import pubsub_v1
+from google.oauth2 import service_account
 
 origins = os.getenv("ORIGINS", "http://localhost:5173").split(",")
 
@@ -51,9 +54,48 @@ def set_gmail_watch(cred):
     }
     return gmail.users().watch(userId="me", body=watch_request).execute()
 
+def ensure_pubsub_subscription():
+    service_account_info = json.loads(settings.SERVICE_ACCOUNT_JSON)
+    credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/pubsub"],
+    )
+
+    subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+    topic_path = subscriber.topic_path(settings.PUBSUB_PROJECT, settings.PUBSUB_TOPIC)
+    subscription_path = subscriber.subscription_path(settings.PUBSUB_PROJECT, settings.PUBSUB_SUBSCRIPTION)
+    push_endpoint = f"{settings.BACKEND_URL}/api/v1/gmail/pubsub/push"
+
+    try:
+        subscription = subscriber.get_subscription(request={"subscription": subscription_path})
+        if subscription.push_config.push_endpoint != push_endpoint:
+            subscriber.modify_push_config(
+                request={
+                    "subscription": subscription_path,
+                    "push_config": {"push_endpoint": push_endpoint},
+                }
+            )
+    except Exception:
+        subscriber.create_subscription(
+            request={
+                "name": subscription_path,
+                "topic": topic_path,
+                "push_config": {"push_endpoint": push_endpoint},
+            }
+        )
+
+    return subscription_path
+
 async def set_gmail_watches_periodically():
     while True:
         print("Setting up Gmail Watches...")
+        try:
+            loop = asyncio.get_running_loop()
+            subscription_path = await loop.run_in_executor(None, ensure_pubsub_subscription)
+            print(f"Pub/Sub subscription ready: {subscription_path}")
+        except Exception as e:
+            print(f"Failed to ensure Pub/Sub subscription: {e}")
+
         db = app.state.db
         cursor = db["gmail_accounts"].find()
         async for cred in cursor:
