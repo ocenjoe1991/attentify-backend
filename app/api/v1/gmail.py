@@ -255,6 +255,51 @@ def has_required_gmail_scopes(scope_value: str) -> bool:
     granted_scopes = set((scope_value or "").split())
     return REQUIRED_GMAIL_SCOPES.issubset(granted_scopes)
 
+
+def get_pubsub_credentials():
+    service_account_info = json.loads(settings.SERVICE_ACCOUNT_JSON)
+    return service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/pubsub"],
+    )
+
+
+def ensure_gmail_pubsub_resources(credentials):
+    publisher = pubsub_v1.PublisherClient(credentials=credentials)
+    subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
+    topic_path = publisher.topic_path(settings.PUBSUB_PROJECT, settings.PUBSUB_TOPIC)
+    subscription_path = subscriber.subscription_path(
+        settings.PUBSUB_PROJECT,
+        settings.PUBSUB_SUBSCRIPTION,
+    )
+    push_endpoint = f"{settings.BACKEND_URL}/api/v1/gmail/pubsub/push"
+
+    try:
+        publisher.get_topic(request={"topic": topic_path})
+    except Exception:
+        publisher.create_topic(request={"name": topic_path})
+
+    try:
+        subscription = subscriber.get_subscription(request={"subscription": subscription_path})
+        existing_endpoint = subscription.push_config.push_endpoint
+        if existing_endpoint != push_endpoint:
+            subscriber.modify_push_config(
+                request={
+                    "subscription": subscription_path,
+                    "push_config": {"push_endpoint": push_endpoint},
+                }
+            )
+    except Exception:
+        subscriber.create_subscription(
+            request={
+                "name": subscription_path,
+                "topic": topic_path,
+                "push_config": {"push_endpoint": push_endpoint},
+            }
+        )
+
+    return topic_path, subscription_path
+
 #/api/v1/gmail/oauth/login
 @router.get("/oauth/login")
 async def google_oauth_login(user_id: str, company_id: str):
@@ -398,16 +443,31 @@ async def google_oauth_callback(
         ],
     )
 
+    loop = asyncio.get_running_loop()
+
+    try:
+        pubsub_credentials = get_pubsub_credentials()
+        topic_path, subscription_path = await loop.run_in_executor(
+            None,
+            ensure_gmail_pubsub_resources,
+            pubsub_credentials,
+        )
+    except Exception:
+        logger.error("Failed to prepare Gmail Pub/Sub resources", exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to prepare Gmail Pub/Sub resources",
+        )
+
     # Call Gmail API in threadpool (avoid blocking)
     def watch_gmail():
         gmail = build("gmail", "v1", credentials=creds)
         watch_request = {
             "labelIds": ["INBOX"],
-            "topicName": f"projects/{settings.PUBSUB_PROJECT}/topics/{settings.PUBSUB_TOPIC}",
+            "topicName": topic_path,
         }
         return gmail.users().watch(userId="me", body=watch_request).execute()
 
-    loop = asyncio.get_running_loop()
     try:
         watch_response = await loop.run_in_executor(None, watch_gmail)
     except HttpError as e:
@@ -421,48 +481,19 @@ async def google_oauth_callback(
                     "from Google third-party access and connect Gmail again."
                 ),
             )
+        if getattr(e, "resp", None) and e.resp.status == 400:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Google rejected the Gmail watch topic. Set PUBSUB_PROJECT to "
+                    "the same Google Cloud project ID as the OAuth client and make "
+                    "sure the Pub/Sub topic exists in that project."
+                ),
+            )
         raise HTTPException(status_code=502, detail="Failed to start Gmail watch")
     print(watch_response)
 
     history_id = watch_response["historyId"]
-
-    # Ensure Pub/Sub subscription exists
-    service_account_info = json.loads(settings.SERVICE_ACCOUNT_JSON)
-
-    credentials = service_account.Credentials.from_service_account_info(
-        service_account_info,
-        scopes=["https://www.googleapis.com/auth/pubsub"]
-    )
-
-    def ensure_subscription():
-        subscriber = pubsub_v1.SubscriberClient(credentials=credentials)
-        topic_path = subscriber.topic_path(settings.PUBSUB_PROJECT, settings.PUBSUB_TOPIC)
-        subscription_path = subscriber.subscription_path(settings.PUBSUB_PROJECT, settings.PUBSUB_SUBSCRIPTION)
-        push_endpoint = f"{settings.BACKEND_URL}/api/v1/gmail/pubsub/push"
-
-        try:
-            subscription = subscriber.get_subscription(request={"subscription": subscription_path})
-            existing_endpoint = subscription.push_config.push_endpoint
-            if existing_endpoint != push_endpoint:
-                subscriber.modify_push_config(
-                    request={
-                        "subscription": subscription_path,
-                        "push_config": {"push_endpoint": push_endpoint},
-                    }
-                )
-        except Exception:
-            subscriber.create_subscription(
-                request={
-                    "name": subscription_path, 
-                    "topic": topic_path,
-                    "push_config": {
-                        "push_endpoint": push_endpoint
-                    }
-                }
-            )
-        return subscription_path
-
-    subscription_path = await loop.run_in_executor(None, ensure_subscription)
 
     # Save/update Gmail account
     account_data = {

@@ -12,6 +12,10 @@ import os
 from app.models.message import Message, ChatEntry
 
 
+def normalize_phone(value: str) -> str:
+    return (value or "").strip().replace(" ", "")
+
+
 @router.post("/twilio/sms")
 async def twilio_sms_webhook(
     From: str = Form(...),
@@ -22,26 +26,37 @@ async def twilio_sms_webhook(
     SmsMessageSid: str = Form(None),
     request: Request = None,
 ):
-    thread_id = From  # Or customize: e.g. f"{From}:{To}"
+    db = request.app.state.db
+    from_phone = normalize_phone(From)
+    to_phone = normalize_phone(To)
+    account = await db.phone_accounts.find_one(
+        {"provider": "twilio", "phone_number": to_phone, "status": "connected"}
+    )
+    if not account:
+        return Response(content="", status_code=204)
+
+    company_id = account["company_id"]
+    user_id = account["user_id"]
+    thread_id = f"sms:{company_id}:{from_phone}:{to_phone}"
 
     # Try to find the existing thread
-    db = request.app.state.db
     doc = await db.messages.find_one({"thread_id": thread_id, "channel": "sms"})
     now = datetime.utcnow()
 
     chat_entry = ChatEntry(
-        sender=From,
-        recipient=To,
+        sender=from_phone,
+        recipient=to_phone,
         content=Body,
         title=Body,
+        timestamp=now,
         channel="sms",
         message_type="text",
         metadata={
             "MessageSid": MessageSid,
             "SmsSid": SmsSid,
             "SmsMessageSid": SmsMessageSid,
-            "from": From,
-            "to": To,
+            "from": from_phone,
+            "to": to_phone,
             "date": now
         }
     )
@@ -58,11 +73,15 @@ async def twilio_sms_webhook(
     else:
         # New thread
         msg_obj = Message(
+            user_id=user_id,
+            company_id=company_id,
             thread_id=thread_id,
-            participants=[From, To],
-            client_id=From,
+            participants=[from_phone, to_phone],
+            client=from_phone,
+            agent=to_phone,
             channel="sms",
-            status="open",
+            status="Open",
+            title=Body[:80],
             started_at=now,
             last_updated=now,
             messages=[chat_entry],
