@@ -307,6 +307,49 @@ async def update_message(id: str, payload: dict = Body(...), db: AsyncIOMotorDat
     )
     return {"message": "Message updated"}
 
+async def ensure_message_access(message_id: str, db: AsyncIOMotorDatabase, current_user: dict) -> dict:
+    if not ObjectId.is_valid(message_id):
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    message = await db["messages"].find_one({"_id": ObjectId(message_id)})
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": message["company_id"],
+        "status": "active",
+    })
+    if not membership:
+        raise HTTPException(status_code=403, detail="User is not a member of this company")
+
+    role = membership.get("role")
+    if role == "store_owner" and message.get("user_id") != current_user["_id"]:
+        raise HTTPException(status_code=403, detail="Message does not belong to this user")
+    if role == "agent" and message.get("assigned_member_id") != current_user["_id"]:
+        raise HTTPException(status_code=403, detail="Message is not assigned to this user")
+    if role not in ["company_owner", "store_owner", "agent"]:
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    return message
+
+@router.delete("/{message_id}", response_model=dict)
+async def delete_message(
+    message_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    message = await ensure_message_access(message_id, db, current_user)
+
+    if not message.get("trashed"):
+        raise HTTPException(status_code=400, detail="Only trashed messages can be permanently deleted")
+
+    result = await db["messages"].delete_one({"_id": message["_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    return {"message": "Message permanently deleted"}
+
 async def serialize_comment(comment: dict, db) -> dict:
     user = await db["users"].find_one({"_id": comment["user_id"]})
     return {
