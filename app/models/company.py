@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional
+from typing import List, Optional
 from datetime import datetime
 from bson import ObjectId
 from app.utils.bson import PyObjectId
@@ -16,6 +16,7 @@ class CompanyInDB(CompanyBase):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     created_by: PyObjectId
     created_at: datetime
+    message_permanent_delete_roles: Optional[List[str]] = None
 
     class Config:
         json_encoders = {ObjectId: str}

@@ -23,6 +23,44 @@ from math import ceil
 
 router = APIRouter()
 
+TICKET_STATUSES = {
+    "Open",
+    "Assigned",
+    "In Progress",
+    "Pending",
+    "Resolved",
+    "Escalated",
+    "Awaiting Approval",
+    "Canceled",
+}
+
+LEGACY_STATUS_MAP = {
+    "Closed": "Resolved",
+    "Cancelled": "Canceled",
+    "open": "Open",
+    "closed": "Resolved",
+    "pending": "Pending",
+}
+
+ACTIVE_STATUSES = {
+    "Open",
+    "Assigned",
+    "In Progress",
+    "Pending",
+    "Escalated",
+    "Awaiting Approval",
+}
+
+ARCHIVED_STATUSES = {
+    "Resolved",
+    "Canceled",
+}
+
+OWNER_ROLES = {"company_owner", "store_owner"}
+DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES = ["company_owner", "store_owner"]
+def normalize_status(status: str) -> str:
+    return LEGACY_STATUS_MAP.get(status, status)
+
 @router.post("/fetch-all")
 async def fetch_all(body: dict, db=Depends(get_database), current_user: dict = Depends(get_current_user)):
     company_id = body.get("company_id", "")
@@ -51,7 +89,7 @@ def doc_to_message(doc: dict) -> Message:
         session_id=doc.get("session_id"),
         started_at=doc.get("started_at"),
         last_updated=doc.get("last_updated"),
-        status=doc.get("status", "open"),
+        status=normalize_status(doc.get("status", "Open")),
         channel=doc.get("channel"),
         title=doc.get("title"),
         ai_summary=doc.get("ai_summary"),
@@ -67,7 +105,7 @@ def doc_to_message_detail(doc: dict) -> Message:
         session_id=doc.get("session_id"),
         started_at=doc.get("started_at"),
         last_updated=doc.get("last_updated"),
-        status=doc.get("status", "open"),
+        status=normalize_status(doc.get("status", "Open")),
         channel=doc.get("channel"),
         title=doc.get("title"),
         ai_summary=doc.get("ai_summary"),
@@ -139,30 +177,24 @@ async def get_company_messages(
 
     # Base query depending on role
     query = {"company_id": ObjectId(company_id)}
-    if role == "store_owner":
-        query["user_id"] = current_user["_id"]
-    elif role == "agent":
+    if role == "agent":
         query["assigned_member_id"] = current_user["_id"]
-    elif role not in ["company_owner", "store_owner", "agent"]:
+    elif role not in ["company_owner", "store_owner", "agent", "readonly"]:
         query["user_id"] = current_user["_id"]
-
-    active_statuses = {
-        "Open",
-        "Pending",
-        "Escalated",
-        "Awaiting Approval",
-    }
-    archived_statuses = {
-        "Resolved",
-        "Cancelled",
-    }
 
     if view_mode == "inbox":
         query["trashed"] = {"$ne": True}
-        query["status"] = {"$in": list(active_statuses)}
+        query["archived"] = {"$ne": True}
+        query["status"] = {"$in": list(ACTIVE_STATUSES)}
     elif view_mode == "archived":
         query["trashed"] = {"$ne": True}
-        query["status"] = {"$in": list(archived_statuses)}
+        query["$and"] = query.get("$and", [])
+        query["$and"].append({
+            "$or": [
+                {"archived": True},
+                {"status": {"$in": list(ARCHIVED_STATUSES | {"Cancelled", "Closed"})}},
+            ]
+        })
     elif view_mode == "trashed":
         query["trashed"] = True
     else:
@@ -189,21 +221,13 @@ async def get_company_messages(
             ]
         })
 
-    allowed_statuses = {
-        "Open",
-        "Closed",
-        "Pending",
-        "Resolved",
-        "Escalated",
-        "Awaiting Approval",
-        "Cancelled",
-    }
     if status_filter != "all":
-        if status_filter not in allowed_statuses:
+        status_filter = normalize_status(status_filter)
+        if status_filter not in TICKET_STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status filter")
-        if view_mode == "inbox" and status_filter not in active_statuses:
+        if view_mode == "inbox" and status_filter not in ACTIVE_STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status for inbox")
-        if view_mode == "archived" and status_filter not in archived_statuses:
+        if view_mode == "archived" and status_filter not in ARCHIVED_STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status for archive")
         query["status"] = status_filter
 
@@ -239,6 +263,7 @@ async def get_company_messages(
         doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
         doc["company_id"] = str(doc["company_id"])
+        doc["status"] = normalize_status(doc.get("status", "Open"))
         doc.pop("_sort_date", None)
 
         # Clean client name
@@ -276,13 +301,12 @@ async def get_company_messages(
     }
 
 @router.get("/{id}", response_model=dict)
-async def get_message(id: str, db: AsyncIOMotorDatabase = Depends(get_database)):
-    if not ObjectId.is_valid(id):
-        raise HTTPException(status_code=400, detail="Invalid message ID")
-
-    doc = await db["messages"].find_one({"_id": ObjectId(id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Message not found")
+async def get_message(
+    id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    doc = await ensure_message_access(id, db, current_user, action="read")
 
     # Convert ObjectIds to strings
     doc["_id"] = str(doc["_id"])
@@ -290,6 +314,7 @@ async def get_message(id: str, db: AsyncIOMotorDatabase = Depends(get_database))
     doc["company_id"] = str(doc["company_id"])
     if "assigned_member_id" in doc and doc["assigned_member_id"]:
         doc["assigned_member_id"] = str(doc["assigned_member_id"])
+    doc["status"] = normalize_status(doc.get("status", "Open"))
 
     # Properly await comment serialization
     comments = []
@@ -300,14 +325,31 @@ async def get_message(id: str, db: AsyncIOMotorDatabase = Depends(get_database))
     return doc
 
 @router.put("/{id}", response_model=dict)
-async def update_message(id: str, payload: dict = Body(...), db: AsyncIOMotorDatabase = Depends(get_database)):
-    db["messages"].find_one_and_update(
+async def update_message(
+    id: str,
+    payload: dict = Body(...),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    await ensure_message_access(id, db, current_user, action="update")
+    safe_payload = {k: v for k, v in payload.items() if k != "_id"}
+    if "status" in safe_payload:
+        safe_payload["status"] = normalize_status(safe_payload["status"])
+        if safe_payload["status"] not in TICKET_STATUSES:
+            raise HTTPException(status_code=400, detail="Invalid status")
+    safe_payload["last_updated"] = datetime.utcnow()
+    await db["messages"].find_one_and_update(
         {"_id": ObjectId(id)},
-        {"$set": payload}
+        {"$set": safe_payload}
     )
     return {"message": "Message updated"}
 
-async def ensure_message_access(message_id: str, db: AsyncIOMotorDatabase, current_user: dict) -> dict:
+async def ensure_message_access(
+    message_id: str,
+    db: AsyncIOMotorDatabase,
+    current_user: dict,
+    action: str = "read",
+) -> dict:
     if not ObjectId.is_valid(message_id):
         raise HTTPException(status_code=400, detail="Invalid message ID")
 
@@ -324,11 +366,11 @@ async def ensure_message_access(message_id: str, db: AsyncIOMotorDatabase, curre
         raise HTTPException(status_code=403, detail="User is not a member of this company")
 
     role = membership.get("role")
-    if role == "store_owner" and message.get("user_id") != current_user["_id"]:
-        raise HTTPException(status_code=403, detail="Message does not belong to this user")
+    if action != "read" and role == "readonly":
+        raise HTTPException(status_code=403, detail="Read-only users cannot modify messages")
     if role == "agent" and message.get("assigned_member_id") != current_user["_id"]:
         raise HTTPException(status_code=403, detail="Message is not assigned to this user")
-    if role not in ["company_owner", "store_owner", "agent"]:
+    if role not in ["company_owner", "store_owner", "agent", "readonly"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     return message
@@ -340,6 +382,20 @@ async def delete_message(
     current_user: dict = Depends(get_current_user),
 ):
     message = await ensure_message_access(message_id, db, current_user)
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": message["company_id"],
+        "status": "active",
+    })
+    role = membership.get("role") if membership else None
+    company = await db["companies"].find_one({"_id": message["company_id"]})
+    allowed_roles = (
+        company.get("message_permanent_delete_roles")
+        if company
+        else DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES
+    ) or DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES
+    if role not in allowed_roles:
+        raise HTTPException(status_code=403, detail="Permanent delete is not enabled for this role")
 
     if not message.get("trashed"):
         raise HTTPException(status_code=400, detail="Only trashed messages can be permanently deleted")
@@ -370,11 +426,14 @@ async def add_comment(
     user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_database)
 ):
-    if not ObjectId.is_valid(message_id):
-        raise HTTPException(status_code=400, detail="Invalid message ID")
+    await ensure_message_access(message_id, db, user, action="update")
 
-    content = payload.get("content")
+    content = (payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Comment content is required")
     status = payload.get("status", "Pending")
+    if status not in {"Pending", "Resolved", "Awaiting Approval"}:
+        raise HTTPException(status_code=400, detail="Invalid comment status")
 
     # Build new comment object
     new_comment = {
@@ -407,6 +466,24 @@ async def edit_comment(
 ):
     if not (ObjectId.is_valid(message_id) and ObjectId.is_valid(comment_id)):
         raise HTTPException(status_code=400, detail="Invalid IDs")
+    content = content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Comment content is required")
+    message = await ensure_message_access(message_id, db, user, action="update")
+    membership = await db["memberships"].find_one({
+        "user_id": user["_id"],
+        "company_id": message["company_id"],
+        "status": "active",
+    })
+    role = membership.get("role") if membership else None
+    existing_comment = next(
+        (c for c in message.get("comments", []) if c.get("_id") == ObjectId(comment_id)),
+        None,
+    )
+    if not existing_comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if existing_comment.get("user_id") != user["_id"] and role not in OWNER_ROLES:
+        raise HTTPException(status_code=403, detail="Only the author or an owner can edit this comment")
     
     # Find and update comment inside array
     result = await db["messages"].update_one(
@@ -439,6 +516,16 @@ async def approve_comment(
 ):
     if not (ObjectId.is_valid(message_id) and ObjectId.is_valid(comment_id)):
         raise HTTPException(status_code=400, detail="Invalid IDs")
+    message = await ensure_message_access(message_id, db, user, action="update")
+    membership = await db["memberships"].find_one({
+        "user_id": user["_id"],
+        "company_id": message["company_id"],
+        "status": "active",
+    })
+    if not membership or membership.get("role") not in OWNER_ROLES:
+        raise HTTPException(status_code=403, detail="Only owners can approve resolution comments")
+    if status not in {"Pending", "Resolved", "Awaiting Approval"}:
+        raise HTTPException(status_code=400, detail="Invalid comment status")
     
     # Find and update comment inside array
     result = await db["messages"].update_one(
@@ -470,6 +557,21 @@ async def delete_comment(
 ):
     if not (ObjectId.is_valid(message_id) and ObjectId.is_valid(comment_id)):
         raise HTTPException(status_code=400, detail="Invalid IDs")
+    message = await ensure_message_access(message_id, db, user, action="update")
+    membership = await db["memberships"].find_one({
+        "user_id": user["_id"],
+        "company_id": message["company_id"],
+        "status": "active",
+    })
+    role = membership.get("role") if membership else None
+    existing_comment = next(
+        (c for c in message.get("comments", []) if c.get("_id") == ObjectId(comment_id)),
+        None,
+    )
+    if not existing_comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if existing_comment.get("user_id") != user["_id"] and role not in OWNER_ROLES:
+        raise HTTPException(status_code=403, detail="Only the author or an owner can delete this comment")
 
     result = await db["messages"].update_one(
         {"_id": ObjectId(message_id)},
@@ -485,8 +587,16 @@ async def delete_comment(
 async def update_message_field(
     message_id: str,
     body: dict = Body(...), 
-    db: AsyncIOMotorDatabase = Depends(get_database)
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
 ):
+    message = await ensure_message_access(message_id, db, current_user, action="update")
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": message["company_id"],
+        "status": "active",
+    })
+    role = membership.get("role") if membership else None
     field = body.get("field")
     value = body.get("value")
 
@@ -494,8 +604,13 @@ async def update_message_field(
         raise HTTPException(status_code=400, detail="Field is required")
 
     # Optionally, prevent updates to _id or forbidden fields
-    if field == "_id":
-        raise HTTPException(status_code=400, detail="Cannot update _id field")
+    allowed_fields = {"assigned_member_id", "status", "trashed", "archived"}
+    if field not in allowed_fields:
+        raise HTTPException(status_code=400, detail="Field cannot be updated here")
+    if field == "assigned_member_id" and role not in OWNER_ROLES:
+        raise HTTPException(status_code=403, detail="Only owners can assign messages")
+    if field in {"trashed", "archived"} and role not in OWNER_ROLES:
+        raise HTTPException(status_code=403, detail="Only owners can move messages")
     
     # Convert to ObjectId where needed
     if field == "assigned_member_id" and value:
@@ -503,11 +618,26 @@ async def update_message_field(
             value = ObjectId(value)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid assigned_member_id")
+        assigned_membership = await db["memberships"].find_one({
+            "user_id": value,
+            "company_id": message["company_id"],
+            "role": "agent",
+            "status": "active",
+        })
+        if not assigned_membership:
+            raise HTTPException(status_code=400, detail="Assigned user must be an active agent in this company")
+    if field == "status":
+        value = normalize_status(value)
+        if value not in TICKET_STATUSES:
+            raise HTTPException(status_code=400, detail="Invalid status")
 
     # Perform update
+    set_payload = {field: value, "last_updated": datetime.utcnow()}
+    if field == "assigned_member_id" and value and normalize_status(message.get("status", "Open")) == "Open":
+        set_payload["status"] = "Assigned"
     result = await db["messages"].update_one(
         {"_id": ObjectId(message_id)},
-        {"$set": {field: value}}
+        {"$set": set_payload}
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Message not found")
@@ -538,6 +668,7 @@ def clean_json_response(response: str):
 async def analyze_email_message_as_list(
     body: dict = Body(...),
     db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Analyze all email ChatEntry objects in a message and extract order/refund/cancel info as JSON.
@@ -548,9 +679,7 @@ async def analyze_email_message_as_list(
     if not message_id or not ObjectId.is_valid(message_id):
         raise HTTPException(status_code=400, detail="Invalid message ID")
 
-    doc = await db["messages"].find_one({"_id": ObjectId(message_id)})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Message not found")
+    doc = await ensure_message_access(message_id, db, current_user, action="read")
 
     result = await analyze_emails_with_ai(doc)
     order_list = []
@@ -569,6 +698,7 @@ async def analyze_email_message_as_list(
 async def analyze_email_message(
     body: dict = Body(...),
     db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Analyze the last three email ChatEntry objects in a message and extract order/refund/cancel info as JSON.
@@ -579,9 +709,7 @@ async def analyze_email_message(
     if not message_id or not ObjectId.is_valid(message_id):
         raise HTTPException(status_code=400, detail="Invalid message ID")
 
-    message_doc = await db["messages"].find_one({"_id": ObjectId(message_id)})
-    if not message_doc:
-        raise HTTPException(status_code=404, detail="Message not found")
+    message_doc = await ensure_message_access(message_id, db, current_user, action="update")
 
     if not (order_info := message_doc.get('order_info')):
         result = await analyze_emails_with_ai(message_doc)
@@ -651,7 +779,8 @@ async def analyze_email_message(
 async def reply_to_message(
     id: str,
     body: dict = Body(...),  # expects: { "content": "the reply text" }
-    db: AsyncIOMotorDatabase = Depends(get_database)
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Reply to a message by adding a new ChatEntry and sending email via Gmail API.
@@ -662,9 +791,11 @@ async def reply_to_message(
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid message ID")
     
-    message = await db["messages"].find_one({"_id": ObjectId(id)})
-    if not message:
-        raise HTTPException(status_code=404, detail="Message not found")
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Reply content is required")
+
+    message = await ensure_message_access(id, db, current_user, action="update")
     
     # Find latest client message for threading
     client_message = None
@@ -695,7 +826,7 @@ async def reply_to_message(
     if original_msg_id and not original_msg_id.startswith("<"):
         original_msg_id = f"<{original_msg_id}>"
 
-    mime_msg = MIMEText(body["content"], "html")
+    mime_msg = MIMEText(content, "html")
     mime_msg['To'] = to_addr
     mime_msg['From'] = agent_email
     mime_msg['Subject'] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
@@ -721,7 +852,7 @@ async def reply_to_message(
     reply_entry = {
         "sender": agent_email,
         "recipient": to_addr,
-        "content": body["content"],
+        "content": content,
         "title": subject if subject.lower().startswith("re:") else f"Re: {subject}",
         "timestamp": datetime.utcnow(),
         "message_type": "html",

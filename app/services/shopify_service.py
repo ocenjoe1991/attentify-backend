@@ -99,11 +99,17 @@ async def upsert_orders(db, shop, orders):
             },
             "shipping_address": order.get("shipping_address", {}),
             "billing_address": order.get("billing_address", {}),
+            "total_shipping_price": (
+                order.get("total_shipping_price_set", {})
+                    .get("shop_money", {})
+                    .get("amount", 0)
+            ),
             "total_price": order.get("total_price"),
             "payment_status": order.get("financial_status"),
             "fulfillment_status": order.get("fulfillment_status"),
             "line_items": [
                 {
+                    "id": item.get("id"),
                     "product_id": item.get("product_id"),
                     "name": item.get("name"),
                     "quantity": item.get("quantity"),
@@ -121,4 +127,4 @@ async def upsert_orders(db, shop, orders):
             )
         )
     if bulk_ops:
-        db.orders.bulk_write(bulk_ops)
+        await db.orders.bulk_write(bulk_ops)

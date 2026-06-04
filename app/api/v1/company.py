@@ -10,11 +10,22 @@ from app.core.security import create_access_token
 
 router = APIRouter()
 
+OWNER_ROLES = {"company_owner", "store_owner"}
+VALID_MESSAGE_DELETE_ROLES = {"company_owner", "store_owner", "agent", "readonly"}
+DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES = ["company_owner", "store_owner"]
+
 def transform_company(company):
     return {
         "id": str(company["_id"]),
         **{k: v for k, v in company.items() if k != "_id"}
     }
+
+async def get_active_membership(db, user_id, company_id):
+    return await db["memberships"].find_one({
+        "user_id": user_id,
+        "company_id": company_id,
+        "status": "active",
+    })
 
 #GET /api/v1/company/
 @router.get("/", response_model=List[SimpleCompanyOut])
@@ -53,6 +64,7 @@ async def create_company(company: CompanyCreate, current_user: dict = Depends(ge
         "email": company.email,
         "created_by": ObjectId(current_user["_id"]),
         "created_at": now,
+        "message_permanent_delete_roles": DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES,
     }
     
     result = await db.companies.insert_one(company_doc)
@@ -111,13 +123,17 @@ async def get_company(
     if not company:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found")
 
-    # Optional: check if current_user has access rights to this company
-    # if company["created_by"] != current_user["_id"]:
-    #     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    membership = await get_active_membership(db, current_user["_id"], ObjectId(company_id))
+    if not membership:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     # Convert ObjectId fields to str
     company["id"] = str(company["_id"])
     company["created_by"] = str(company["created_by"])
+    company["message_permanent_delete_roles"] = company.get(
+        "message_permanent_delete_roles",
+        DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES,
+    )
 
     return CompanyInDB.parse_obj(company)
     
@@ -130,6 +146,10 @@ async def update_company(
 ):
     if not ObjectId.is_valid(payload.company_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
+
+    membership = await get_active_membership(db, current_user["_id"], ObjectId(payload.company_id))
+    if not membership or membership.get("role") != "company_owner":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only company owners can update company settings")
 
     # Build dynamic update fields
     update_data = {}
@@ -158,6 +178,44 @@ async def update_company(
         "site_url": updated_company.get("site_url"),
         "email": updated_company.get("email")
     }
+
+@router.put("/{company_id}/message-delete-policy")
+async def update_message_delete_policy(
+    company_id: str,
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
+
+    company_object_id = ObjectId(company_id)
+    membership = await get_active_membership(db, current_user["_id"], company_object_id)
+    if not membership or membership.get("role") != "company_owner":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only company owners can update delete permissions")
+
+    roles = payload.get("message_permanent_delete_roles")
+    if not isinstance(roles, list):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Roles must be a list")
+
+    cleaned_roles = []
+    for role in roles:
+        if role not in VALID_MESSAGE_DELETE_ROLES:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
+        if role not in cleaned_roles:
+            cleaned_roles.append(role)
+
+    if not any(role in OWNER_ROLES for role in cleaned_roles):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one owner role must keep permanent delete access")
+
+    result = await db["companies"].update_one(
+        {"_id": company_object_id},
+        {"$set": {"message_permanent_delete_roles": cleaned_roles}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found")
+
+    return {"message_permanent_delete_roles": cleaned_roles}
 
 #GET /api/v1/company/{company_id}/members
 @router.get("/{company_id}/members", response_model=List[dict])
