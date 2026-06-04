@@ -10,6 +10,7 @@ from jose import jwt, JWTError
 from app.core.config import settings
 from fastapi.responses import RedirectResponse
 from app.core.security import get_current_user, create_access_token
+from app.core.permissions import ROLE_ADMIN, ROLE_COMPANY_OWNER, normalize_custom_permissions
 
 router = APIRouter()
 
@@ -24,8 +25,10 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
         "company_id": ObjectId(invite.company_id),
         "status": "active",
     })
-    if current_user.get("role") != "admin" and (not membership or membership.get("role") != "company_owner"):
+    if current_user.get("role") != ROLE_ADMIN and (not membership or membership.get("role") != ROLE_COMPANY_OWNER):
         raise HTTPException(status_code=403, detail="Only administrators or owners can send invitations")
+
+    custom_permissions = normalize_custom_permissions(invite.custom_permissions)
 
     # Check if invitation already exists
     existing_invite = await db["invitations"].find_one(
@@ -45,7 +48,7 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
         {
             "$set": {
                 "role": invite.role,
-                "custom_permissions": invite.custom_permissions,
+                "custom_permissions": custom_permissions,
                 "token": token,
                 "invited_at": datetime.utcnow(),
                 "status": "pending"

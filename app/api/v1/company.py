@@ -7,12 +7,16 @@ from app.db.mongodb import get_database
 from app.core.security import get_current_user
 from typing import List
 from app.core.security import create_access_token
+from app.core.permissions import (
+    ROLE_ADMIN,
+    ROLE_COMPANY_OWNER,
+    ROLE_PERMISSIONS,
+    normalize_custom_permissions,
+)
 
 router = APIRouter()
 
-OWNER_ROLES = {"company_owner", "store_owner"}
 VALID_MESSAGE_DELETE_ROLES = {"company_owner", "store_owner", "agent", "readonly"}
-VALID_CUSTOM_PERMISSIONS = {"permanent_delete_ticket"}
 
 def transform_company(company):
     return {
@@ -27,26 +31,12 @@ async def get_active_membership(db, user_id, company_id):
         "status": "active",
     })
 
-def normalize_custom_permissions(permissions):
-    if permissions is None:
-        return []
-    if not isinstance(permissions, list):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Custom permissions must be a list")
-
-    cleaned_permissions = []
-    for permission in permissions:
-        if permission not in VALID_CUSTOM_PERMISSIONS:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid custom permission")
-        if permission not in cleaned_permissions:
-            cleaned_permissions.append(permission)
-    return cleaned_permissions
-
 async def ensure_member_admin(db, current_user, company_id):
-    if current_user.get("role") == "admin":
+    if current_user.get("role") == ROLE_ADMIN:
         return
 
     membership = await get_active_membership(db, current_user["_id"], company_id)
-    if not membership or membership.get("role") != "company_owner":
+    if not membership or membership.get("role") != ROLE_COMPANY_OWNER:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only administrators or owners can manage members")
 
 #GET /api/v1/company/
@@ -167,7 +157,7 @@ async def update_company(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
 
     membership = await get_active_membership(db, current_user["_id"], ObjectId(payload.company_id))
-    if not membership or membership.get("role") != "company_owner":
+    if current_user.get("role") != ROLE_ADMIN and (not membership or membership.get("role") != ROLE_COMPANY_OWNER):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only company owners can update company settings")
 
     # Build dynamic update fields
@@ -246,6 +236,10 @@ async def list_company_members(
     if not ObjectId.is_valid(company_id):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
 
+    membership = await get_active_membership(db, current_user["_id"], ObjectId(company_id))
+    if current_user.get("role") != ROLE_ADMIN and not membership:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
     members_cursor = db["memberships"].find({
         "company_id": ObjectId(company_id),
         "status": "active"
@@ -279,6 +273,24 @@ async def list_company_members(
         })
 
     return memberships
+
+@router.get("/{company_id}/role-permissions", response_model=dict)
+async def get_role_permissions(
+    company_id: str,
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
+
+    membership = await get_active_membership(db, current_user["_id"], ObjectId(company_id))
+    if current_user.get("role") != ROLE_ADMIN and not membership:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    return {
+        role: sorted(list(permissions))
+        for role, permissions in ROLE_PERMISSIONS.items()
+    }
 
 #GET /api/v1/company/{company_id}/active_members
 @router.get("/{company_id}/active_members", response_model=List[dict])
@@ -330,6 +342,7 @@ async def delete_membership(
 
         if not membership:
             raise HTTPException(status_code=404, detail="Membership not found")
+        await ensure_member_admin(db, current_user, membership["company_id"])
 
         result = await db.memberships.delete_one({"_id": ObjectId(id)})
 
@@ -353,6 +366,7 @@ async def delete_membership(
 
         if not invitation:
             raise HTTPException(status_code=404, detail="Invitation not found")
+        await ensure_member_admin(db, current_user, invitation["company_id"])
 
         result = await db.invitations.delete_one({"_id": ObjectId(id)})
     if result.deleted_count == 0:

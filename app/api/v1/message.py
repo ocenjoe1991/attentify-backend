@@ -18,6 +18,12 @@ from datetime import datetime, timezone
 from email.utils import parseaddr
 from pymongo import ASCENDING, DESCENDING
 from app.core.security import get_current_user
+from app.core.permissions import (
+    OWNER_ROLES,
+    PERMISSION_RESOLVE_WITHOUT_OWNER_APPROVAL,
+    can_permanently_delete_ticket,
+    has_owner_approval_bypass,
+)
 
 from math import ceil
 
@@ -56,8 +62,6 @@ ARCHIVED_STATUSES = {
     "Canceled",
 }
 
-OWNER_ROLES = {"company_owner", "store_owner"}
-PERMANENT_DELETE_PERMISSION = "permanent_delete_ticket"
 def normalize_status(status: str) -> str:
     return LEGACY_STATUS_MAP.get(status, status)
 
@@ -331,12 +335,23 @@ async def update_message(
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict = Depends(get_current_user),
 ):
-    await ensure_message_access(id, db, current_user, action="update")
+    message = await ensure_message_access(id, db, current_user, action="update")
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": message["company_id"],
+        "status": "active",
+    })
     safe_payload = {k: v for k, v in payload.items() if k != "_id"}
     if "status" in safe_payload:
         safe_payload["status"] = normalize_status(safe_payload["status"])
         if safe_payload["status"] not in TICKET_STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status")
+        if (
+            safe_payload["status"] == "Resolved"
+            and membership.get("role") not in OWNER_ROLES
+            and not has_owner_approval_bypass(membership, PERMISSION_RESOLVE_WITHOUT_OWNER_APPROVAL)
+        ):
+            safe_payload["status"] = "Awaiting Approval"
     safe_payload["last_updated"] = datetime.utcnow()
     await db["messages"].find_one_and_update(
         {"_id": ObjectId(id)},
@@ -388,8 +403,7 @@ async def delete_message(
         "status": "active",
     })
     role = membership.get("role") if membership else None
-    custom_permissions = membership.get("custom_permissions", []) if membership else []
-    if role not in OWNER_ROLES and PERMANENT_DELETE_PERMISSION not in custom_permissions:
+    if not can_permanently_delete_ticket(membership):
         raise HTTPException(status_code=403, detail="Permanent delete is not enabled for this account")
 
     if not message.get("trashed"):
@@ -421,12 +435,25 @@ async def add_comment(
     user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_database)
 ):
-    await ensure_message_access(message_id, db, user, action="update")
+    message = await ensure_message_access(message_id, db, user, action="update")
 
     content = (payload.get("content") or "").strip()
     if not content:
         raise HTTPException(status_code=400, detail="Comment content is required")
     status = payload.get("status", "Pending")
+    membership = await db["memberships"].find_one({
+        "user_id": user["_id"],
+        "company_id": message["company_id"],
+        "status": "active",
+    })
+    can_resolve_without_owner = has_owner_approval_bypass(
+        membership,
+        PERMISSION_RESOLVE_WITHOUT_OWNER_APPROVAL,
+    )
+    if status == "Resolved" and not can_resolve_without_owner:
+        status = "Awaiting Approval"
+    elif status == "Awaiting Approval" and can_resolve_without_owner:
+        status = "Resolved"
     if status not in {"Pending", "Resolved", "Awaiting Approval"}:
         raise HTTPException(status_code=400, detail="Invalid comment status")
 
@@ -518,7 +545,8 @@ async def approve_comment(
         "status": "active",
     })
     if not membership or membership.get("role") not in OWNER_ROLES:
-        raise HTTPException(status_code=403, detail="Only owners can approve resolution comments")
+        if not has_owner_approval_bypass(membership, PERMISSION_RESOLVE_WITHOUT_OWNER_APPROVAL):
+            raise HTTPException(status_code=403, detail="Only owners or permitted users can approve resolution comments")
     if status not in {"Pending", "Resolved", "Awaiting Approval"}:
         raise HTTPException(status_code=400, detail="Invalid comment status")
     
@@ -625,6 +653,12 @@ async def update_message_field(
         value = normalize_status(value)
         if value not in TICKET_STATUSES:
             raise HTTPException(status_code=400, detail="Invalid status")
+        if (
+            value == "Resolved"
+            and role not in OWNER_ROLES
+            and not has_owner_approval_bypass(membership, PERMISSION_RESOLVE_WITHOUT_OWNER_APPROVAL)
+        ):
+            value = "Awaiting Approval"
 
     # Perform update
     set_payload = {field: value, "last_updated": datetime.utcnow()}

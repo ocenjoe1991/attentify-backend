@@ -9,7 +9,7 @@ from app.models.company import CompanyInDB
 class MembershipBase(BaseModel):
     role: Literal["company_owner", "store_owner", "agent", "readonly"]
     status: Literal["active", "invited", "suspended"] = "active"
-    custom_permissions: List[str] = []
+    custom_permissions: List[str] = Field(default_factory=list)
 
 class MembershipCreate(MembershipBase):
     user_id: PyObjectId

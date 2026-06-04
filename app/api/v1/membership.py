@@ -3,34 +3,22 @@ from app.models.membership import UpdateMembershipRequest
 from bson import ObjectId
 from app.db.mongodb import get_database
 from app.core.security import get_current_user
+from app.core.permissions import ROLE_ADMIN, ROLE_COMPANY_OWNER, normalize_custom_permissions
 
 router = APIRouter()
 
-VALID_CUSTOM_PERMISSIONS = {"permanent_delete_ticket"}
-
 async def ensure_membership_admin(db, current_user, target_membership):
-    if current_user.get("role") == "admin":
+    if current_user.get("role") == ROLE_ADMIN:
         return
 
     admin_membership = await db["memberships"].find_one({
         "user_id": current_user["_id"],
         "company_id": target_membership["company_id"],
-        "role": "company_owner",
+        "role": ROLE_COMPANY_OWNER,
         "status": "active",
     })
     if not admin_membership:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only administrators or owners can update memberships")
-
-def normalize_custom_permissions(permissions):
-    if permissions is None:
-        return None
-    cleaned_permissions = []
-    for permission in permissions:
-        if permission not in VALID_CUSTOM_PERMISSIONS:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid custom permission")
-        if permission not in cleaned_permissions:
-            cleaned_permissions.append(permission)
-    return cleaned_permissions
 
 #POST /api/v1/membership/update
 @router.post("/update")
@@ -54,8 +42,8 @@ async def update_membership(
         update_data["role"] = payload.role
     if payload.status is not None:
         update_data["status"] = payload.status
-    normalized_permissions = normalize_custom_permissions(payload.custom_permissions)
-    if normalized_permissions is not None:
+    if payload.custom_permissions is not None:
+        normalized_permissions = normalize_custom_permissions(payload.custom_permissions)
         update_data["custom_permissions"] = normalized_permissions
 
     if not update_data:

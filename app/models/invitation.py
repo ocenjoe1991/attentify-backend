@@ -9,7 +9,7 @@ class InvitationBase(BaseModel):
     email: EmailStr
     company_id: PyObjectId
     role: Literal["company_owner", "store_owner", "agent", "readonly"]
-    custom_permissions: List[str] = []
+    custom_permissions: List[str] = Field(default_factory=list)
 
 class InvitationDetails(BaseModel):
     email: str

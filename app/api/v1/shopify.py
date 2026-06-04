@@ -16,6 +16,11 @@ from app.services.shopify_service import (
 from math import ceil
 from app.db.mongodb import get_database
 from app.core.security import get_current_user
+from app.core.permissions import (
+    PERMISSION_CANCELLATION_WITHOUT_OWNER_APPROVAL,
+    PERMISSION_REFUND_WITHOUT_OWNER_APPROVAL,
+    has_owner_approval_bypass,
+)
 import httpx
 
 router = APIRouter()
@@ -737,11 +742,15 @@ async def refund_order(
     membership = await require_company_member(db, current_user, order["company_id"])
     approvals = await get_governance_settings(db)
     amount_for_approval = float(refund_amount or 0)
-    requires_owner = approvals.get("refund_requires_owner", True) and membership.get("role") != "company_owner"
+    can_bypass_refund_approval = has_owner_approval_bypass(
+        membership,
+        PERMISSION_REFUND_WITHOUT_OWNER_APPROVAL,
+    )
+    requires_owner = approvals.get("refund_requires_owner", True) and not can_bypass_refund_approval
     high_value_requires_owner = (
         approvals.get("high_value_refund_requires_owner", True)
         and amount_for_approval >= float(approvals.get("high_value_refund_threshold", 100))
-        and membership.get("role") != "company_owner"
+        and not can_bypass_refund_approval
     )
     if requires_owner or high_value_requires_owner:
         return JSONResponse(
@@ -909,7 +918,10 @@ async def cancel_order(
 
     membership = await require_company_member(db, current_user, order_doc["company_id"])
     approvals = await get_governance_settings(db)
-    if approvals.get("cancellation_requires_owner", True) and membership.get("role") != "company_owner":
+    if approvals.get("cancellation_requires_owner", True) and not has_owner_approval_bypass(
+        membership,
+        PERMISSION_CANCELLATION_WITHOUT_OWNER_APPROVAL,
+    ):
         return JSONResponse(
             status_code=202,
             content=await create_approval_request(
