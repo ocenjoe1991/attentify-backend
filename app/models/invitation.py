@@ -1,7 +1,7 @@
 # models/invitation.py
 from pydantic import BaseModel, EmailStr, Field
 from datetime import datetime
-from typing import Literal
+from typing import List, Literal
 from bson import ObjectId
 from app.utils.bson import PyObjectId
 
@@ -9,6 +9,7 @@ class InvitationBase(BaseModel):
     email: EmailStr
     company_id: PyObjectId
     role: Literal["company_owner", "store_owner", "agent", "readonly"]
+    custom_permissions: List[str] = []
 
 class InvitationDetails(BaseModel):
     email: str

@@ -15,9 +15,17 @@ router = APIRouter()
 
 # POST /api/v1/invitations/send
 @router.post("/send")
-async def send_invitation(invite: InvitationBase, db=Depends(get_database)):
+async def send_invitation(invite: InvitationBase, db=Depends(get_database), current_user=Depends(get_current_user)):
     if not ObjectId.is_valid(str(invite.company_id)):
         raise HTTPException(status_code=400, detail="Invalid company ID")
+
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": ObjectId(invite.company_id),
+        "status": "active",
+    })
+    if current_user.get("role") != "admin" and (not membership or membership.get("role") != "company_owner"):
+        raise HTTPException(status_code=403, detail="Only administrators or owners can send invitations")
 
     # Check if invitation already exists
     existing_invite = await db["invitations"].find_one(
@@ -37,6 +45,7 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database)):
         {
             "$set": {
                 "role": invite.role,
+                "custom_permissions": invite.custom_permissions,
                 "token": token,
                 "invited_at": datetime.utcnow(),
                 "status": "pending"
@@ -81,6 +90,7 @@ async def accept_invitation_token(
         "company_id": ObjectId(company_id),
         "role": invitation["role"],
         "status": "active",
+        "custom_permissions": invitation.get("custom_permissions", []),
         "joined_at": datetime.utcnow(),
         "last_used_at": datetime.utcnow()
     })
@@ -144,6 +154,7 @@ async def accept_invitation(db=Depends(get_database), current_user=Depends(get_c
         "company_id": invitation["company_id"],
         "role": invitation["role"],
         "status": "active",
+        "custom_permissions": invitation.get("custom_permissions", []),
         "joined_at": now,
         "last_used_at": now
     })

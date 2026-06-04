@@ -57,7 +57,7 @@ ARCHIVED_STATUSES = {
 }
 
 OWNER_ROLES = {"company_owner", "store_owner"}
-DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES = ["company_owner", "store_owner"]
+PERMANENT_DELETE_PERMISSION = "permanent_delete_ticket"
 def normalize_status(status: str) -> str:
     return LEGACY_STATUS_MAP.get(status, status)
 
@@ -388,14 +388,9 @@ async def delete_message(
         "status": "active",
     })
     role = membership.get("role") if membership else None
-    company = await db["companies"].find_one({"_id": message["company_id"]})
-    allowed_roles = (
-        company.get("message_permanent_delete_roles")
-        if company
-        else DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES
-    ) or DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES
-    if role not in allowed_roles:
-        raise HTTPException(status_code=403, detail="Permanent delete is not enabled for this role")
+    custom_permissions = membership.get("custom_permissions", []) if membership else []
+    if role not in OWNER_ROLES and PERMANENT_DELETE_PERMISSION not in custom_permissions:
+        raise HTTPException(status_code=403, detail="Permanent delete is not enabled for this account")
 
     if not message.get("trashed"):
         raise HTTPException(status_code=400, detail="Only trashed messages can be permanently deleted")

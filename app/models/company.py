@@ -16,7 +16,7 @@ class CompanyInDB(CompanyBase):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     created_by: PyObjectId
     created_at: datetime
-    message_permanent_delete_roles: Optional[List[str]] = None
+    current_user_custom_permissions: Optional[List[str]] = None
 
     class Config:
         json_encoders = {ObjectId: str}

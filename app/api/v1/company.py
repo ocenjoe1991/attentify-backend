@@ -12,7 +12,7 @@ router = APIRouter()
 
 OWNER_ROLES = {"company_owner", "store_owner"}
 VALID_MESSAGE_DELETE_ROLES = {"company_owner", "store_owner", "agent", "readonly"}
-DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES = ["company_owner", "store_owner"]
+VALID_CUSTOM_PERMISSIONS = {"permanent_delete_ticket"}
 
 def transform_company(company):
     return {
@@ -26,6 +26,28 @@ async def get_active_membership(db, user_id, company_id):
         "company_id": company_id,
         "status": "active",
     })
+
+def normalize_custom_permissions(permissions):
+    if permissions is None:
+        return []
+    if not isinstance(permissions, list):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Custom permissions must be a list")
+
+    cleaned_permissions = []
+    for permission in permissions:
+        if permission not in VALID_CUSTOM_PERMISSIONS:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid custom permission")
+        if permission not in cleaned_permissions:
+            cleaned_permissions.append(permission)
+    return cleaned_permissions
+
+async def ensure_member_admin(db, current_user, company_id):
+    if current_user.get("role") == "admin":
+        return
+
+    membership = await get_active_membership(db, current_user["_id"], company_id)
+    if not membership or membership.get("role") != "company_owner":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only administrators or owners can manage members")
 
 #GET /api/v1/company/
 @router.get("/", response_model=List[SimpleCompanyOut])
@@ -64,7 +86,6 @@ async def create_company(company: CompanyCreate, current_user: dict = Depends(ge
         "email": company.email,
         "created_by": ObjectId(current_user["_id"]),
         "created_at": now,
-        "message_permanent_delete_roles": DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES,
     }
     
     result = await db.companies.insert_one(company_doc)
@@ -76,6 +97,7 @@ async def create_company(company: CompanyCreate, current_user: dict = Depends(ge
         "company_id": company_id,
         "role": "company_owner",
         "status": "active",
+        "custom_permissions": [],
         "joined_at": now,
         "last_used_at": now,
     }
@@ -130,10 +152,7 @@ async def get_company(
     # Convert ObjectId fields to str
     company["id"] = str(company["_id"])
     company["created_by"] = str(company["created_by"])
-    company["message_permanent_delete_roles"] = company.get(
-        "message_permanent_delete_roles",
-        DEFAULT_MESSAGE_PERMANENT_DELETE_ROLES,
-    )
+    company["current_user_custom_permissions"] = membership.get("custom_permissions", [])
 
     return CompanyInDB.parse_obj(company)
     
@@ -179,43 +198,43 @@ async def update_company(
         "email": updated_company.get("email")
     }
 
-@router.put("/{company_id}/message-delete-policy")
-async def update_message_delete_policy(
-    company_id: str,
+@router.post("/update-member")
+async def update_company_member(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
     db=Depends(get_database),
 ):
-    if not ObjectId.is_valid(company_id):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
+    member_id = payload.get("id")
+    member_status = payload.get("status", "active")
+    role = payload.get("role")
+    custom_permissions = normalize_custom_permissions(payload.get("custom_permissions", []))
 
-    company_object_id = ObjectId(company_id)
-    membership = await get_active_membership(db, current_user["_id"], company_object_id)
-    if not membership or membership.get("role") != "company_owner":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only company owners can update delete permissions")
+    if not member_id or not ObjectId.is_valid(member_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid member ID")
+    if member_status not in {"active", "pending"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid member status")
+    if role not in VALID_MESSAGE_DELETE_ROLES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
 
-    roles = payload.get("message_permanent_delete_roles")
-    if not isinstance(roles, list):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Roles must be a list")
+    collection_name = "memberships" if member_status == "active" else "invitations"
+    member = await db[collection_name].find_one({"_id": ObjectId(member_id)})
+    if not member:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
 
-    cleaned_roles = []
-    for role in roles:
-        if role not in VALID_MESSAGE_DELETE_ROLES:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
-        if role not in cleaned_roles:
-            cleaned_roles.append(role)
+    await ensure_member_admin(db, current_user, member["company_id"])
 
-    if not any(role in OWNER_ROLES for role in cleaned_roles):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one owner role must keep permanent delete access")
-
-    result = await db["companies"].update_one(
-        {"_id": company_object_id},
-        {"$set": {"message_permanent_delete_roles": cleaned_roles}},
+    result = await db[collection_name].update_one(
+        {"_id": ObjectId(member_id)},
+        {"$set": {"role": role, "custom_permissions": custom_permissions}},
     )
     if result.matched_count == 0:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
 
-    return {"message_permanent_delete_roles": cleaned_roles}
+    return {
+        "id": member_id,
+        "role": role,
+        "custom_permissions": custom_permissions,
+    }
 
 #GET /api/v1/company/{company_id}/members
 @router.get("/{company_id}/members", response_model=List[dict])
@@ -241,7 +260,8 @@ async def list_company_members(
                 "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
                 "email": user["email"],
                 "role": membership["role"],
-                "status": "active"
+                "status": "active",
+                "custom_permissions": membership.get("custom_permissions", []),
             })
 
     invitations_cursor = db["invitations"].find({
@@ -254,7 +274,8 @@ async def list_company_members(
             "id": str(invitation["_id"]),
             "email": invitation["email"],
             "role": invitation["role"],
-            "status": "pending"
+            "status": "pending",
+            "custom_permissions": invitation.get("custom_permissions", []),
         })
 
     return memberships
