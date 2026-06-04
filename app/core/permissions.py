@@ -101,8 +101,7 @@ def has_owner_approval_bypass(membership: dict | None, permission: str) -> bool:
 
 
 def can_permanently_delete_ticket(membership: dict | None) -> bool:
-    role = (membership or {}).get("role")
-    return role in OWNER_ROLES or has_custom_permission(
+    return has_custom_permission(
         membership,
         PERMISSION_PERMANENT_DELETE_TICKET,
     )

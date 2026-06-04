@@ -39,6 +39,27 @@ async def ensure_member_admin(db, current_user, company_id):
     if not membership or membership.get("role") != ROLE_COMPANY_OWNER:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only administrators or owners can manage members")
 
+async def count_active_company_owners(db, company_id):
+    return await db["memberships"].count_documents({
+        "company_id": company_id,
+        "role": ROLE_COMPANY_OWNER,
+        "status": "active",
+    })
+
+async def ensure_owner_change_allowed(db, current_user, member, new_role=None, deleting=False):
+    if member.get("role") != ROLE_COMPANY_OWNER:
+        return
+
+    is_self = member.get("user_id") == current_user["_id"]
+    if deleting and is_self:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot delete your own owner account")
+    if not deleting and is_self and new_role != ROLE_COMPANY_OWNER:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot remove your own owner role")
+
+    owner_count = await count_active_company_owners(db, member["company_id"])
+    if owner_count <= 1 and (deleting or new_role != ROLE_COMPANY_OWNER):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one company owner must remain")
+
 #GET /api/v1/company/
 @router.get("/", response_model=List[SimpleCompanyOut])
 async def list_companies(current_user: dict = Depends(get_current_user), db = Depends(get_database)):
@@ -212,6 +233,8 @@ async def update_company_member(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
 
     await ensure_member_admin(db, current_user, member["company_id"])
+    if collection_name == "memberships":
+        await ensure_owner_change_allowed(db, current_user, member, new_role=role)
 
     result = await db[collection_name].update_one(
         {"_id": ObjectId(member_id)},
@@ -343,6 +366,7 @@ async def delete_membership(
         if not membership:
             raise HTTPException(status_code=404, detail="Membership not found")
         await ensure_member_admin(db, current_user, membership["company_id"])
+        await ensure_owner_change_allowed(db, current_user, membership, deleting=True)
 
         result = await db.memberships.delete_one({"_id": ObjectId(id)})
 

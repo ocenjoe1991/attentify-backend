@@ -20,6 +20,21 @@ async def ensure_membership_admin(db, current_user, target_membership):
     if not admin_membership:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only administrators or owners can update memberships")
 
+async def ensure_owner_role_change_allowed(db, current_user, target_membership, new_role):
+    if target_membership.get("role") != ROLE_COMPANY_OWNER or new_role == ROLE_COMPANY_OWNER:
+        return
+
+    if target_membership.get("user_id") == current_user["_id"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot remove your own owner role")
+
+    owner_count = await db["memberships"].count_documents({
+        "company_id": target_membership["company_id"],
+        "role": ROLE_COMPANY_OWNER,
+        "status": "active",
+    })
+    if owner_count <= 1:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one company owner must remain")
+
 #POST /api/v1/membership/update
 @router.post("/update")
 async def update_membership(
@@ -39,6 +54,7 @@ async def update_membership(
     # Build dynamic update fields
     update_data = {}
     if payload.role is not None:
+        await ensure_owner_role_change_allowed(db, current_user, target_membership, payload.role)
         update_data["role"] = payload.role
     if payload.status is not None:
         update_data["status"] = payload.status
