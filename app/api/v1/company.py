@@ -360,6 +360,7 @@ async def delete_membership(
         raise HTTPException(status_code=400, detail="Invalid status")
     
     result = None
+    now = datetime.utcnow()
     if status == "active":
         membership = await db.memberships.find_one({"_id": ObjectId(id)})
 
@@ -368,22 +369,35 @@ async def delete_membership(
         await ensure_member_admin(db, current_user, membership["company_id"])
         await ensure_owner_change_allowed(db, current_user, membership, deleting=True)
 
-        result = await db.memberships.delete_one({"_id": ObjectId(id)})
+        result = await db.memberships.update_one(
+            {"_id": ObjectId(id)},
+            {
+                "$set": {
+                    "status": "removed",
+                    "removed_at": now,
+                    "removed_by": current_user["_id"],
+                    "updated_at": now,
+                }
+            },
+        )
 
-        # Remove associated invitations
+        # Keep invitation history, but make sure pending invites for this member are no longer usable.
         company_id = membership.get("company_id")
         deleted_user_id = membership.get("user_id")
         deleted_user = await db.users.find_one({"_id": deleted_user_id})
         deleted_user_email = deleted_user.get("email") if deleted_user else "Unknown"
 
-        await db["invitations"].delete_many({
+        await db["invitations"].update_many({
             "email": deleted_user_email,
-            "company_id": company_id
+            "company_id": company_id,
+            "status": "pending",
+        }, {
+            "$set": {
+                "status": "cancelled",
+                "cancelled_at": now,
+                "cancelled_by": current_user["_id"],
+            }
         })
-
-        deleted_user_membership = await db.memberships.find_one({"user_id": deleted_user_id})
-        if not deleted_user_membership:
-            await db.users.delete_one({"_id": deleted_user_id})
 
     elif status == "pending":
         invitation = await db.invitations.find_one({"_id": ObjectId(id)})
@@ -392,8 +406,17 @@ async def delete_membership(
             raise HTTPException(status_code=404, detail="Invitation not found")
         await ensure_member_admin(db, current_user, invitation["company_id"])
 
-        result = await db.invitations.delete_one({"_id": ObjectId(id)})
-    if result.deleted_count == 0:
+        result = await db.invitations.update_one(
+            {"_id": ObjectId(id)},
+            {
+                "$set": {
+                    "status": "cancelled",
+                    "cancelled_at": now,
+                    "cancelled_by": current_user["_id"],
+                }
+            },
+        )
+    if result.modified_count == 0:
         raise HTTPException(status_code=500, detail="Failed to delete membership")
 
-    return {"success": True, "message": "Membership deleted"}
+    return {"success": True, "message": "Member removed"}

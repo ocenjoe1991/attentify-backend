@@ -8,7 +8,7 @@ from app.models.company import CompanyInDB
 
 class MembershipBase(BaseModel):
     role: Literal["company_owner", "store_owner", "agent", "readonly"]
-    status: Literal["active", "invited", "suspended"] = "active"
+    status: Literal["active", "invited", "suspended", "removed"] = "active"
     custom_permissions: List[str] = Field(default_factory=list)
 
 class MembershipCreate(MembershipBase):
@@ -33,5 +33,5 @@ class MembershipPublic(MembershipInDB):
 class UpdateMembershipRequest(BaseModel):
     membership_id: str = Field(..., description="MongoDB ObjectId of the membership")
     role: Optional[Literal["company_owner", "store_owner", "agent", "readonly"]] = None
-    status: Optional[Literal["active", "invited", "suspended"]] = None
+    status: Optional[Literal["active", "invited", "suspended", "removed"]] = None
     custom_permissions: Optional[List[str]] = None
