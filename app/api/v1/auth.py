@@ -28,6 +28,87 @@ GOOGLE_AUTH_REDIRECT_URI = os.getenv(
     f"{BACKEND_URL}/api/v1/auth/google/callback",
 )
 
+async def build_membership_login_payload(db, user: dict, user_id: str):
+    memberships_cursor = db.memberships.find({
+        "user_id": user["_id"],
+        "status": "active"
+    }).sort("last_used_at", -1)
+
+    memberships = await memberships_cursor.to_list(length=None)
+
+    if not memberships:
+        invitation_result = await db.invitations.find_one({
+            "email": user["email"],
+            "status": "pending"
+        })
+
+        redirect_url = "/ask-accept-invitation" if invitation_result else "/register-company"
+        token = create_access_token({
+            "sub": user_id,
+            "user_id": user_id,
+            "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+            "email": user["email"],
+            "companies": [],
+            "redirect_url": redirect_url,
+        })
+        return {
+            "token": token,
+            "user": {
+                "id": user_id,
+                "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+                "email": user["email"],
+                "companies": [],
+            },
+            "redirect_url": redirect_url,
+        }
+    
+    selected_membership = memberships[0]
+    company_id = selected_membership["company_id"]
+    role = selected_membership.get("role", "readonly")
+
+    await db.memberships.update_one(
+        {"_id": selected_membership["_id"]},
+        {"$set": {"last_used_at": datetime.utcnow()}}
+    )
+
+    company_ids = [m["company_id"] for m in memberships]
+    companies_cursor = db.companies.find({"_id": {"$in": company_ids}})
+    companies_map = {str(c["_id"]): c async for c in companies_cursor}
+
+    company_list = []
+    for m in memberships:
+        cid = str(m["company_id"])
+        company = companies_map.get(cid)
+        if company:
+            company_list.append({
+                "id": cid,
+                "name": company.get("name", "")
+            })
+    
+    token = create_access_token(data={
+        "sub": user_id,
+        "user_id": user_id,
+        "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+        "email": user["email"],
+        "company_id": str(company_id),
+        "role": role,
+        "companies": company_list,
+        "redirect_url": "/dashboard",
+    })
+
+    return {
+        "token": token,
+        "user": {
+            "id": user_id,
+            "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+            "email": user["email"],
+            "company_id": str(company_id),
+            "role": role,
+            "companies": company_list,
+        },
+        "redirect_url": "/dashboard",
+    }
+
 # --- OAuth Setup --
 oauth = OAuth()
 oauth.register(
@@ -119,63 +200,9 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
         redirect_url = f"{FRONTEND_URL}/oauth/callback/login?token={token}"
         return RedirectResponse(url=redirect_url)
     
-    memberships_cursor = db.memberships.find({
-        "user_id": user["_id"],
-        "status": "active"
-    }).sort("last_used_at", -1)
-
-    memberships = await memberships_cursor.to_list(length=None)
-
-    if not memberships:
-        invitation_result = await db.invitations.find_one({
-            "email": email,
-            "status": "pending"
-        })
-
-        redirect_path = "/ask-accept-invitation" if invitation_result else "/register-company"
-        token = create_access_token({
-            "sub": user_id,
-            "user_id": user_id,
-            "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
-            "email": user["email"],
-            "redirect_url": redirect_path
-        })
-        return RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/register?token={token}")
-    
-    selected_membership = memberships[0]
-    company_id = selected_membership["company_id"]
-    role = selected_membership.get("role", "readonly")
-
-    await db.memberships.update_one(
-        {"_id": selected_membership["_id"]},
-        {"$set": {"last_used_at": datetime.utcnow()}}
-    )
-
-    company_ids = [m["company_id"] for m in memberships]
-    companies_cursor = db.companies.find({"_id": {"$in": company_ids}})
-    companies_map = {str(c["_id"]): c async for c in companies_cursor}
-
-    company_list = []
-    for m in memberships:
-        cid = str(m["company_id"])
-        company = companies_map.get(cid)
-        if company:
-            company_list.append({
-                "id": cid,
-                "name": company.get("name", "")
-            })
-
-    token = create_access_token(data={
-        "sub": user_id,
-        "user_id": user_id,
-        "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
-        "email": user["email"],
-        "company_id": str(company_id),
-        "role": role,
-        "companies": company_list
-    })
-
-    redirect_url = f"{FRONTEND_URL}/oauth/callback/login?token={token}"
+    payload = await build_membership_login_payload(db, user, user_id)
+    callback_path = "login" if payload.get("user", {}).get("company_id") else "register"
+    redirect_url = f"{FRONTEND_URL}/oauth/callback/{callback_path}?token={payload['token']}"
     return RedirectResponse(url=redirect_url)
 
 # /api/v1/auth/register
@@ -327,53 +354,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get
             }
         }
         
-    memberships_cursor = db.memberships.find({
-        "user_id": user["_id"],
-        "status": "active"
-    }).sort("last_used_at", -1)
-
-    memberships = await memberships_cursor.to_list(length=None)
-
-    if not memberships:
-        raise HTTPException(status_code=403, detail="No active company membership found")
-    
-    selected_membership = memberships[0]
-    company_id = selected_membership["company_id"]
-    role = selected_membership.get("role", "readonly")
-
-    await db.memberships.update_one(
-        {"_id": selected_membership["_id"]},
-        {"$set": {"last_used_at": datetime.utcnow()}}
-    )
-
-    # === Fetch Company Info ===
-    company_ids = [m["company_id"] for m in memberships]
-    companies_cursor = db.companies.find({"_id": {"$in": company_ids}})
-    companies_map = {str(c["_id"]): c async for c in companies_cursor}
-
-    company_list = []
-    for m in memberships:
-        cid = str(m["company_id"])
-        company = companies_map.get(cid)
-        if company:
-            company_list.append({
-                "id": cid,
-                "name": company.get("name", "")
-            })
-    
-    token = create_access_token(data={
-        "sub": user_id,
-        "user_id": user_id,
-        "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
-        "email": user["email"],
-        "company_id": str(company_id),
-        "role": role,
-        "companies": company_list
-    })
-
-    return {
-        "token": token,
-    }
+    return await build_membership_login_payload(db, user, user_id)
 
 
 # /api/v1/auth/forgot-password
