@@ -20,19 +20,71 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
     if not ObjectId.is_valid(str(invite.company_id)):
         raise HTTPException(status_code=400, detail="Invalid company ID")
 
+    company_id = ObjectId(invite.company_id)
     membership = await db["memberships"].find_one({
         "user_id": current_user["_id"],
-        "company_id": ObjectId(invite.company_id),
+        "company_id": company_id,
         "status": "active",
     })
     if current_user.get("role") != ROLE_ADMIN and (not membership or membership.get("role") != ROLE_COMPANY_OWNER):
         raise HTTPException(status_code=403, detail="Only administrators or owners can send invitations")
 
     custom_permissions = normalize_custom_permissions(invite.custom_permissions)
+    now = datetime.utcnow()
+
+    existing_user = await db["users"].find_one({"email": invite.email})
+    if existing_user:
+        existing_membership = await db["memberships"].find_one({
+            "user_id": existing_user["_id"],
+            "company_id": company_id,
+        })
+        if existing_membership and existing_membership.get("status") == "active":
+            return {"message": "This user is already a team member."}
+        if existing_membership:
+            await db["memberships"].update_one(
+                {"_id": existing_membership["_id"]},
+                {
+                    "$set": {
+                        "role": invite.role,
+                        "status": "active",
+                        "custom_permissions": custom_permissions,
+                        "rejoined_at": now,
+                        "last_used_at": now,
+                        "updated_at": now,
+                    },
+                    "$unset": {
+                        "removed_at": "",
+                        "removed_by": "",
+                    },
+                },
+            )
+        else:
+            await db["memberships"].insert_one({
+                "user_id": existing_user["_id"],
+                "company_id": company_id,
+                "role": invite.role,
+                "status": "active",
+                "custom_permissions": custom_permissions,
+                "joined_at": now,
+                "last_used_at": now,
+            })
+
+        await db["invitations"].update_many(
+            {"email": invite.email, "company_id": company_id, "status": {"$in": ["pending", "accepted", "cancelled"]}},
+            {
+                "$set": {
+                    "status": "accepted",
+                    "role": invite.role,
+                    "custom_permissions": custom_permissions,
+                    "updated_at": now,
+                }
+            },
+        )
+        return {"message": "Existing user restored to the team."}
 
     # Check if invitation already exists
     existing_invite = await db["invitations"].find_one(
-        {"email": invite.email, "company_id": ObjectId(invite.company_id)}
+        {"email": invite.email, "company_id": company_id}
     )
 
     # If already accepted, stop here
@@ -44,13 +96,13 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
 
     # Update if exists (pending or expired), otherwise create new
     result = await db["invitations"].update_one(
-        {"email": invite.email, "company_id": ObjectId(invite.company_id)},
+        {"email": invite.email, "company_id": company_id},
         {
             "$set": {
                 "role": invite.role,
                 "custom_permissions": custom_permissions,
                 "token": token,
-                "invited_at": datetime.utcnow(),
+                "invited_at": now,
                 "status": "pending"
             }
         },
@@ -87,16 +139,39 @@ async def accept_invitation_token(
         # Frontend can redirect to signup page if user doesn't exist
         return {"redirect_url": f"/signup?token={payload.token}"}
 
-    # Add user to memberships
-    await db["memberships"].insert_one({
+    now = datetime.utcnow()
+    existing_membership = await db["memberships"].find_one({
         "user_id": user["_id"],
         "company_id": ObjectId(company_id),
-        "role": invitation["role"],
-        "status": "active",
-        "custom_permissions": invitation.get("custom_permissions", []),
-        "joined_at": datetime.utcnow(),
-        "last_used_at": datetime.utcnow()
     })
+    if existing_membership:
+        await db["memberships"].update_one(
+            {"_id": existing_membership["_id"]},
+            {
+                "$set": {
+                    "role": invitation["role"],
+                    "status": "active",
+                    "custom_permissions": invitation.get("custom_permissions", []),
+                    "rejoined_at": now,
+                    "last_used_at": now,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "removed_at": "",
+                    "removed_by": "",
+                },
+            },
+        )
+    else:
+        await db["memberships"].insert_one({
+            "user_id": user["_id"],
+            "company_id": ObjectId(company_id),
+            "role": invitation["role"],
+            "status": "active",
+            "custom_permissions": invitation.get("custom_permissions", []),
+            "joined_at": now,
+            "last_used_at": now,
+        })
 
     # Mark invitation as accepted
     await db["invitations"].update_one(
@@ -151,16 +226,38 @@ async def accept_invitation(db=Depends(get_database), current_user=Depends(get_c
     if not invitation:
         raise HTTPException(status_code=404, detail="No pending invitation found")
 
-    # Add to memberships
-    await db.memberships.insert_one({
+    existing_membership = await db.memberships.find_one({
         "user_id": ObjectId(current_user["_id"]),
         "company_id": invitation["company_id"],
-        "role": invitation["role"],
-        "status": "active",
-        "custom_permissions": invitation.get("custom_permissions", []),
-        "joined_at": now,
-        "last_used_at": now
     })
+    if existing_membership:
+        await db.memberships.update_one(
+            {"_id": existing_membership["_id"]},
+            {
+                "$set": {
+                    "role": invitation["role"],
+                    "status": "active",
+                    "custom_permissions": invitation.get("custom_permissions", []),
+                    "rejoined_at": now,
+                    "last_used_at": now,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "removed_at": "",
+                    "removed_by": "",
+                },
+            },
+        )
+    else:
+        await db.memberships.insert_one({
+            "user_id": ObjectId(current_user["_id"]),
+            "company_id": invitation["company_id"],
+            "role": invitation["role"],
+            "status": "active",
+            "custom_permissions": invitation.get("custom_permissions", []),
+            "joined_at": now,
+            "last_used_at": now,
+        })
 
     # Mark invitation as accepted
     await db.invitations.update_one(
