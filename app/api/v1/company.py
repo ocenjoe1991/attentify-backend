@@ -390,7 +390,7 @@ async def delete_membership(
         await db["invitations"].update_many({
             "email": deleted_user_email,
             "company_id": company_id,
-            "status": "pending",
+            "status": {"$in": ["pending", "accepted"]},
         }, {
             "$set": {
                 "status": "cancelled",
