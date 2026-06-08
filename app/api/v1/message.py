@@ -632,8 +632,10 @@ async def update_message_field(
         raise HTTPException(status_code=400, detail="Field cannot be updated here")
     if field == "assigned_member_id" and role not in OWNER_ROLES:
         raise HTTPException(status_code=403, detail="Only owners can assign messages")
-    if field in {"trashed", "archived"} and role not in OWNER_ROLES:
-        raise HTTPException(status_code=403, detail="Only owners can move messages")
+    if field == "archived" and role not in OWNER_ROLES:
+        raise HTTPException(status_code=403, detail="Only owners can archive messages")
+    if field == "trashed" and role not in OWNER_ROLES and not can_permanently_delete_ticket(membership):
+        raise HTTPException(status_code=403, detail="Delete is not enabled for this account")
     
     # Convert to ObjectId where needed
     if field == "assigned_member_id" and value:
