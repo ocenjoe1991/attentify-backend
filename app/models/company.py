@@ -17,6 +17,7 @@ class CompanyInDB(CompanyBase):
     created_by: PyObjectId
     created_at: datetime
     current_user_custom_permissions: Optional[List[str]] = None
+    current_user_role: Optional[str] = None
 
     class Config:
         json_encoders = {ObjectId: str}

@@ -164,6 +164,7 @@ async def get_company(
     company["id"] = str(company["_id"])
     company["created_by"] = str(company["created_by"])
     company["current_user_custom_permissions"] = membership.get("custom_permissions", [])
+    company["current_user_role"] = membership.get("role")
 
     return CompanyInDB.parse_obj(company)
     
@@ -250,7 +251,7 @@ async def update_company_member(
     }
 
 #GET /api/v1/company/{company_id}/members
-@router.get("/{company_id}/members", response_model=List[dict])
+@router.get("/{company_id}/members", response_model=dict)
 async def list_company_members(
     company_id: str,
     current_user: dict = Depends(get_current_user),
@@ -262,6 +263,7 @@ async def list_company_members(
     membership = await get_active_membership(db, current_user["_id"], ObjectId(company_id))
     if current_user.get("role") != ROLE_ADMIN and not membership:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    current_user_role = ROLE_ADMIN if current_user.get("role") == ROLE_ADMIN else membership.get("role")
 
     members_cursor = db["memberships"].find({
         "company_id": ObjectId(company_id),
@@ -295,7 +297,10 @@ async def list_company_members(
             "custom_permissions": invitation.get("custom_permissions", []),
         })
 
-    return memberships
+    return {
+        "members": memberships,
+        "current_user_role": current_user_role,
+    }
 
 @router.get("/{company_id}/role-permissions", response_model=dict)
 async def get_role_permissions(
