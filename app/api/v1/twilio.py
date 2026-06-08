@@ -8,6 +8,7 @@ from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 
 from app.core.security import get_current_user
+from app.core.audit import record_audit_log
 from app.db.mongodb import get_database
 from app.models.message import ChatEntry
 
@@ -145,6 +146,17 @@ async def create_twilio_account(
         )
         account_doc["_id"] = existing["_id"]
 
+    await record_audit_log(
+        db,
+        company_id=ObjectId(payload.company_id),
+        actor=current_user,
+        actor_role=membership.get("role", "unknown"),
+        action="Connected Twilio phone account",
+        entity_type="phone_account",
+        entity_id=account_doc["_id"],
+        details={"phone_number": phone_number, "label": payload.label or ""},
+    )
+
     return phone_account_helper(account_doc)
 
 
@@ -166,6 +178,16 @@ async def delete_twilio_account(
         raise HTTPException(status_code=403, detail="Only owners can remove phone accounts")
 
     await db["phone_accounts"].delete_one({"_id": account["_id"]})
+    await record_audit_log(
+        db,
+        company_id=account["company_id"],
+        actor=current_user,
+        actor_role=membership.get("role", "unknown"),
+        action="Removed Twilio phone account",
+        entity_type="phone_account",
+        entity_id=account["_id"],
+        details={"phone_number": account.get("phone_number"), "label": account.get("label", "")},
+    )
     return None
 
 

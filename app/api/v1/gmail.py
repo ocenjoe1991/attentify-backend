@@ -5,6 +5,7 @@ import httpx
 from urllib.parse import urlencode
 from datetime import datetime, timedelta
 from app.core.security import get_current_user
+from app.core.audit import record_audit_log
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 import os
@@ -201,11 +202,22 @@ async def update_gmail_account(
 
 
 @router.delete("/{account_id}", status_code=204)
-async def delete_gmail_account(account_id: str, request: Request):
+async def delete_gmail_account(
+    account_id: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
     db = request.app.state.db
     account = await db.gmail_accounts.find_one({"_id": ObjectId(account_id)})
     if not account:
         raise HTTPException(status_code=404, detail="Gmail account not found")
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": account.get("company_id"),
+        "status": "active",
+    })
+    if not membership:
+        raise HTTPException(status_code=403, detail="User is not a member of this company")
 
     # Step 1: Stop Gmail Watch for this user
     try:
@@ -227,6 +239,17 @@ async def delete_gmail_account(account_id: str, request: Request):
     result = await db.gmail_accounts.delete_one({"_id": ObjectId(account_id)})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Gmail account not found")
+
+    await record_audit_log(
+        db,
+        company_id=account.get("company_id"),
+        actor=current_user,
+        actor_role=membership.get("role", "unknown"),
+        action="Removed Gmail account",
+        entity_type="gmail_account",
+        entity_id=ObjectId(account_id),
+        details={"email": account.get("email", "")},
+    )
 
     return None
 
@@ -520,8 +543,27 @@ async def google_oauth_callback(
 
     if existing:
         await db.gmail_accounts.update_one({"_id": existing["_id"]}, {"$set": account_data})
+        account_id = existing["_id"]
     else:
-        await db.gmail_accounts.insert_one(account_data)
+        result = await db.gmail_accounts.insert_one(account_data)
+        account_id = result.inserted_id
+
+    actor = await db["users"].find_one({"_id": user_id})
+    membership = await db["memberships"].find_one({
+        "user_id": user_id,
+        "company_id": company_id,
+        "status": "active",
+    })
+    await record_audit_log(
+        db,
+        company_id=company_id,
+        actor=actor,
+        actor_role=membership.get("role", "unknown") if membership else "unknown",
+        action="Connected Gmail account",
+        entity_type="gmail_account",
+        entity_id=account_id,
+        details={"email": email},
+    )
 
     return RedirectResponse(url=f"{FRONTEND_URL}/accounts/gmail")
 

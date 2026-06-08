@@ -21,6 +21,7 @@ from app.core.permissions import (
     PERMISSION_REFUND_WITHOUT_OWNER_APPROVAL,
     has_owner_approval_bypass,
 )
+from app.core.audit import record_audit_log
 import httpx
 
 router = APIRouter()
@@ -73,11 +74,34 @@ async def create_approval_request(
         "updated_at": now,
     }
     result = await db["approval_requests"].insert_one(request_doc)
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": company_id,
+        "status": "active",
+    })
+    message = None
     if request_doc["message_id"]:
+        message = await db["messages"].find_one({"_id": request_doc["message_id"], "company_id": company_id})
         await db["messages"].update_one(
             {"_id": request_doc["message_id"], "company_id": company_id},
             {"$set": {"status": "Awaiting Approval", "last_updated": now}},
         )
+    await record_audit_log(
+        db,
+        company_id=company_id,
+        actor=current_user,
+        actor_role=membership.get("role", "unknown") if membership else "unknown",
+        action=f"Requested {action_type} approval",
+        entity_type="approval_request",
+        entity_id=result.inserted_id,
+        ticket=(message or {}).get("ticket", ""),
+        customer=(message or {}).get("client", ""),
+        details={
+            "order_id": payload.get("order_id"),
+            "shop": payload.get("shop"),
+            "message_id": str(request_doc["message_id"] or ""),
+        },
+    )
     return {
         "msg": f"{action_type.title()} request is awaiting owner approval.",
         "approval_required": True,
@@ -171,7 +195,7 @@ def shopify_install(
 
 #/api/v1/shopify/callback
 @router.get("/callback")
-def shopify_callback(request: Request):
+async def shopify_callback(request: Request):
     params = dict(request.query_params)
     shop = params.get("shop")
     code = params.get("code")
@@ -214,7 +238,7 @@ def shopify_callback(request: Request):
     webhook_id = register_shopify_webhook(shop, access_token)
 
     db = request.app.state.db
-    db.shopify_cred.update_one(
+    await db.shopify_cred.update_one(
         {"shop": shop, "user_id": ObjectId(user_id)},
         {
             "$set": {
@@ -227,6 +251,23 @@ def shopify_callback(request: Request):
             }
         },
         upsert=True
+    )
+    actor = await db["users"].find_one({"_id": ObjectId(user_id)})
+    membership = await db["memberships"].find_one({
+        "user_id": ObjectId(user_id),
+        "company_id": ObjectId(company_id),
+        "status": "active",
+    })
+    cred = await db.shopify_cred.find_one({"shop": shop, "user_id": ObjectId(user_id)})
+    await record_audit_log(
+        db,
+        company_id=ObjectId(company_id),
+        actor=actor,
+        actor_role=membership.get("role", "unknown") if membership else "unknown",
+        action="Connected Shopify store",
+        entity_type="shopify_cred",
+        entity_id=cred["_id"] if cred else None,
+        details={"shop": shop},
     )
 
     redirect_frontend_url = f"{FRONTEND_URL}/shopify/success?shop={shop}"
@@ -349,6 +390,17 @@ async def delete_shopify_cred(
 
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Shopify credential not found")
+
+    await record_audit_log(
+        db,
+        company_id=cred["company_id"],
+        actor=current_user,
+        actor_role=membership.get("role", "unknown"),
+        action="Removed Shopify store",
+        entity_type="shopify_cred",
+        entity_id=ObjectId(shopify_id),
+        details={"shop": shop},
+    )
 
     return {"detail": "Deleted successfully"}
 
@@ -656,6 +708,24 @@ async def reject_approval_request(
             {"_id": request_doc["message_id"], "company_id": request_doc["company_id"]},
             {"$set": {"status": "Open", "last_updated": now}},
         )
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": request_doc["company_id"],
+        "status": "active",
+    })
+    message = await db["messages"].find_one({"_id": request_doc.get("message_id")}) if request_doc.get("message_id") else None
+    await record_audit_log(
+        db,
+        company_id=request_doc["company_id"],
+        actor=current_user,
+        actor_role=membership.get("role", "unknown") if membership else "unknown",
+        action="Rejected approval request",
+        entity_type="approval_request",
+        entity_id=request_doc["_id"],
+        ticket=(message or {}).get("ticket", ""),
+        customer=(message or {}).get("client", ""),
+        details={"type": request_doc.get("type"), "reason": (payload.get("reason") or "").strip()},
+    )
     return {"msg": "Approval request rejected."}
 
 
@@ -702,6 +772,24 @@ async def approve_approval_request(
             {"_id": request_doc["message_id"], "company_id": request_doc["company_id"]},
             {"$set": {"status": "In Progress", "last_updated": now}},
         )
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": request_doc["company_id"],
+        "status": "active",
+    })
+    message = await db["messages"].find_one({"_id": request_doc.get("message_id")}) if request_doc.get("message_id") else None
+    await record_audit_log(
+        db,
+        company_id=request_doc["company_id"],
+        actor=current_user,
+        actor_role=membership.get("role", "unknown") if membership else "unknown",
+        action="Approved approval request",
+        entity_type="approval_request",
+        entity_id=request_doc["_id"],
+        ticket=(message or {}).get("ticket", ""),
+        customer=(message or {}).get("client", ""),
+        details={"type": request_doc.get("type")},
+    )
     return result
 
 # /shopify/order/refund
@@ -867,6 +955,19 @@ async def refund_order(
                 "$set": {"last_updated": now},
             },
         )
+    message = await db["messages"].find_one({"_id": ObjectId(message_id), "company_id": order["company_id"]}) if ObjectId.is_valid(message_id or "") else None
+    await record_audit_log(
+        db,
+        company_id=order["company_id"],
+        actor=current_user,
+        actor_role=membership.get("role", "unknown"),
+        action="Processed refund",
+        entity_type="order",
+        entity_id=order["_id"],
+        ticket=(message or {}).get("ticket", ""),
+        customer=order.get("customer", {}).get("email", "") or (message or {}).get("client", ""),
+        details={"order_id": order_id, "shop": shop, "amount": refund_amount, "message_id": message_id},
+    )
 
     return {
         "msg": "Refund processed successfully",
@@ -977,6 +1078,19 @@ async def cancel_order(
                     "$set": {"last_updated": datetime.utcnow()},
                 },
             )
+        message = await db["messages"].find_one({"_id": ObjectId(message_id), "company_id": order_doc["company_id"]}) if ObjectId.is_valid(message_id or "") else None
+        await record_audit_log(
+            db,
+            company_id=order_doc["company_id"],
+            actor=current_user,
+            actor_role=membership.get("role", "unknown"),
+            action="Cancelled order",
+            entity_type="order",
+            entity_id=order_doc["_id"],
+            ticket=(message or {}).get("ticket", ""),
+            customer=order_doc.get("customer", {}).get("email", "") or (message or {}).get("client", ""),
+            details={"order_id": order_id, "shop": shop, "message_id": message_id},
+        )
 
         return {
             "msg": f"Order {order_id} cancelled successfully.",

@@ -11,6 +11,7 @@ from app.core.config import settings
 from fastapi.responses import RedirectResponse
 from app.core.security import get_current_user, create_access_token
 from app.core.permissions import ROLE_ADMIN, ROLE_COMPANY_OWNER, normalize_custom_permissions
+from app.core.audit import record_audit_log
 
 router = APIRouter()
 
@@ -80,6 +81,16 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
                 }
             },
         )
+        await record_audit_log(
+            db,
+            company_id=company_id,
+            actor=current_user,
+            actor_role=membership.get("role") if membership else ROLE_ADMIN,
+            action="Restored team member",
+            entity_type="membership",
+            entity_id=existing_membership["_id"] if existing_membership else existing_user["_id"],
+            details={"target_email": invite.email, "role": invite.role, "custom_permissions": custom_permissions},
+        )
         return {"message": "Existing user restored to the team."}
 
     # Check if invitation already exists
@@ -110,6 +121,18 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
     )
 
     await send_invitation_email(invite.email, invite_link)
+
+    invitation_doc = await db["invitations"].find_one({"email": invite.email, "company_id": company_id})
+    await record_audit_log(
+        db,
+        company_id=company_id,
+        actor=current_user,
+        actor_role=membership.get("role") if membership else ROLE_ADMIN,
+        action="Invited team member" if result.matched_count == 0 else "Updated team invitation",
+        entity_type="invitation",
+        entity_id=invitation_doc["_id"] if invitation_doc else None,
+        details={"target_email": invite.email, "role": invite.role, "custom_permissions": custom_permissions},
+    )
 
     if result.matched_count > 0:
         return {"message": "Invitation updated successfully."}

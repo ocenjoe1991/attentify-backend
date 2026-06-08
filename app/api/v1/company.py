@@ -13,6 +13,8 @@ from app.core.permissions import (
     ROLE_PERMISSIONS,
     normalize_custom_permissions,
 )
+from app.core.audit import record_audit_log, serialize_audit_log
+from pymongo import DESCENDING
 
 router = APIRouter()
 
@@ -203,6 +205,17 @@ async def update_company(
     if not updated_company:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found")
 
+    await record_audit_log(
+        db,
+        company_id=ObjectId(payload.company_id),
+        actor=current_user,
+        actor_role=membership.get("role") if membership else ROLE_ADMIN,
+        action="Updated company settings",
+        entity_type="company",
+        entity_id=ObjectId(payload.company_id),
+        details={"fields": sorted(update_data.keys())},
+    )
+
     return {
         "id": str(updated_company["_id"]),
         "name": updated_company.get("name"),
@@ -237,12 +250,48 @@ async def update_company_member(
     if collection_name == "memberships":
         await ensure_owner_change_allowed(db, current_user, member, new_role=role)
 
+    old_role = member.get("role")
+    old_permissions = sorted(member.get("custom_permissions", []))
+    target_email = member.get("email", "")
+    if collection_name == "memberships":
+        target_user = await db["users"].find_one({"_id": member.get("user_id")})
+        target_email = target_user.get("email", "") if target_user else ""
+    actor_membership = await get_active_membership(db, current_user["_id"], member["company_id"])
+
     result = await db[collection_name].update_one(
         {"_id": ObjectId(member_id)},
         {"$set": {"role": role, "custom_permissions": custom_permissions}},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
+
+    new_permissions = sorted(custom_permissions)
+    if old_role != role:
+        await record_audit_log(
+            db,
+            company_id=member["company_id"],
+            actor=current_user,
+            actor_role=actor_membership.get("role") if actor_membership else ROLE_ADMIN,
+            action="Changed member role",
+            entity_type=collection_name[:-1],
+            entity_id=ObjectId(member_id),
+            details={"target_email": target_email, "old_role": old_role, "new_role": role},
+        )
+    if old_permissions != new_permissions:
+        await record_audit_log(
+            db,
+            company_id=member["company_id"],
+            actor=current_user,
+            actor_role=actor_membership.get("role") if actor_membership else ROLE_ADMIN,
+            action="Changed member permissions",
+            entity_type=collection_name[:-1],
+            entity_id=ObjectId(member_id),
+            details={
+                "target_email": target_email,
+                "old_permissions": old_permissions,
+                "new_permissions": new_permissions,
+            },
+        )
 
     return {
         "id": member_id,
@@ -319,6 +368,25 @@ async def get_role_permissions(
         role: sorted(list(permissions))
         for role, permissions in ROLE_PERMISSIONS.items()
     }
+
+@router.get("/{company_id}/audit-logs", response_model=dict)
+async def list_audit_logs(
+    company_id: str,
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
+
+    membership = await get_active_membership(db, current_user["_id"], ObjectId(company_id))
+    if current_user.get("role") != ROLE_ADMIN and not membership:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    cursor = db["audit_logs"].find({"company_id": ObjectId(company_id)}).sort("created_at", DESCENDING).limit(100)
+    logs = []
+    async for doc in cursor:
+        logs.append(serialize_audit_log(doc))
+    return {"logs": logs}
 
 #GET /api/v1/company/{company_id}/active_members
 @router.get("/{company_id}/active_members", response_model=List[dict])
@@ -403,6 +471,17 @@ async def delete_membership(
                 "cancelled_by": current_user["_id"],
             }
         })
+        actor_membership = await get_active_membership(db, current_user["_id"], company_id)
+        await record_audit_log(
+            db,
+            company_id=company_id,
+            actor=current_user,
+            actor_role=actor_membership.get("role") if actor_membership else ROLE_ADMIN,
+            action="Removed team member",
+            entity_type="membership",
+            entity_id=ObjectId(id),
+            details={"target_email": deleted_user_email, "old_role": membership.get("role")},
+        )
 
     elif status == "pending":
         invitation = await db.invitations.find_one({"_id": ObjectId(id)})
@@ -420,6 +499,17 @@ async def delete_membership(
                     "cancelled_by": current_user["_id"],
                 }
             },
+        )
+        actor_membership = await get_active_membership(db, current_user["_id"], invitation["company_id"])
+        await record_audit_log(
+            db,
+            company_id=invitation["company_id"],
+            actor=current_user,
+            actor_role=actor_membership.get("role") if actor_membership else ROLE_ADMIN,
+            action="Cancelled team invitation",
+            entity_type="invitation",
+            entity_id=ObjectId(id),
+            details={"target_email": invitation.get("email"), "old_role": invitation.get("role")},
         )
     if result.modified_count == 0:
         raise HTTPException(status_code=500, detail="Failed to delete membership")

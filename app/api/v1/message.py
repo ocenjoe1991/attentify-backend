@@ -24,6 +24,7 @@ from app.core.permissions import (
     can_permanently_delete_ticket,
     has_owner_approval_bypass,
 )
+from app.core.audit import record_audit_log
 
 from math import ceil
 
@@ -116,6 +117,32 @@ def doc_to_message_detail(doc: dict) -> Message:
         tags=doc.get("tags", []),
         resolved_by_ai=doc.get("resolved_by_ai", False),
         messages=[]  # or omit this line if optional in schema
+    )
+
+async def get_user_display_name(user: dict) -> str:
+    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+    return name or user.get("email", "Unknown user")
+
+async def record_ticket_audit_log(
+    db: AsyncIOMotorDatabase,
+    message: dict,
+    current_user: dict,
+    membership: dict,
+    action: str,
+    details: dict | None = None,
+) -> None:
+    ticket = message.get("ticket") or str(message.get("_id"))
+    await record_audit_log(
+        db,
+        company_id=message["company_id"],
+        actor=current_user,
+        actor_role=membership.get("role", "unknown") if membership else "unknown",
+        action=action,
+        entity_type="ticket",
+        entity_id=message["_id"],
+        ticket=ticket,
+        customer=message.get("client", ""),
+        details=details,
     )
 
 @router.get("/", response_model=List[dict])
@@ -413,6 +440,8 @@ async def delete_message(
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Message not found")
 
+    await record_ticket_audit_log(db, message, current_user, membership, "Permanently deleted ticket")
+
     return {"message": "Message permanently deleted"}
 
 async def serialize_comment(comment: dict, db) -> dict:
@@ -525,6 +554,14 @@ async def edit_comment(
     # Get updated comment
     message = await db["messages"].find_one({"_id": ObjectId(message_id)})
     updated_comment = next((c for c in message["comments"] if c["_id"] == ObjectId(comment_id)), None)
+    await record_ticket_audit_log(
+        db,
+        message,
+        user,
+        membership,
+        "Edited comment",
+        {"comment_id": comment_id},
+    )
 
     return {"message": "Comment updated", "comment": await serialize_comment(updated_comment, db)}
 
@@ -604,6 +641,15 @@ async def delete_comment(
     if result.modified_count == 0:
         raise HTTPException(status_code=404, detail="Comment not found or not authorized")
 
+    await record_ticket_audit_log(
+        db,
+        message,
+        user,
+        membership,
+        "Deleted comment",
+        {"comment_id": comment_id},
+    )
+
     return {"message": "Comment deleted"}
 
 @router.patch("/{message_id}")
@@ -672,6 +718,39 @@ async def update_message_field(
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Message not found")
+    if field == "trashed" and value is True and not message.get("trashed"):
+        await record_ticket_audit_log(db, message, current_user, membership, "Deleted ticket")
+    elif field == "status" and normalize_status(message.get("status", "Open")) != value:
+        await record_ticket_audit_log(
+            db,
+            message,
+            current_user,
+            membership,
+            "Changed ticket status",
+            {"old_status": normalize_status(message.get("status", "Open")), "new_status": value},
+        )
+    elif field == "assigned_member_id" and message.get("assigned_member_id") != value:
+        assigned_user = await db["users"].find_one({"_id": value}) if value else None
+        await record_ticket_audit_log(
+            db,
+            message,
+            current_user,
+            membership,
+            "Assigned ticket" if value else "Unassigned ticket",
+            {
+                "old_assigned_member_id": str(message.get("assigned_member_id") or ""),
+                "new_assigned_member_id": str(value or ""),
+                "target_email": assigned_user.get("email", "") if assigned_user else "",
+            },
+        )
+    elif field == "archived" and bool(message.get("archived")) != bool(value):
+        await record_ticket_audit_log(
+            db,
+            message,
+            current_user,
+            membership,
+            "Archived ticket" if value else "Unarchived ticket",
+        )
     return {"message": f"{field} updated"}
 
 def clean_json_response(response: str):
