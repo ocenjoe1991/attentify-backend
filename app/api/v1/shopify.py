@@ -30,12 +30,324 @@ SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
 SHOPIFY_API_SECRET = os.getenv("SHOPIFY_API_SECRET")
 SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
 SHOPIFY_REDIRECT_URI = os.getenv("SHOPIFY_REDIRECT_URI", "http://localhost:8000/api/v1/shopify/callback")
-SHOPIFY_SCOPES = os.getenv("SHOPIFY_SCOPES", "read_products,write_products,read_orders,write_orders,read_customers,write_customers")
+SHOPIFY_SCOPES = os.getenv(
+    "SHOPIFY_SCOPES",
+    "read_products,write_products,read_orders,write_orders,read_customers,write_customers,"
+    "read_returns,write_returns,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders",
+)
 SHOPIFY_INSTALL_URL=os.getenv("SHOPIFY_INSTALL_URL")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 OWNER_ROLES = {"company_owner", "store_owner"}
+
+
+def to_float_amount(value) -> float:
+    try:
+        return round(float(value or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_order_action(
+    *,
+    action_type: str,
+    amount,
+    current_user: dict,
+    membership: dict,
+    note: str = "",
+    details: dict | None = None,
+) -> dict:
+    return {
+        "type": action_type,
+        "amount": to_float_amount(amount),
+        "actor_id": str(current_user["_id"]),
+        "actor_name": f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}".strip()
+        or current_user.get("email", "Unknown user"),
+        "actor_role": membership.get("role", "unknown") if membership else "unknown",
+        "note": note,
+        "details": details or {},
+        "created_at": datetime.utcnow(),
+    }
+
+
+def serialize_order_actions(order: dict) -> list[dict]:
+    actions = []
+    for action in order.get("order_actions", []):
+        serialized = dict(action)
+        if serialized.get("created_at") and hasattr(serialized["created_at"], "isoformat"):
+            serialized["created_at"] = serialized["created_at"].isoformat()
+        if serialized.get("actor_id"):
+            serialized["actor_id"] = str(serialized["actor_id"])
+        actions.append(serialized)
+    return sorted(actions, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+async def get_order_action_context(db, payload: dict, current_user: dict):
+    order_id = payload.get("order_id")
+    shop = payload.get("shop")
+    if not order_id or not shop:
+        return JSONResponse(status_code=400, content={"error": "Missing order_id or shop"})
+
+    shopify_cred = await db["shopify_cred"].find_one({"shop": shop})
+    if not shopify_cred or not shopify_cred.get("access_token"):
+        return JSONResponse(status_code=404, content={"error": "Shop credentials not found"})
+
+    order_doc = await db["orders"].find_one({"order_id": int(order_id)})
+    if not order_doc:
+        return JSONResponse(status_code=404, content={"error": "Order not found"})
+    if order_doc.get("company_id") != shopify_cred.get("company_id"):
+        return JSONResponse(status_code=403, content={"error": "Order does not belong to this shop connection"})
+
+    membership = await require_company_member(db, current_user, order_doc["company_id"])
+    return order_doc, shopify_cred, membership
+
+
+async def record_order_action_and_audit(
+    db,
+    *,
+    order_doc: dict,
+    current_user: dict,
+    membership: dict,
+    action_type: str,
+    audit_action: str,
+    amount,
+    note: str,
+    message_id: str = "",
+    details: dict | None = None,
+    order_updates: dict | None = None,
+) -> dict:
+    now = datetime.utcnow()
+    action_details = {
+        "order_id": str(order_doc.get("order_id", "")),
+        "shop": order_doc.get("shop", ""),
+        **(details or {}),
+    }
+    order_action = build_order_action(
+        action_type=action_type,
+        amount=amount,
+        current_user=current_user,
+        membership=membership,
+        note=note,
+        details=action_details,
+    )
+    order_action["created_at"] = now
+
+    set_payload = {"updated_at": now, **(order_updates or {})}
+    await db["orders"].update_one(
+        {"_id": order_doc["_id"]},
+        {"$set": set_payload, "$push": {"order_actions": order_action}},
+    )
+
+    message = None
+    if ObjectId.is_valid(message_id or ""):
+        message = await db["messages"].find_one({"_id": ObjectId(message_id), "company_id": order_doc["company_id"]})
+        if message:
+            await db["messages"].update_one(
+                {"_id": message["_id"]},
+                {
+                    "$push": {
+                        "activity": {
+                            "type": action_type,
+                            "actor_id": current_user["_id"],
+                            "note": note,
+                            "amount": to_float_amount(amount),
+                            "created_at": now,
+                        }
+                    },
+                    "$set": {"last_updated": now},
+                },
+            )
+
+    await record_audit_log(
+        db,
+        company_id=order_doc["company_id"],
+        actor=current_user,
+        actor_role=membership.get("role", "unknown"),
+        action=audit_action,
+        entity_type="order",
+        entity_id=order_doc["_id"],
+        ticket=(message or {}).get("ticket", ""),
+        customer=order_doc.get("customer", {}).get("email", "") or (message or {}).get("client", ""),
+        details={**action_details, "amount": to_float_amount(amount), "message_id": message_id},
+    )
+    return order_action
+
+
+async def get_fulfillment_orders(shop: str, access_token: str, order_id: str) -> list[dict]:
+    url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders/{int(order_id)}/fulfillment_orders.json"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            url,
+            headers={
+                "X-Shopify-Access-Token": access_token,
+                "Content-Type": "application/json",
+            },
+        )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.json())
+    return response.json().get("fulfillment_orders", [])
+
+
+async def shopify_graphql(shop: str, access_token: str, query: str, variables: dict | None = None) -> dict:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/graphql.json",
+            headers={
+                "X-Shopify-Access-Token": access_token,
+                "Content-Type": "application/json",
+            },
+            json={"query": query, "variables": variables or {}},
+        )
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.json())
+    data = response.json()
+    if data.get("errors"):
+        raise HTTPException(status_code=400, detail=data["errors"])
+    return data.get("data", {})
+
+
+def order_gid(order_id) -> str:
+    return f"gid://shopify/Order/{int(order_id)}"
+
+
+def variant_gid(value) -> str:
+    value = str(value or "")
+    return value if value.startswith("gid://") else f"gid://shopify/ProductVariant/{int(value)}"
+
+
+async def build_return_line_items(
+    shop: str,
+    access_token: str,
+    order_id,
+    selected_items: list[dict],
+    note: str,
+) -> list[dict]:
+    query = """
+    query ReturnableFulfillments($id: ID!) {
+      order(id: $id) {
+        returnableFulfillments(first: 20) {
+          edges {
+            node {
+              returnableFulfillmentLineItems(first: 100) {
+                edges {
+                  node {
+                    quantity
+                    fulfillmentLineItem {
+                      id
+                      lineItem {
+                        legacyResourceId
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = await shopify_graphql(shop, access_token, query, {"id": order_gid(order_id)})
+    selected_by_line_item_id = {
+        str(item.get("line_item_id")): int(item.get("quantity") or 1)
+        for item in selected_items
+        if item.get("line_item_id")
+    }
+    return_line_items = []
+    for edge in data.get("order", {}).get("returnableFulfillments", {}).get("edges", []):
+        line_edges = edge.get("node", {}).get("returnableFulfillmentLineItems", {}).get("edges", [])
+        for line_edge in line_edges:
+            node = line_edge.get("node", {})
+            fulfillment_line_item = node.get("fulfillmentLineItem", {})
+            line_item_id = str(fulfillment_line_item.get("lineItem", {}).get("legacyResourceId", ""))
+            if selected_by_line_item_id and line_item_id not in selected_by_line_item_id:
+                continue
+            quantity = selected_by_line_item_id.get(line_item_id, node.get("quantity", 1))
+            return_line_items.append({
+                "fulfillmentLineItemId": fulfillment_line_item.get("id"),
+                "quantity": min(int(quantity or 1), int(node.get("quantity") or 1)),
+                "returnReasonNote": note[:255],
+            })
+    if not return_line_items:
+        raise HTTPException(status_code=400, detail="No returnable fulfillment line items found for this order")
+    return return_line_items
+
+
+async def create_shopify_return(
+    shop: str,
+    access_token: str,
+    order_id,
+    return_line_items: list[dict],
+    exchange_line_items: list[dict] | None = None,
+) -> dict:
+    mutation = """
+    mutation ReturnCreate($returnInput: ReturnInput!) {
+      returnCreate(returnInput: $returnInput) {
+        userErrors {
+          field
+          message
+        }
+        return {
+          id
+          status
+          returnLineItems(first: 20) {
+            edges {
+              node {
+                id
+                quantity
+              }
+            }
+          }
+          exchangeLineItems(first: 20) {
+            edges {
+              node {
+                id
+                quantity
+                variantId
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    return_input = {
+        "orderId": order_gid(order_id),
+        "returnLineItems": return_line_items,
+    }
+    if exchange_line_items:
+        return_input["exchangeLineItems"] = exchange_line_items
+    data = await shopify_graphql(shop, access_token, mutation, {"returnInput": return_input})
+    payload = data.get("returnCreate", {})
+    user_errors = payload.get("userErrors") or []
+    if user_errors:
+        raise HTTPException(status_code=400, detail=user_errors)
+    return payload.get("return", {})
+
+
+async def send_order_invoice(shop: str, access_token: str, order_id, email: str | None = None) -> dict:
+    mutation = """
+    mutation OrderInvoiceSend($id: ID!, $email: EmailInput) {
+      orderInvoiceSend(id: $id, email: $email) {
+        order {
+          id
+          name
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+    """
+    variables = {"id": order_gid(order_id), "email": {"to": email} if email else None}
+    data = await shopify_graphql(shop, access_token, mutation, variables)
+    payload = data.get("orderInvoiceSend", {})
+    user_errors = payload.get("userErrors") or []
+    if user_errors:
+        raise HTTPException(status_code=400, detail=user_errors)
+    return payload.get("order", {})
 
 
 async def require_company_member(db, current_user: dict, company_id: ObjectId) -> dict:
@@ -595,6 +907,7 @@ async def get_orders(
     cursor = db.orders.find(filter_query).sort("created_at", -1).skip((page - 1) * size).limit(size)
     orders = []
     async for doc in cursor:
+        doc["order_actions"] = serialize_order_actions(doc)
         doc['_id'] = str(doc['_id'])
         doc['user_id'] = str(doc['user_id'])
         doc['company_id'] = str(doc['company_id'])
@@ -904,6 +1217,10 @@ async def refund_order(
             "amount": transaction_amount,
             "gateway": t["gateway"]
         })
+    actual_refund_amount = round(
+        sum(to_float_amount(transaction.get("amount")) for transaction in corrected_transactions),
+        2,
+    )
 
     # STEP 3: Use Shopify's calculated refund exactly
     final_payload = {
@@ -936,9 +1253,25 @@ async def refund_order(
         return JSONResponse(status_code=refund_response.status_code, content=refund_response.json())
 
     now = datetime.utcnow()
+    order_action = build_order_action(
+        action_type="refund",
+        amount=actual_refund_amount,
+        current_user=current_user,
+        membership=membership,
+        note=note,
+        details={
+            "order_id": order_id,
+            "shop": shop,
+            "refund_shipping": refund_shipping,
+            "selected_items": selected_items,
+        },
+    )
     await db["orders"].update_one(
         {"_id": order["_id"]},
-        {"$set": {"updated_at": now, "last_refund_at": now}},
+        {
+            "$set": {"updated_at": now, "last_refund_at": now},
+            "$push": {"order_actions": order_action},
+        },
     )
     if ObjectId.is_valid(message_id or ""):
         await db["messages"].update_one(
@@ -966,7 +1299,7 @@ async def refund_order(
         entity_id=order["_id"],
         ticket=(message or {}).get("ticket", ""),
         customer=order.get("customer", {}).get("email", "") or (message or {}).get("client", ""),
-        details={"order_id": order_id, "shop": shop, "amount": refund_amount, "message_id": message_id},
+        details={"order_id": order_id, "shop": shop, "amount": actual_refund_amount, "message_id": message_id},
     )
 
     return {
@@ -1057,11 +1390,24 @@ async def cancel_order(
     # --- Step 6: Handle Shopify response ---
     if response.status_code == 200:
         data = response.json()
+        cancelled_at = datetime.utcnow()
+        cancellation_amount = to_float_amount(order_doc.get("total_price"))
+        order_action = build_order_action(
+            action_type="cancellation",
+            amount=cancellation_amount,
+            current_user=current_user,
+            membership=membership,
+            note=note,
+            details={"order_id": order_id, "shop": shop},
+        )
 
         # Optionally update local DB to mark as cancelled
         await db.orders.update_one(
             {"order_id": int(order_id)},
-            {"$set": {"fulfillment_status": "canceled", "cancelled_at": datetime.utcnow()}},
+            {
+                "$set": {"fulfillment_status": "canceled", "cancelled_at": cancelled_at},
+                "$push": {"order_actions": order_action},
+            },
         )
         if ObjectId.is_valid(message_id or ""):
             await db["messages"].update_one(
@@ -1072,10 +1418,10 @@ async def cancel_order(
                             "type": "cancellation",
                             "actor_id": current_user["_id"],
                             "note": note,
-                            "created_at": datetime.utcnow(),
+                            "created_at": cancelled_at,
                         }
                     },
-                    "$set": {"last_updated": datetime.utcnow()},
+                    "$set": {"last_updated": cancelled_at},
                 },
             )
         message = await db["messages"].find_one({"_id": ObjectId(message_id), "company_id": order_doc["company_id"]}) if ObjectId.is_valid(message_id or "") else None
@@ -1089,7 +1435,7 @@ async def cancel_order(
             entity_id=order_doc["_id"],
             ticket=(message or {}).get("ticket", ""),
             customer=order_doc.get("customer", {}).get("email", "") or (message or {}).get("client", ""),
-            details={"order_id": order_id, "shop": shop, "message_id": message_id},
+            details={"order_id": order_id, "shop": shop, "amount": cancellation_amount, "message_id": message_id},
         )
 
         return {
@@ -1110,3 +1456,316 @@ async def cancel_order(
             "details": error_data,
         },
     )
+
+
+@router.post("/order/return")
+async def create_return_action(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    db = await get_database()
+    context = await get_order_action_context(db, payload, current_user)
+    if isinstance(context, JSONResponse):
+        return context
+    order_doc, shopify_cred, membership = context
+
+    note = (payload.get("note") or "").strip()
+    if not note:
+        return JSONResponse(status_code=400, content={"error": "Return note is required"})
+
+    amount = payload.get("amount") or 0
+    try:
+        return_line_items = await build_return_line_items(
+            payload.get("shop"),
+            shopify_cred["access_token"],
+            payload.get("order_id"),
+            payload.get("selected_items", []),
+            note,
+        )
+        shopify_return = await create_shopify_return(
+            payload.get("shop"),
+            shopify_cred["access_token"],
+            payload.get("order_id"),
+            return_line_items,
+        )
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+    await record_order_action_and_audit(
+        db,
+        order_doc=order_doc,
+        current_user=current_user,
+        membership=membership,
+        action_type="return",
+        audit_action="Created return",
+        amount=amount,
+        note=note,
+        message_id=payload.get("message_id", ""),
+        details={
+            "selected_items": payload.get("selected_items", []),
+            "shopify_return_id": shopify_return.get("id"),
+        },
+    )
+    return {"msg": "Return created successfully.", "shopify_return": shopify_return}
+
+
+@router.post("/order/exchange")
+async def create_exchange_action(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    db = await get_database()
+    context = await get_order_action_context(db, payload, current_user)
+    if isinstance(context, JSONResponse):
+        return context
+    order_doc, shopify_cred, membership = context
+
+    note = (payload.get("note") or "").strip()
+    if not note:
+        return JSONResponse(status_code=400, content={"error": "Exchange note is required"})
+    exchange_items = payload.get("exchange_items", [])
+    if not exchange_items:
+        return JSONResponse(status_code=400, content={"error": "At least one exchange item is required"})
+
+    amount = payload.get("amount") or 0
+    try:
+        return_line_items = await build_return_line_items(
+            payload.get("shop"),
+            shopify_cred["access_token"],
+            payload.get("order_id"),
+            payload.get("selected_items", []),
+            note,
+        )
+        exchange_line_items = [
+            {
+                "variantId": variant_gid(item.get("variant_id")),
+                "quantity": int(item.get("quantity") or 1),
+            }
+            for item in exchange_items
+            if item.get("variant_id")
+        ]
+        if not exchange_line_items:
+            return JSONResponse(status_code=400, content={"error": "Exchange variant ID is required"})
+        shopify_return = await create_shopify_return(
+            payload.get("shop"),
+            shopify_cred["access_token"],
+            payload.get("order_id"),
+            return_line_items,
+            exchange_line_items,
+        )
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+    await record_order_action_and_audit(
+        db,
+        order_doc=order_doc,
+        current_user=current_user,
+        membership=membership,
+        action_type="exchange",
+        audit_action="Created exchange",
+        amount=amount,
+        note=note,
+        message_id=payload.get("message_id", ""),
+        details={
+            "selected_items": payload.get("selected_items", []),
+            "exchange_items": exchange_items,
+            "shopify_return_id": shopify_return.get("id"),
+        },
+    )
+    return {"msg": "Exchange created successfully.", "shopify_return": shopify_return}
+
+
+@router.post("/order/resend")
+async def resend_order_notification(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    db = await get_database()
+    context = await get_order_action_context(db, payload, current_user)
+    if isinstance(context, JSONResponse):
+        return context
+    order_doc, shopify_cred, membership = context
+
+    notification_type = payload.get("type")
+    if notification_type != "invoice":
+        return JSONResponse(status_code=400, content={"error": "Invalid notification type"})
+
+    action_type = "resend_invoice"
+    audit_action = "Resent invoice"
+    note = (payload.get("note") or "").strip()
+    try:
+        shopify_order = await send_order_invoice(
+            payload.get("shop"),
+            shopify_cred["access_token"],
+            payload.get("order_id"),
+            payload.get("email") or order_doc.get("customer", {}).get("email"),
+        )
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
+    await record_order_action_and_audit(
+        db,
+        order_doc=order_doc,
+        current_user=current_user,
+        membership=membership,
+        action_type=action_type,
+        audit_action=audit_action,
+        amount=0,
+        note=note,
+        message_id=payload.get("message_id", ""),
+        details={"shopify_order_id": shopify_order.get("id")},
+    )
+    return {"msg": "Invoice sent successfully.", "shopify_order": shopify_order}
+
+
+@router.post("/order/add-note")
+async def add_order_note(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    db = await get_database()
+    context = await get_order_action_context(db, payload, current_user)
+    if isinstance(context, JSONResponse):
+        return context
+    order_doc, shopify_cred, membership = context
+
+    note = (payload.get("note") or "").strip()
+    if not note:
+        return JSONResponse(status_code=400, content={"error": "Order note is required"})
+
+    shop = payload.get("shop")
+    order_id = payload.get("order_id")
+    url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders/{int(order_id)}.json"
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            url,
+            headers={
+                "X-Shopify-Access-Token": shopify_cred["access_token"],
+                "Content-Type": "application/json",
+            },
+            json={"order": {"id": int(order_id), "note": note}},
+        )
+    if response.status_code >= 400:
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+    await record_order_action_and_audit(
+        db,
+        order_doc=order_doc,
+        current_user=current_user,
+        membership=membership,
+        action_type="add_note",
+        audit_action="Added order note",
+        amount=0,
+        note=note,
+        message_id=payload.get("message_id", ""),
+        order_updates={"note": note},
+    )
+    return {"msg": "Order note added successfully.", "shopify_response": response.json()}
+
+
+@router.post("/order/fulfillment-hold")
+async def hold_fulfillment(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    db = await get_database()
+    context = await get_order_action_context(db, payload, current_user)
+    if isinstance(context, JSONResponse):
+        return context
+    order_doc, shopify_cred, membership = context
+
+    note = (payload.get("note") or "").strip() or "Placed on hold from Attentify"
+    reason = payload.get("reason") or "other"
+    shop = payload.get("shop")
+    order_id = payload.get("order_id")
+    fulfillment_orders = await get_fulfillment_orders(shop, shopify_cred["access_token"], order_id)
+    if not fulfillment_orders:
+        return JSONResponse(status_code=404, content={"error": "No fulfillment orders found"})
+
+    held_ids = []
+    async with httpx.AsyncClient() as client:
+        for fulfillment_order in fulfillment_orders:
+            fulfillment_order_id = fulfillment_order.get("id")
+            if not fulfillment_order_id:
+                continue
+            response = await client.post(
+                f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/fulfillment_orders/{fulfillment_order_id}/hold.json",
+                headers={
+                    "X-Shopify-Access-Token": shopify_cred["access_token"],
+                    "Content-Type": "application/json",
+                },
+                json={"fulfillment_hold": {"reason": reason, "reason_notes": note}},
+            )
+            if response.status_code < 400:
+                held_ids.append(str(fulfillment_order_id))
+
+    if not held_ids:
+        return JSONResponse(status_code=400, content={"error": "Failed to hold fulfillment orders"})
+
+    await record_order_action_and_audit(
+        db,
+        order_doc=order_doc,
+        current_user=current_user,
+        membership=membership,
+        action_type="fulfillment_hold",
+        audit_action="Placed fulfillment on hold",
+        amount=0,
+        note=note,
+        message_id=payload.get("message_id", ""),
+        details={"fulfillment_order_ids": held_ids, "reason": reason},
+        order_updates={"fulfillment_hold_status": "held"},
+    )
+    return {"msg": "Fulfillment hold placed successfully.", "fulfillment_order_ids": held_ids}
+
+
+@router.post("/order/fulfillment-release")
+async def release_fulfillment_hold(
+    payload: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+):
+    db = await get_database()
+    context = await get_order_action_context(db, payload, current_user)
+    if isinstance(context, JSONResponse):
+        return context
+    order_doc, shopify_cred, membership = context
+
+    note = (payload.get("note") or "").strip()
+    shop = payload.get("shop")
+    order_id = payload.get("order_id")
+    fulfillment_orders = await get_fulfillment_orders(shop, shopify_cred["access_token"], order_id)
+    if not fulfillment_orders:
+        return JSONResponse(status_code=404, content={"error": "No fulfillment orders found"})
+
+    released_ids = []
+    async with httpx.AsyncClient() as client:
+        for fulfillment_order in fulfillment_orders:
+            fulfillment_order_id = fulfillment_order.get("id")
+            if not fulfillment_order_id:
+                continue
+            response = await client.post(
+                f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/fulfillment_orders/{fulfillment_order_id}/release_hold.json",
+                headers={
+                    "X-Shopify-Access-Token": shopify_cred["access_token"],
+                    "Content-Type": "application/json",
+                },
+            )
+            if response.status_code < 400:
+                released_ids.append(str(fulfillment_order_id))
+
+    if not released_ids:
+        return JSONResponse(status_code=400, content={"error": "Failed to release fulfillment holds"})
+
+    await record_order_action_and_audit(
+        db,
+        order_doc=order_doc,
+        current_user=current_user,
+        membership=membership,
+        action_type="fulfillment_release",
+        audit_action="Released fulfillment hold",
+        amount=0,
+        note=note,
+        message_id=payload.get("message_id", ""),
+        details={"fulfillment_order_ids": released_ids},
+        order_updates={"fulfillment_hold_status": "released"},
+    )
+    return {"msg": "Fulfillment hold released successfully.", "fulfillment_order_ids": released_ids}

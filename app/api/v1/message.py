@@ -773,6 +773,50 @@ def clean_json_response(response: str):
         return json.loads(cleaned)
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON response: {e}\nRaw text: {response}")
+
+
+def serialize_order_action(action: dict) -> dict:
+    serialized = dict(action)
+    if serialized.get("created_at"):
+        serialized["created_at"] = serialized["created_at"].isoformat() if hasattr(serialized["created_at"], "isoformat") else serialized["created_at"]
+    if serialized.get("actor_id"):
+        serialized["actor_id"] = str(serialized["actor_id"])
+    return serialized
+
+
+async def get_order_actions(db: AsyncIOMotorDatabase, order: dict) -> list[dict]:
+    stored_actions = [
+        serialize_order_action(action)
+        for action in order.get("order_actions", [])
+    ]
+    if stored_actions:
+        return sorted(stored_actions, key=lambda action: action.get("created_at", ""), reverse=True)
+
+    audit_actions = []
+    order_id_values = [str(order.get("order_id", "")), order.get("order_id")]
+    cursor = db["audit_logs"].find({
+        "company_id": order.get("company_id"),
+        "entity_type": "order",
+        "action": {"$in": ["Processed refund", "Cancelled order"]},
+        "$or": [
+            {"entity_id": order.get("_id")},
+            {"details.order_id": {"$in": order_id_values}},
+        ],
+    }).sort("created_at", DESCENDING).limit(50)
+    async for log in cursor:
+        action_type = "refund" if log.get("action") == "Processed refund" else "cancellation"
+        details = log.get("details", {}) or {}
+        audit_actions.append({
+            "type": action_type,
+            "amount": details.get("amount"),
+            "actor_id": str(log.get("actor_id") or ""),
+            "actor_name": log.get("actor_name", "Unknown user"),
+            "actor_role": log.get("actor_role", "unknown"),
+            "note": details.get("note", ""),
+            "details": details,
+            "created_at": log.get("created_at").isoformat() if log.get("created_at") else "",
+        })
+    return audit_actions
     
 @router.post("/analyze_as_list", response_model=list)
 async def analyze_email_message_as_list(
@@ -870,6 +914,7 @@ async def analyze_email_message(
         email = match[0] if match else ""
 
         if email and db_order.get("customer", {}).get("email", "") == email:
+            db_order["order_actions"] = await get_order_actions(db, db_order)
             db_order["_id"] = str(db_order["_id"])
             db_order["user_id"] = str(db_order.get("user_id", ""))
             db_order["company_id"] = str(db_order.get("company_id", ""))
