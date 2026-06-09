@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
 from datetime import datetime
 from app.models.company import CompanyCreate, SimpleCompanyOut, CompanyInDB, UpdateCompanyRequest
 from app.models.user import UserPublic
@@ -372,6 +372,10 @@ async def get_role_permissions(
 @router.get("/{company_id}/audit-logs", response_model=dict)
 async def list_audit_logs(
     company_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    skip: int = Query(0, ge=0),
+    category: str = Query("all"),
+    search: str = Query(""),
     current_user: dict = Depends(get_current_user),
     db=Depends(get_database),
 ):
@@ -382,11 +386,46 @@ async def list_audit_logs(
     if current_user.get("role") != ROLE_ADMIN and not membership:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-    cursor = db["audit_logs"].find({"company_id": ObjectId(company_id)}).sort("created_at", DESCENDING).limit(100)
+    query = {"company_id": ObjectId(company_id)}
+    category_map = {
+        "tickets": ["ticket"],
+        "orders": ["order"],
+        "team": ["membership", "invitation"],
+        "settings": ["company"],
+        "integrations": ["shopify_cred", "gmail_account", "phone_account"],
+    }
+    if category != "all":
+        if category not in category_map:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid audit log category")
+        query["entity_type"] = {"$in": category_map[category]}
+
+    if search.strip():
+        search_regex = {"$regex": search.strip(), "$options": "i"}
+        query["$or"] = [
+            {"actor_name": search_regex},
+            {"actor_email": search_regex},
+            {"action": search_regex},
+            {"ticket": search_regex},
+            {"customer": search_regex},
+            {"details.target_email": search_regex},
+            {"details.order_id": search_regex},
+            {"details.shop": search_regex},
+            {"details.email": search_regex},
+            {"details.phone_number": search_regex},
+        ]
+
+    total = await db["audit_logs"].count_documents(query)
+    cursor = (
+        db["audit_logs"]
+        .find(query)
+        .sort("created_at", DESCENDING)
+        .skip(skip)
+        .limit(limit)
+    )
     logs = []
     async for doc in cursor:
         logs.append(serialize_audit_log(doc))
-    return {"logs": logs}
+    return {"logs": logs, "total": total, "has_more": skip + len(logs) < total}
 
 #GET /api/v1/company/{company_id}/active_members
 @router.get("/{company_id}/active_members", response_model=List[dict])
