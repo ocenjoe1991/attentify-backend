@@ -189,6 +189,7 @@ async def get_company_messages(
     view_mode: str = Query("inbox", description="inbox, archived, or trashed"),
     assigned_filter: str = Query("all", description="all, assigned, or unassigned"),
     status_filter: str = Query("all", description="Message status or all"),
+    order_filter: str = Query("all", description="all, order, other, or needs_review"),
     sort_by: str = Query("last_updated", description="started_at or last_updated"),
     sort_order: str = Query("desc", description="asc or desc"),
     db: AsyncIOMotorDatabase = Depends(get_database),
@@ -252,6 +253,21 @@ async def get_company_messages(
             ]
         })
 
+    if order_filter == "order":
+        query["order_match_status"] = "matched"
+    elif order_filter == "other":
+        query["order_match_status"] = {"$in": ["unmatched", "not_order"]}
+    elif order_filter == "needs_review":
+        query["$and"] = query.get("$and", [])
+        query["$and"].append({
+            "$or": [
+                {"order_match_status": {"$exists": False}},
+                {"order_match_status": {"$in": ["unknown", "possible"]}},
+            ]
+        })
+    elif order_filter != "all":
+        raise HTTPException(status_code=400, detail="Invalid order filter")
+
     if status_filter != "all":
         status_filter = normalize_status(status_filter)
         if status_filter not in TICKET_STATUSES:
@@ -295,6 +311,7 @@ async def get_company_messages(
         doc["user_id"] = str(doc["user_id"])
         doc["company_id"] = str(doc["company_id"])
         doc["status"] = normalize_status(doc.get("status", "Open"))
+        doc["order_match_status"] = doc.get("order_match_status", "unknown")
         doc.pop("_sort_date", None)
 
         # Clean client name
@@ -369,6 +386,10 @@ async def update_message(
         "status": "active",
     })
     safe_payload = {k: v for k, v in payload.items() if k != "_id"}
+    if safe_payload.get("order_info.confirmed") is True:
+        safe_payload["order_match_status"] = "matched"
+        if safe_payload.get("order_info.order_id"):
+            safe_payload["matched_order_name"] = safe_payload["order_info.order_id"]
     if "status" in safe_payload:
         safe_payload["status"] = normalize_status(safe_payload["status"])
         if safe_payload["status"] not in TICKET_STATUSES:
@@ -870,6 +891,10 @@ async def analyze_email_message(
         # result is now a single dict, not a list
 
         if isinstance(result, dict) and result.get("error"):
+            await db["messages"].update_one(
+                {"_id": message_doc["_id"]},
+                {"$set": {"order_match_status": "unknown"}},
+            )
             return {
                 "order_id": "",
                 "type": "",
@@ -883,6 +908,10 @@ async def analyze_email_message(
         try:
             order_info = clean_json_response(response)
         except ValueError as exc:
+            await db["messages"].update_one(
+                {"_id": message_doc["_id"]},
+                {"$set": {"order_match_status": "unknown"}},
+            )
             return {
                 "order_id": "",
                 "type": "",
@@ -902,6 +931,15 @@ async def analyze_email_message(
             )
     
     order_id = str(order_info.get("order_id", ""))
+    if not order_id:
+        await db["messages"].update_one(
+            {"_id": message_doc["_id"]},
+            {"$set": {"order_match_status": "not_order"}},
+        )
+        order_info["msg"] = order_info.get("msg") or "No order found in message"
+        order_info["shopify_order"] = {}
+        return order_info
+
     order_name = order_id if order_id.startswith("#") else "#" + order_id
 
     db_order = await db["orders"].find_one({"name": order_name})
@@ -919,14 +957,38 @@ async def analyze_email_message(
             db_order["user_id"] = str(db_order.get("user_id", ""))
             db_order["company_id"] = str(db_order.get("company_id", ""))
             order_info["shopify_order"] = db_order
+            await db["messages"].update_one(
+                {"_id": message_doc["_id"]},
+                {
+                    "$set": {
+                        "order_match_status": "matched",
+                        "matched_order_id": str(db_order.get("order_id", "")),
+                        "matched_order_name": db_order.get("name", ""),
+                    }
+                },
+            )
 
         else:
             order_info["msg"] = "Email not matched"
             order_info["shopify_order"] = {}
+            await db["messages"].update_one(
+                {"_id": message_doc["_id"]},
+                {
+                    "$set": {
+                        "order_match_status": "possible",
+                        "matched_order_id": str(db_order.get("order_id", "")),
+                        "matched_order_name": db_order.get("name", ""),
+                    }
+                },
+            )
 
     else:
         order_info["msg"] = "Order not found"
         order_info["shopify_order"] = {}
+        await db["messages"].update_one(
+            {"_id": message_doc["_id"]},
+            {"$set": {"order_match_status": "unmatched"}},
+        )
 
     return order_info
 
