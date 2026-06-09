@@ -3,6 +3,7 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from urllib.parse import urlencode
 import hmac, hashlib, requests, base64
 import os
+import re
 from typing import List, Dict
 from datetime import datetime
 import json
@@ -909,6 +910,8 @@ async def get_orders(
     shop: str = Query("", description="Filter by shop"),
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(10, ge=1, le=100, description="Page size"),
+    sort_by: str = Query("date", description="order, date, payment_status, fulfillment_status"),
+    sort_order: str = Query("desc", description="asc or desc"),
     company_id: str = Query("", description="Company ID"),
     email: str = Query("", description="Email"),
     current_user: dict = Depends(get_current_user),
@@ -917,10 +920,27 @@ async def get_orders(
 
     # Build filter query
     filter_query = {}
-    if search:
+    if search.strip():
+        search_value = search.strip()
+        search_regex = {"$regex": re.escape(search_value), "$options": "i"}
+        search_or = [
+            {"name": search_regex},
+            {"customer.email": search_regex},
+            {"customer.name": search_regex},
+            {"email": search_regex},
+            {"contact_email": search_regex},
+            {"customerEmail": search_regex},
+            {"shop": search_regex},
+        ]
+        numeric_search = search_value.lstrip("#")
+        if numeric_search.isdigit():
+            numeric_value = int(numeric_search)
+            search_or.extend([
+                {"order_id": numeric_value},
+                {"order_number": numeric_value},
+            ])
         filter_query["$or"] = [
-            {"name": {"$regex": search, "$options": "i"}},
-            {"customer.email": {"$regex": search, "$options": "i"}}
+            *search_or
         ]
     if shop:
         filter_query["shop"] = shop
@@ -942,8 +962,22 @@ async def get_orders(
     total_count = await db.orders.count_documents(filter_query)
     totalPages = ceil(total_count / size)
 
-    # Fetch paginated orders sorted by created_at descending
-    cursor = db.orders.find(filter_query).sort("created_at", -1).skip((page - 1) * size).limit(size)
+    sort_fields = {
+        "order": "name",
+        "date": "created_at",
+        "payment_status": "payment_status",
+        "fulfillment_status": "fulfillment_status",
+    }
+    sort_field = sort_fields.get(sort_by, "created_at")
+    sort_direction = 1 if sort_order == "asc" else -1
+
+    # Fetch paginated orders sorted by the requested table column
+    cursor = (
+        db.orders.find(filter_query)
+        .sort([(sort_field, sort_direction), ("_id", sort_direction)])
+        .skip((page - 1) * size)
+        .limit(size)
+    )
     orders = []
     async for doc in cursor:
         doc["order_actions"] = serialize_order_actions(doc)
