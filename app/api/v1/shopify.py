@@ -83,6 +83,25 @@ def serialize_order_actions(order: dict) -> list[dict]:
     return sorted(actions, key=lambda item: item.get("created_at", ""), reverse=True)
 
 
+def stringify_shopify_error(value) -> str:
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return " ".join(filter(None, [stringify_shopify_error(item) for item in value]))
+    if isinstance(value, dict):
+        for key in ("message", "error", "errors"):
+            if key in value:
+                message = stringify_shopify_error(value.get(key))
+                if message:
+                    return message
+        return " ".join(
+            filter(None, [f"{key}: {stringify_shopify_error(item) or item}" for key, item in value.items()])
+        )
+    return str(value)
+
+
 async def get_order_action_context(db, payload: dict, current_user: dict):
     order_id = payload.get("order_id")
     shop = payload.get("shop")
@@ -1374,6 +1393,11 @@ async def cancel_order(
             status_code=400,
             content={"error": f"Order {order_id} is already cancelled."},
         )
+    if str(order_doc.get("payment_status", "")).lower() == "refunded":
+        return JSONResponse(
+            status_code=400,
+            content={"error": "This order has already been refunded and cannot be cancelled."},
+        )
 
     # --- Step 5: Call Shopify Cancel API ---
     cancel_url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders/{int(order_id)}/cancel.json"
@@ -1452,7 +1476,7 @@ async def cancel_order(
     return JSONResponse(
         status_code=response.status_code,
         content={
-            "error": "Failed to cancel order in Shopify.",
+            "error": stringify_shopify_error(error_data) or "Failed to cancel order in Shopify.",
             "details": error_data,
         },
     )
