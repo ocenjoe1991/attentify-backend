@@ -102,6 +102,26 @@ def stringify_shopify_error(value) -> str:
     return str(value)
 
 
+def order_is_refunded(order: dict) -> bool:
+    return any(
+        str(order.get(field, "")).lower() == "refunded"
+        for field in ("payment_status", "financial_status")
+    )
+
+
+def order_is_cancelled(order: dict) -> bool:
+    if order.get("cancelled_at"):
+        return True
+    return any(
+        str(order.get(field, "")).lower() in {"cancelled", "canceled"}
+        for field in ("status", "fulfillment_status")
+    )
+
+
+def order_has_cancellation_action(order: dict) -> bool:
+    return any(action.get("type") == "cancellation" for action in order.get("order_actions", []))
+
+
 async def get_order_action_context(db, payload: dict, current_user: dict):
     order_id = payload.get("order_id")
     shop = payload.get("shop")
@@ -1158,6 +1178,10 @@ async def refund_order(
         return JSONResponse(status_code=404, content={"error": "Order not found"})
     if order.get("company_id") != shopify_cred.get("company_id"):
         return JSONResponse(status_code=403, content={"error": "Order does not belong to this shop connection"})
+    if order_is_refunded(order):
+        return JSONResponse(status_code=400, content={"error": "This order is already refunded."})
+    if order_is_cancelled(order):
+        return JSONResponse(status_code=400, content={"error": "This order is already cancelled."})
 
     membership = await require_company_member(db, current_user, order["company_id"])
     approvals = await get_governance_settings(db)
@@ -1368,6 +1392,21 @@ async def cancel_order(
         )
     if order_doc.get("company_id") != shopify_cred.get("company_id"):
         return JSONResponse(status_code=403, content={"error": "Order does not belong to this shop connection"})
+    if order_is_cancelled(order_doc):
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Order {order_id} is already cancelled."},
+        )
+    if order_is_refunded(order_doc):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "This order is already refunded."},
+        )
+    if order_has_cancellation_action(order_doc):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Cancellation has already been recorded for this order."},
+        )
 
     membership = await require_company_member(db, current_user, order_doc["company_id"])
     approvals = await get_governance_settings(db)
@@ -1385,18 +1424,6 @@ async def cancel_order(
                 order_doc["company_id"],
                 message_id,
             ),
-        )
-
-    # --- Step 4: Check if order is already cancelled ---
-    if order_doc.get("cancelled_at"):
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Order {order_id} is already cancelled."},
-        )
-    if str(order_doc.get("payment_status", "")).lower() == "refunded":
-        return JSONResponse(
-            status_code=400,
-            content={"error": "This order has already been refunded and cannot be cancelled."},
         )
 
     # --- Step 5: Call Shopify Cancel API ---
