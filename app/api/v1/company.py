@@ -14,7 +14,7 @@ from app.core.permissions import (
     normalize_custom_permissions,
 )
 from app.core.audit import record_audit_log, serialize_audit_log
-from pymongo import DESCENDING
+from pymongo import ASCENDING, DESCENDING
 
 router = APIRouter()
 
@@ -47,6 +47,29 @@ async def count_active_company_owners(db, company_id):
         "role": ROLE_COMPANY_OWNER,
         "status": "active",
     })
+
+def serialize_dashboard_message(message):
+    return {
+        "_id": str(message["_id"]),
+        "title": message.get("title") or "Untitled",
+        "client": message.get("client", ""),
+        "status": message.get("status", ""),
+        "ticket": message.get("ticket", ""),
+        "order_match_status": message.get("order_match_status", "unknown"),
+        "matched_order_name": message.get("matched_order_name", ""),
+        "last_updated": message.get("last_updated").isoformat() if hasattr(message.get("last_updated"), "isoformat") else message.get("last_updated", ""),
+    }
+
+def serialize_dashboard_approval(request_doc):
+    return {
+        "_id": str(request_doc["_id"]),
+        "type": request_doc.get("type", ""),
+        "status": request_doc.get("status", ""),
+        "requester_name": request_doc.get("requester_name", ""),
+        "requester_email": request_doc.get("requester_email", ""),
+        "created_at": request_doc.get("created_at").isoformat() if hasattr(request_doc.get("created_at"), "isoformat") else request_doc.get("created_at", ""),
+        "payload": request_doc.get("payload", {}),
+    }
 
 async def ensure_owner_change_allowed(db, current_user, member, new_role=None, deleting=False):
     if member.get("role") != ROLE_COMPANY_OWNER:
@@ -426,6 +449,127 @@ async def list_audit_logs(
     async for doc in cursor:
         logs.append(serialize_audit_log(doc))
     return {"logs": logs, "total": total, "has_more": skip + len(logs) < total}
+
+@router.get("/{company_id}/dashboard", response_model=dict)
+async def get_company_dashboard(
+    company_id: str,
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
+
+    company_object_id = ObjectId(company_id)
+    membership = await get_active_membership(db, current_user["_id"], company_object_id)
+    if current_user.get("role") != ROLE_ADMIN and not membership:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    base_message_query = {"company_id": company_object_id}
+    open_statuses = ["Open", "Assigned", "In Progress", "Pending", "Escalated", "Awaiting Approval"]
+    needs_review_filter = {
+        "$or": [
+            {"order_match_status": {"$exists": False}},
+            {"order_match_status": {"$in": ["unknown", "possible"]}},
+        ]
+    }
+
+    open_tickets = await db["messages"].count_documents({
+        **base_message_query,
+        "status": {"$in": open_statuses},
+    })
+    pending_tickets = await db["messages"].count_documents({
+        **base_message_query,
+        "status": {"$in": ["Pending", "Awaiting Approval"]},
+    })
+    resolved_tickets = await db["messages"].count_documents({
+        **base_message_query,
+        "status": "Resolved",
+    })
+    order_messages = await db["messages"].count_documents({
+        **base_message_query,
+        "order_match_status": "matched",
+    })
+    needs_review = await db["messages"].count_documents({
+        **base_message_query,
+        **needs_review_filter,
+    })
+    unmatched_orders = await db["messages"].count_documents({
+        **base_message_query,
+        "order_match_status": "unmatched",
+    })
+    approval_count = await db["approval_requests"].count_documents({
+        "company_id": company_object_id,
+        "status": "pending",
+    })
+    connected_gmail = await db["gmail_accounts"].count_documents({
+        "company_id": company_object_id,
+        "status": "connected",
+    })
+    connected_shopify = await db["shopify_cred"].count_documents({
+        "company_id": company_object_id,
+        "status": "connected",
+    })
+
+    recent_messages = []
+    message_cursor = (
+        db["messages"]
+        .find(base_message_query)
+        .sort("last_updated", DESCENDING)
+        .limit(5)
+    )
+    async for message in message_cursor:
+        recent_messages.append(serialize_dashboard_message(message))
+
+    review_messages = []
+    review_cursor = (
+        db["messages"]
+        .find({**base_message_query, **needs_review_filter})
+        .sort("last_updated", DESCENDING)
+        .limit(5)
+    )
+    async for message in review_cursor:
+        review_messages.append(serialize_dashboard_message(message))
+
+    approvals = []
+    approval_cursor = (
+        db["approval_requests"]
+        .find({"company_id": company_object_id, "status": "pending"})
+        .sort("created_at", ASCENDING)
+        .limit(5)
+    )
+    async for request_doc in approval_cursor:
+        approvals.append(serialize_dashboard_approval(request_doc))
+
+    recent_activity = []
+    audit_cursor = (
+        db["audit_logs"]
+        .find({"company_id": company_object_id})
+        .sort("created_at", DESCENDING)
+        .limit(6)
+    )
+    async for log in audit_cursor:
+        recent_activity.append(serialize_audit_log(log))
+
+    return {
+        "summary": {
+            "open_tickets": open_tickets,
+            "pending_tickets": pending_tickets,
+            "resolved_tickets": resolved_tickets,
+            "awaiting_approval": approval_count,
+            "order_messages": order_messages,
+            "needs_review": needs_review,
+            "unmatched_orders": unmatched_orders,
+        },
+        "connections": {
+            "gmail_connected": connected_gmail,
+            "shopify_connected": connected_shopify,
+        },
+        "recent_messages": recent_messages,
+        "review_messages": review_messages,
+        "pending_approvals": approvals,
+        "recent_activity": recent_activity,
+        "current_user_role": (membership or {}).get("role", current_user.get("role", "")),
+    }
 
 #GET /api/v1/company/{company_id}/active_members
 @router.get("/{company_id}/active_members", response_model=List[dict])
