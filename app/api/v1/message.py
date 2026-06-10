@@ -842,6 +842,83 @@ def refund_amount(refund: dict) -> float:
     )
 
 
+def find_order_line_item(order: dict, line_item_id) -> dict:
+    line_item_id = str(line_item_id or "")
+    for item in order.get("line_items", []) or []:
+        if str(item.get("id", "")) == line_item_id:
+            return item
+    return {}
+
+
+def format_action_line_item(*, name="", quantity=1, amount=None, line_item_id="", variant_id="") -> dict:
+    return {
+        "name": name or "Unknown item",
+        "quantity": int(quantity or 1),
+        "amount": action_amount(amount) if amount not in (None, "") else "",
+        "line_item_id": str(line_item_id or ""),
+        "variant_id": str(variant_id or ""),
+    }
+
+
+def build_refund_line_items(order: dict, refund: dict) -> list[dict]:
+    items = []
+    for refund_item in refund.get("refund_line_items", []) or []:
+        nested_item = refund_item.get("line_item") or {}
+        line_item_id = refund_item.get("line_item_id") or nested_item.get("id")
+        order_item = find_order_line_item(order, line_item_id)
+        items.append(format_action_line_item(
+            name=nested_item.get("name") or order_item.get("name"),
+            quantity=refund_item.get("quantity"),
+            amount=refund_item.get("subtotal"),
+            line_item_id=line_item_id,
+            variant_id=nested_item.get("variant_id") or order_item.get("variant_id"),
+        ))
+    return items
+
+
+def build_selected_line_items(order: dict, selected_items: list[dict]) -> list[dict]:
+    items = []
+    for selected in selected_items or []:
+        line_item_id = selected.get("line_item_id") or selected.get("id")
+        order_item = find_order_line_item(order, line_item_id)
+        items.append(format_action_line_item(
+            name=order_item.get("name"),
+            quantity=selected.get("quantity"),
+            amount=selected.get("amount") or order_item.get("price"),
+            line_item_id=line_item_id,
+            variant_id=order_item.get("variant_id"),
+        ))
+    return items
+
+
+def enrich_action_details_with_line_items(action: dict, order: dict) -> dict:
+    details = dict(action.get("details") or {})
+    if details.get("line_items") or details.get("returned_items"):
+        action["details"] = details
+        return action
+
+    selected_items = details.get("selected_items") or []
+    if selected_items:
+        line_items = build_selected_line_items(order, selected_items)
+        details["line_items"] = line_items
+        if action.get("type") in {"return", "exchange"}:
+            details["returned_items"] = line_items
+
+    exchange_items = details.get("exchange_items") or []
+    if exchange_items:
+        details["exchange_items"] = [
+            format_action_line_item(
+                name=item.get("name") or item.get("title") or f"Variant {item.get('variant_id')}",
+                quantity=item.get("quantity"),
+                variant_id=item.get("variant_id"),
+            )
+            for item in exchange_items
+        ]
+
+    action["details"] = details
+    return action
+
+
 def build_shopify_order_actions(order: dict) -> list[dict]:
     actions = []
 
@@ -858,6 +935,7 @@ def build_shopify_order_actions(order: dict) -> list[dict]:
                 "shopify_refund_id": refund.get("id"),
                 "order_id": str(order.get("order_id", "")),
                 "transactions": refund.get("transactions", []),
+                "line_items": build_refund_line_items(order, refund),
             },
             "created_at": refund.get("created_at") or refund.get("processed_at") or order.get("updated_at") or "",
         })
@@ -987,7 +1065,7 @@ def dedupe_order_actions(actions: list[dict]) -> list[dict]:
 async def get_order_actions(db: AsyncIOMotorDatabase, order: dict) -> list[dict]:
     order = await hydrate_shopify_refunds(db, order)
     stored_actions = [
-        serialize_order_action(action)
+        enrich_action_details_with_line_items(serialize_order_action(action), order)
         for action in order.get("order_actions", [])
     ]
     shopify_actions = [
