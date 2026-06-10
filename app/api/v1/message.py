@@ -805,13 +805,124 @@ def serialize_order_action(action: dict) -> dict:
     return serialized
 
 
+def parse_action_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def action_amount(value) -> float:
+    try:
+        return round(float(value or 0), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def refund_amount(refund: dict) -> float:
+    transactions = refund.get("transactions") or []
+    if transactions:
+        return round(sum(action_amount(transaction.get("amount")) for transaction in transactions), 2)
+    if refund.get("total_refunded") is not None:
+        return action_amount(refund.get("total_refunded"))
+    line_items = refund.get("refund_line_items") or []
+    return round(
+        sum(action_amount(item.get("subtotal")) + action_amount(item.get("total_tax")) for item in line_items),
+        2,
+    )
+
+
+def build_shopify_order_actions(order: dict) -> list[dict]:
+    actions = []
+
+    for refund in order.get("refunds", []) or []:
+        amount = refund_amount(refund)
+        actions.append({
+            "type": "refund",
+            "amount": amount,
+            "actor_name": "Shopify",
+            "actor_role": "system",
+            "note": refund.get("note") or "Refund recorded in Shopify",
+            "details": {
+                "source": "shopify",
+                "shopify_refund_id": refund.get("id"),
+                "order_id": str(order.get("order_id", "")),
+                "transactions": refund.get("transactions", []),
+            },
+            "created_at": refund.get("created_at") or refund.get("processed_at") or order.get("updated_at") or "",
+        })
+
+    if order.get("cancelled_at"):
+        actions.append({
+            "type": "cancellation",
+            "amount": action_amount(order.get("total_price")),
+            "actor_name": "Shopify",
+            "actor_role": "system",
+            "note": order.get("cancel_reason") or "Cancellation recorded in Shopify",
+            "details": {
+                "source": "shopify",
+                "order_id": str(order.get("order_id", "")),
+                "cancel_reason": order.get("cancel_reason", ""),
+            },
+            "created_at": order.get("cancelled_at"),
+        })
+
+    for fulfillment in order.get("fulfillments", []) or []:
+        if fulfillment.get("created_at"):
+            actions.append({
+                "type": "fulfillment",
+                "amount": "",
+                "actor_name": "Shopify",
+                "actor_role": "system",
+                "note": fulfillment.get("status") or "Fulfillment recorded in Shopify",
+                "details": {
+                    "source": "shopify",
+                    "shopify_fulfillment_id": fulfillment.get("id"),
+                    "tracking_number": fulfillment.get("tracking_number"),
+                },
+                "created_at": fulfillment.get("created_at"),
+            })
+
+    return actions
+
+
+def dedupe_order_actions(actions: list[dict]) -> list[dict]:
+    deduped = []
+    for action in sorted(actions, key=lambda item: item.get("created_at", ""), reverse=True):
+        action_type = action.get("type", "")
+        amount = action_amount(action.get("amount"))
+        created_at = parse_action_datetime(action.get("created_at"))
+        duplicate = False
+        for existing in deduped:
+            if existing.get("type", "") != action_type:
+                continue
+            if action_amount(existing.get("amount")) != amount:
+                continue
+            existing_at = parse_action_datetime(existing.get("created_at"))
+            if created_at and existing_at:
+                if abs((created_at - existing_at).total_seconds()) <= 300:
+                    duplicate = True
+                    break
+            elif action.get("details", {}).get("shopify_refund_id") and action.get("details", {}).get("shopify_refund_id") == existing.get("details", {}).get("shopify_refund_id"):
+                duplicate = True
+                break
+        if not duplicate:
+            deduped.append(action)
+    return deduped
+
+
 async def get_order_actions(db: AsyncIOMotorDatabase, order: dict) -> list[dict]:
     stored_actions = [
         serialize_order_action(action)
         for action in order.get("order_actions", [])
     ]
-    if stored_actions:
-        return sorted(stored_actions, key=lambda action: action.get("created_at", ""), reverse=True)
+    shopify_actions = build_shopify_order_actions(order)
 
     audit_actions = []
     order_id_values = [str(order.get("order_id", "")), order.get("order_id")]
@@ -837,7 +948,8 @@ async def get_order_actions(db: AsyncIOMotorDatabase, order: dict) -> list[dict]
             "details": details,
             "created_at": log.get("created_at").isoformat() if log.get("created_at") else "",
         })
-    return audit_actions
+
+    return dedupe_order_actions([*stored_actions, *shopify_actions, *audit_actions])
     
 @router.post("/analyze_as_list", response_model=list)
 async def analyze_email_message_as_list(

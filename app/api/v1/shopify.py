@@ -887,6 +887,11 @@ async def shopify_orders_create_webhook(
                     ),
             "payment_status": data.get("financial_status"),
             "fulfillment_status": data.get("fulfillment_status"),
+            "cancelled_at": data.get("cancelled_at"),
+            "cancel_reason": data.get("cancel_reason"),
+            "closed_at": data.get("closed_at"),
+            "refunds": data.get("refunds", []),
+            "fulfillments": data.get("fulfillments", []),
             "updated_at": data.get("updated_at")
         }
 

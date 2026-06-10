@@ -1,3 +1,5 @@
+import re
+import urllib.parse
 import requests
 from datetime import datetime
 from pymongo import UpdateOne
@@ -47,17 +49,34 @@ def fetch_orders_from_shop1(shop, access_token):
     return orders
 
 async def fetch_orders_from_shop(shop, access_token):
-    """Fetch the 30 most recent orders from a Shopify store using the access token."""
-    url = f"https://{shop}/admin/api/2025-10/orders.json?status=any&limit=10&order=created_at desc"
+    """Fetch all available orders from a Shopify store using cursor pagination."""
+    url = f"https://{shop}/admin/api/2025-10/orders.json?status=any&limit=250&order=created_at desc"
     headers = {
         "X-Shopify-Access-Token": access_token,
         "Content-Type": "application/json"
     }
-    resp = requests.get(url, headers=headers)
-    if resp.status_code != 200:
-        return []
-    data = resp.json()
-    return data.get("orders", [])
+    orders = []
+    next_url = url
+
+    while next_url:
+        resp = requests.get(next_url, headers=headers)
+        if resp.status_code != 200:
+            break
+
+        data = resp.json()
+        orders.extend(data.get("orders", []))
+
+        link = resp.headers.get("link", "")
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        next_url = match.group(1) if match else None
+
+        if next_url:
+            parsed = urllib.parse.urlparse(next_url)
+            query = urllib.parse.parse_qs(parsed.query)
+            page_info = query.get("page_info", [None])[0]
+            next_url = f"https://{shop}/admin/api/2025-10/orders.json?limit=250&page_info={page_info}" if page_info else None
+
+    return orders
 
 async def upsert_orders(db, shop, orders):
     """Insert or update orders in the database for a specific shop."""
@@ -107,6 +126,11 @@ async def upsert_orders(db, shop, orders):
             "total_price": order.get("total_price"),
             "payment_status": order.get("financial_status"),
             "fulfillment_status": order.get("fulfillment_status"),
+            "cancelled_at": order.get("cancelled_at"),
+            "cancel_reason": order.get("cancel_reason"),
+            "closed_at": order.get("closed_at"),
+            "refunds": order.get("refunds", []),
+            "fulfillments": order.get("fulfillments", []),
             "line_items": [
                 {
                     "id": item.get("id"),
