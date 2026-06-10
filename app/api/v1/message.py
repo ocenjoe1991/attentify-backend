@@ -1,6 +1,8 @@
 # app/routes/message.py
 
 from fastapi import APIRouter, HTTPException, Depends, Body, Query
+import os
+import httpx
 from app.services.gmail_service import fetch_all_gmail_accounts, get_gmail_service
 from app.db.mongodb import get_database
 from app.models.message import Message, ChatEntry, PyObjectId 
@@ -29,6 +31,8 @@ from app.core.audit import record_audit_log
 from math import ceil
 
 router = APIRouter()
+
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
 
 TICKET_STATUSES = {
     "Open",
@@ -892,6 +896,69 @@ def build_shopify_order_actions(order: dict) -> list[dict]:
     return actions
 
 
+async def hydrate_shopify_refunds(db: AsyncIOMotorDatabase, order: dict) -> dict:
+    if order.get("refunds") or str(order.get("payment_status", "")).lower() != "refunded":
+        return order
+
+    shop = order.get("shop")
+    order_id = order.get("order_id")
+    if not shop or not order_id:
+        return order
+
+    cred = await db["shopify_cred"].find_one({
+        "shop": shop,
+        "company_id": order.get("company_id"),
+    })
+    access_token = (cred or {}).get("access_token")
+    if not access_token:
+        return order
+
+    url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders/{int(order_id)}/refunds.json"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                },
+            )
+    except Exception:
+        return order
+
+    if response.status_code >= 400:
+        return order
+
+    refunds = response.json().get("refunds", [])
+    if refunds:
+        order["refunds"] = refunds
+        await db["orders"].update_one(
+            {"_id": order["_id"]},
+            {"$set": {"refunds": refunds}},
+        )
+    return order
+
+
+def build_inferred_refund_action(order: dict) -> list[dict]:
+    if str(order.get("payment_status", "")).lower() != "refunded":
+        return []
+    if order.get("refunds"):
+        return []
+    return [{
+        "type": "refund",
+        "amount": action_amount(order.get("total_price")),
+        "actor_name": "Shopify",
+        "actor_role": "system",
+        "note": "Refunded in Shopify; detailed refund record was not available from Shopify.",
+        "details": {
+            "source": "shopify",
+            "inferred": True,
+            "order_id": str(order.get("order_id", "")),
+        },
+        "created_at": order.get("updated_at") or order.get("created_at") or "",
+    }]
+
+
 def dedupe_order_actions(actions: list[dict]) -> list[dict]:
     deduped = []
     for action in sorted(actions, key=lambda item: item.get("created_at", ""), reverse=True):
@@ -918,11 +985,15 @@ def dedupe_order_actions(actions: list[dict]) -> list[dict]:
 
 
 async def get_order_actions(db: AsyncIOMotorDatabase, order: dict) -> list[dict]:
+    order = await hydrate_shopify_refunds(db, order)
     stored_actions = [
         serialize_order_action(action)
         for action in order.get("order_actions", [])
     ]
-    shopify_actions = build_shopify_order_actions(order)
+    shopify_actions = [
+        *build_shopify_order_actions(order),
+        *build_inferred_refund_action(order),
+    ]
 
     audit_actions = []
     order_id_values = [str(order.get("order_id", "")), order.get("order_id")]
