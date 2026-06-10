@@ -81,7 +81,103 @@ def serialize_order_actions(order: dict) -> list[dict]:
         if serialized.get("actor_id"):
             serialized["actor_id"] = str(serialized["actor_id"])
         actions.append(serialized)
+
+    for refund in order.get("refunds", []) or []:
+        transactions = refund.get("transactions") or []
+        amount = round(sum(to_float_amount(transaction.get("amount")) for transaction in transactions), 2)
+        if not amount:
+            amount = to_float_amount(refund.get("total_refunded"))
+        if not amount:
+            amount = round(
+                sum(
+                    to_float_amount(item.get("subtotal")) + to_float_amount(item.get("total_tax"))
+                    for item in refund.get("refund_line_items", []) or []
+                ),
+                2,
+            )
+        actions.append({
+            "type": "refund",
+            "amount": amount,
+            "actor_name": "Shopify",
+            "actor_role": "system",
+            "note": refund.get("note") or "Refund recorded in Shopify",
+            "details": {
+                "source": "shopify",
+                "shopify_refund_id": refund.get("id"),
+                "order_id": str(order.get("order_id", "")),
+                "transactions": transactions,
+            },
+            "created_at": refund.get("created_at") or refund.get("processed_at") or order.get("updated_at") or "",
+        })
+
+    if order.get("cancelled_at"):
+        actions.append({
+            "type": "cancellation",
+            "amount": to_float_amount(order.get("total_price")),
+            "actor_name": "Shopify",
+            "actor_role": "system",
+            "note": order.get("cancel_reason") or "Cancellation recorded in Shopify",
+            "details": {
+                "source": "shopify",
+                "order_id": str(order.get("order_id", "")),
+                "cancel_reason": order.get("cancel_reason", ""),
+            },
+            "created_at": order.get("cancelled_at"),
+        })
+
+    if order_is_refunded(order) and not order.get("refunds") and not any(action.get("type") == "refund" for action in actions):
+        actions.append({
+            "type": "refund",
+            "amount": to_float_amount(order.get("total_price")),
+            "actor_name": "Shopify",
+            "actor_role": "system",
+            "note": "Refunded in Shopify; detailed refund record was not available from Shopify.",
+            "details": {
+                "source": "shopify",
+                "inferred": True,
+                "order_id": str(order.get("order_id", "")),
+            },
+            "created_at": order.get("updated_at") or order.get("created_at") or "",
+        })
     return sorted(actions, key=lambda item: item.get("created_at", ""), reverse=True)
+
+
+async def hydrate_shopify_refunds_for_order(db, order: dict) -> dict:
+    if order.get("refunds") or not order_is_refunded(order):
+        return order
+
+    shop = order.get("shop")
+    order_id = order.get("order_id")
+    company_id = order.get("company_id")
+    if not shop or not order_id or not company_id:
+        return order
+
+    cred = await db["shopify_cred"].find_one({"shop": shop, "company_id": company_id})
+    access_token = (cred or {}).get("access_token")
+    if not access_token:
+        return order
+
+    url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders/{int(order_id)}/refunds.json"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                url,
+                headers={
+                    "X-Shopify-Access-Token": access_token,
+                    "Content-Type": "application/json",
+                },
+            )
+    except Exception:
+        return order
+
+    if response.status_code >= 400:
+        return order
+
+    refunds = response.json().get("refunds", [])
+    if refunds:
+        order["refunds"] = refunds
+        await db["orders"].update_one({"_id": order["_id"]}, {"$set": {"refunds": refunds}})
+    return order
 
 
 def stringify_shopify_error(value) -> str:
@@ -985,6 +1081,7 @@ async def get_orders(
     )
     orders = []
     async for doc in cursor:
+        doc = await hydrate_shopify_refunds_for_order(db, doc)
         doc["order_actions"] = serialize_order_actions(doc)
         doc['_id'] = str(doc['_id'])
         doc['user_id'] = str(doc['user_id'])
