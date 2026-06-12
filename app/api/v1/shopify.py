@@ -1128,6 +1128,7 @@ async def get_orders(
     sort_order: str = Query("desc", description="asc or desc"),
     company_id: str = Query("", description="Company ID"),
     email: str = Query("", description="Email"),
+    include_actions: bool = Query(False, description="Include detailed order action history"),
     current_user: dict = Depends(get_current_user),
 ):
     db = request.app.state.db
@@ -1186,16 +1187,31 @@ async def get_orders(
     sort_direction = 1 if sort_order == "asc" else -1
 
     # Fetch paginated orders sorted by the requested table column
+    projection = None
+    if not include_actions:
+        projection = {
+            "line_items": 0,
+            "refunds": 0,
+            "fulfillments": 0,
+            "order_actions": 0,
+        }
+
     cursor = (
-        db.orders.find(filter_query)
+        db.orders.find(filter_query, projection)
         .sort([(sort_field, sort_direction), ("_id", sort_direction)])
         .skip((page - 1) * size)
         .limit(size)
     )
     orders = []
     async for doc in cursor:
-        doc = await hydrate_shopify_refunds_for_order(db, doc)
-        doc["order_actions"] = serialize_order_actions(doc)
+        if include_actions:
+            doc = await hydrate_shopify_refunds_for_order(db, doc)
+            doc["order_actions"] = serialize_order_actions(doc)
+        else:
+            doc.pop("order_actions", None)
+            doc.pop("refunds", None)
+            doc.pop("fulfillments", None)
+            doc.pop("line_items", None)
         doc['_id'] = str(doc['_id'])
         doc['user_id'] = str(doc['user_id'])
         doc['company_id'] = str(doc['company_id'])

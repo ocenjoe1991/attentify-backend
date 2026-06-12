@@ -108,6 +108,19 @@ async def set_gmail_watches_periodically():
             
         await asyncio.sleep(24 * 3600)
 
+async def ensure_database_indexes(db):
+    await db["orders"].create_index([("company_id", 1), ("created_at", -1)])
+    await db["orders"].create_index([("company_id", 1), ("shop", 1), ("created_at", -1)])
+    await db["orders"].create_index([("company_id", 1), ("name", 1)])
+    await db["orders"].create_index([("company_id", 1), ("order_id", 1)])
+    await db["orders"].create_index([("company_id", 1), ("customer.email", 1)])
+
+    await db["messages"].create_index([("company_id", 1), ("last_updated", -1)])
+    await db["messages"].create_index([("company_id", 1), ("started_at", -1)])
+    await db["messages"].create_index([("company_id", 1), ("status", 1), ("last_updated", -1)])
+    await db["messages"].create_index([("company_id", 1), ("order_match_status", 1), ("last_updated", -1)])
+    await db["messages"].create_index([("thread_id", 1), ("channel", 1)])
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -121,6 +134,7 @@ async def lifespan(app: FastAPI):
         print("Connected to MongoDB")
         app.state.mongo_client = mongo_client
         app.state.db = mongo_client[DB_NAME]
+        await ensure_database_indexes(app.state.db)
     except Exception as e:
         print("Failed to connect to MongoDB:", e)
         raise e  # Optional: prevent app from starting if DB fails
