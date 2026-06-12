@@ -842,6 +842,30 @@ def refund_amount(refund: dict) -> float:
     )
 
 
+def refund_shipping_amount(refund: dict) -> float:
+    shipping = refund.get("shipping") or {}
+    for value in (
+        shipping.get("amount"),
+        (shipping.get("shop_money") or {}).get("amount"),
+        (shipping.get("presentment_money") or {}).get("amount"),
+    ):
+        amount = action_amount(value)
+        if amount:
+            return amount
+
+    for adjustment in refund.get("order_adjustments", []) or []:
+        kind = str(adjustment.get("kind", "")).lower()
+        reason = str(adjustment.get("reason", "")).lower()
+        if "shipping" not in kind and "shipping" not in reason:
+            continue
+        amount = action_amount(adjustment.get("amount"))
+        if not amount:
+            amount = action_amount((adjustment.get("amount_set") or {}).get("shop_money", {}).get("amount"))
+        if amount:
+            return abs(amount)
+    return 0.0
+
+
 def find_order_line_item(order: dict, line_item_id) -> dict:
     line_item_id = str(line_item_id or "")
     for item in order.get("line_items", []) or []:
@@ -874,6 +898,16 @@ def build_refund_line_items(order: dict, refund: dict) -> list[dict]:
             variant_id=nested_item.get("variant_id") or order_item.get("variant_id"),
         ))
     return items
+
+
+def build_refund_shipping_line(refund: dict) -> dict | None:
+    amount = refund_shipping_amount(refund)
+    if not amount:
+        return None
+    return {
+        "name": "Shipping refund",
+        "amount": amount,
+    }
 
 
 def build_selected_line_items(order: dict, selected_items: list[dict]) -> list[dict]:
@@ -936,6 +970,7 @@ def build_shopify_order_actions(order: dict) -> list[dict]:
                 "order_id": str(order.get("order_id", "")),
                 "transactions": refund.get("transactions", []),
                 "line_items": build_refund_line_items(order, refund),
+                "shipping_refund": build_refund_shipping_line(refund),
             },
             "created_at": refund.get("created_at") or refund.get("processed_at") or order.get("updated_at") or "",
         })

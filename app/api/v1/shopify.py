@@ -107,6 +107,7 @@ def serialize_order_actions(order: dict) -> list[dict]:
                 "order_id": str(order.get("order_id", "")),
                 "transactions": transactions,
                 "line_items": build_refund_line_items(order, refund),
+                "shipping_refund": build_refund_shipping_line(refund),
             },
             "created_at": refund.get("created_at") or refund.get("processed_at") or order.get("updated_at") or "",
         })
@@ -208,6 +209,30 @@ def find_order_line_item(order: dict, line_item_id) -> dict:
     return {}
 
 
+def refund_shipping_amount(refund: dict) -> float:
+    shipping = refund.get("shipping") or {}
+    for value in (
+        shipping.get("amount"),
+        (shipping.get("shop_money") or {}).get("amount"),
+        (shipping.get("presentment_money") or {}).get("amount"),
+    ):
+        amount = to_float_amount(value)
+        if amount:
+            return amount
+
+    for adjustment in refund.get("order_adjustments", []) or []:
+        kind = str(adjustment.get("kind", "")).lower()
+        reason = str(adjustment.get("reason", "")).lower()
+        if "shipping" not in kind and "shipping" not in reason:
+            continue
+        amount = to_float_amount(adjustment.get("amount"))
+        if not amount:
+            amount = to_float_amount((adjustment.get("amount_set") or {}).get("shop_money", {}).get("amount"))
+        if amount:
+            return abs(amount)
+    return 0.0
+
+
 def format_action_line_item(*, name="", quantity=1, amount=None, line_item_id="", variant_id="") -> dict:
     return {
         "name": name or "Unknown item",
@@ -232,6 +257,16 @@ def build_refund_line_items(order: dict, refund: dict) -> list[dict]:
             variant_id=nested_item.get("variant_id") or order_item.get("variant_id"),
         ))
     return items
+
+
+def build_refund_shipping_line(refund: dict) -> dict | None:
+    amount = refund_shipping_amount(refund)
+    if not amount:
+        return None
+    return {
+        "name": "Shipping refund",
+        "amount": amount,
+    }
 
 
 def build_selected_line_items(order: dict, selected_items: list[dict]) -> list[dict]:
