@@ -539,6 +539,8 @@ async def get_company_dashboard(
         review_messages.append(serialize_dashboard_message(message))
 
     approvals = []
+    my_approvals = []
+    team_approvals = []
     approval_cursor = (
         db["approval_requests"]
         .find({"company_id": company_object_id, "status": "pending"})
@@ -546,7 +548,23 @@ async def get_company_dashboard(
         .limit(5)
     )
     async for request_doc in approval_cursor:
-        approvals.append(serialize_dashboard_approval(request_doc))
+        team_approvals.append(serialize_dashboard_approval(request_doc))
+
+    can_process_approvals = (
+        current_user.get("role") == ROLE_ADMIN
+        or (membership and membership.get("role") == ROLE_COMPANY_OWNER)
+    )
+    if can_process_approvals:
+        my_approvals = team_approvals
+    else:
+        my_approval_cursor = (
+            db["approval_requests"]
+            .find({"company_id": company_object_id, "status": "pending", "requested_by": current_user["_id"]})
+            .sort("created_at", ASCENDING)
+            .limit(5)
+        )
+        async for request_doc in my_approval_cursor:
+            my_approvals.append(serialize_dashboard_approval(request_doc))
 
     recent_activity = []
     audit_cursor = (
@@ -574,7 +592,8 @@ async def get_company_dashboard(
         },
         "recent_messages": recent_messages,
         "review_messages": review_messages,
-        "pending_approvals": approvals,
+        "my_pending_approvals": my_approvals,
+        "team_pending_approvals": team_approvals,
         "recent_activity": recent_activity,
         "current_user_role": (membership or {}).get("role", current_user.get("role", "")),
     }
