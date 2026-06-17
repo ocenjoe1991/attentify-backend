@@ -512,9 +512,16 @@ async def get_company_dashboard(
     })
 
     recent_messages = []
+    # Use same inbox filtering as message list: exclude trashed/archived and only active statuses
+    inbox_query = {
+        **base_message_query,
+        "trashed": {"$ne": True},
+        "archived": {"$ne": True},
+        "status": {"$in": open_statuses},
+    }
     message_cursor = (
         db["messages"]
-        .find(base_message_query)
+        .find(inbox_query)
         .sort("created_at", DESCENDING)
         .limit(5)
     )
@@ -525,7 +532,7 @@ async def get_company_dashboard(
     review_cursor = (
         db["messages"]
         .find({**base_message_query, **needs_review_filter})
-        .sort("last_updated", DESCENDING)
+        .sort("created_at", DESCENDING)
         .limit(5)
     )
     async for message in review_cursor:

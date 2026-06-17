@@ -194,7 +194,7 @@ async def get_company_messages(
     assigned_filter: str = Query("all", description="all, assigned, or unassigned"),
     status_filter: str = Query("all", description="Message status or all"),
     order_filter: str = Query("all", description="all, order, other, or needs_review"),
-    sort_by: str = Query("last_updated", description="started_at or last_updated"),
+    sort_by: str = Query("created_at", description="started_at, created_at or last_updated"),
     sort_order: str = Query("desc", description="asc or desc"),
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict = Depends(get_current_user)
@@ -282,7 +282,8 @@ async def get_company_messages(
             raise HTTPException(status_code=400, detail="Invalid status for archive")
         query["status"] = status_filter
 
-    sort_field = "started_at" if sort_by == "started_at" else "last_updated"
+    # Support 'created_at' as alias for 'started_at' (messages use started_at as creation date)
+    sort_field = "started_at" if sort_by in ("started_at", "created_at") else "last_updated"
     sort_direction = ASCENDING if sort_order == "asc" else DESCENDING
 
     # Count total documents for pagination
