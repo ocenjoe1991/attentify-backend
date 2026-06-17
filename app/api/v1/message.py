@@ -1,6 +1,6 @@
 # app/routes/message.py
 
-from fastapi import APIRouter, HTTPException, Depends, Body, Query
+from fastapi import APIRouter, HTTPException, Depends, Body, Query, Request
 import os
 import httpx
 from app.services.gmail_service import fetch_all_gmail_accounts, get_gmail_service
@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from email.utils import parseaddr
 from pymongo import ASCENDING, DESCENDING
 from app.core.security import get_current_user
+from app.utils.logger import logger
 from app.core.permissions import (
     OWNER_ROLES,
     PERMISSION_RESOLVE_WITHOUT_OWNER_APPROVAL,
@@ -682,6 +683,7 @@ async def delete_comment(
 async def update_message_field(
     message_id: str,
     body: dict = Body(...), 
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict = Depends(get_current_user),
 ):
@@ -734,6 +736,24 @@ async def update_message_field(
         ):
             value = "Awaiting Approval"
 
+    # Capture request metadata for audit tracing
+    client_ip = None
+    try:
+        # Prefer X-Forwarded-For (common behind proxies/load-balancers)
+        if request:
+            xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For")
+            xri = request.headers.get("x-real-ip") or request.headers.get("X-Real-Ip")
+            if xff:
+                # X-Forwarded-For may contain a comma-separated list; take the first
+                client_ip = xff.split(",")[0].strip()
+            elif xri:
+                client_ip = xri.strip()
+            else:
+                client_ip = request.client.host if request.client else None
+    except Exception:
+        client_ip = None
+    user_agent = request.headers.get("user-agent", "") if request else ""
+
     # Perform update
     set_payload = {field: value, "last_updated": datetime.utcnow()}
     if field == "assigned_member_id" and value and normalize_status(message.get("status", "Open")) == "Open":
@@ -745,7 +765,7 @@ async def update_message_field(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Message not found")
     if field == "trashed" and value is True and not message.get("trashed"):
-        await record_ticket_audit_log(db, message, current_user, membership, "Deleted ticket")
+        await record_ticket_audit_log(db, message, current_user, membership, "Deleted ticket", details={"ip": client_ip, "user_agent": user_agent})
     elif field == "status" and normalize_status(message.get("status", "Open")) != value:
         await record_ticket_audit_log(
             db,
@@ -767,16 +787,24 @@ async def update_message_field(
                 "old_assigned_member_id": str(message.get("assigned_member_id") or ""),
                 "new_assigned_member_id": str(value or ""),
                 "target_email": assigned_user.get("email", "") if assigned_user else "",
+                "ip": client_ip,
+                "user_agent": user_agent,
             },
         )
     elif field == "archived" and bool(message.get("archived")) != bool(value):
+        # Include request metadata so we can trace unexpected archive actions
         await record_ticket_audit_log(
             db,
             message,
             current_user,
             membership,
             "Archived ticket" if value else "Unarchived ticket",
+            {"old_archived": bool(message.get("archived")), "new_archived": bool(value), "ip": client_ip, "user_agent": user_agent},
         )
+        try:
+            logger.info("Archive change", extra={"actor_email": current_user.get("email", ""), "message_id": str(message.get("_id")), "old": bool(message.get("archived")), "new": bool(value), "ip": client_ip})
+        except Exception:
+            pass
     return {"message": f"{field} updated"}
 
 def clean_json_response(response: str):
