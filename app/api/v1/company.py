@@ -57,6 +57,7 @@ def serialize_dashboard_message(message):
         "ticket": message.get("ticket", ""),
         "order_match_status": message.get("order_match_status", "unknown"),
         "matched_order_name": message.get("matched_order_name", ""),
+        "created_at": message.get("created_at").isoformat() if hasattr(message.get("created_at"), "isoformat") else message.get("created_at", ""),
         "last_updated": message.get("last_updated").isoformat() if hasattr(message.get("last_updated"), "isoformat") else message.get("last_updated", ""),
     }
 
@@ -514,7 +515,7 @@ async def get_company_dashboard(
     message_cursor = (
         db["messages"]
         .find(base_message_query)
-        .sort("last_updated", DESCENDING)
+        .sort("created_at", DESCENDING)
         .limit(5)
     )
     async for message in message_cursor:
