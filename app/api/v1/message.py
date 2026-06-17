@@ -682,8 +682,8 @@ async def delete_comment(
 @router.patch("/{message_id}")
 async def update_message_field(
     message_id: str,
-    body: dict = Body(...), 
     request: Request,
+    body: dict = Body(...),
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict = Depends(get_current_user),
 ):
