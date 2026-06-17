@@ -551,7 +551,7 @@ async def get_company_dashboard(
     recent_activity = []
     audit_cursor = (
         db["audit_logs"]
-        .find({"company_id": company_object_id})
+        .find({"company_id": company_object_id, "actor_id": current_user["_id"]})
         .sort("created_at", DESCENDING)
         .limit(6)
     )
