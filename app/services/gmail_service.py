@@ -26,7 +26,13 @@ def _message_timestamp_bounds(messages):
     return min(timestamps), max(timestamps)
 
 
-async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str):
+async def fetch_and_save_gmail(
+    account: dict,
+    db,
+    user_id: str,
+    company_id: str,
+    update_existing: bool = False,
+):
     creds = Credentials(
         token=account["access_token"],
         refresh_token=account["refresh_token"],
@@ -204,6 +210,8 @@ async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str)
                     None,
                 )
                 if duplicate_index is not None:
+                    if not update_existing:
+                        continue
                     existing_messages[duplicate_index] = chat_entry.dict()
                     started_at, last_updated = _message_timestamp_bounds(existing_messages)
                     await db["messages"].update_one(

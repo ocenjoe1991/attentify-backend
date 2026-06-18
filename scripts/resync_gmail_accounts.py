@@ -74,6 +74,7 @@ async def main(env_file: str | None, reset_only: bool) -> None:
                 db,
                 user_id=str(user_id),
                 company_id=str(company_id),
+                update_existing=True,
             )
             print(
                 f"- {result.get('email')}: {result.get('status')} "
