@@ -1,5 +1,6 @@
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -29,7 +30,7 @@ async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str)
                 if isinstance(expires_at, str) else expires_at
             )
             if expires_at_dt.tzinfo:
-                expires_at_dt = expires_at_dt.astimezone(tz=None).replace(tzinfo=None)
+                expires_at_dt = expires_at_dt.astimezone(timezone.utc).replace(tzinfo=None)
             token_expired = datetime.utcnow() >= expires_at_dt
         except Exception as e:
             logging.warning(f"Could not parse expires_at: {expires_at} ({e})")
@@ -105,9 +106,15 @@ async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str)
             date = next((h["value"] for h in headers if h["name"] == "Date"), "")
 
             try:
-                timestamp = datetime.strptime(date[:25], "%a, %d %b %Y %H:%M:%S")
+                timestamp = parsedate_to_datetime(date)
+                if timestamp is None:
+                    raise ValueError("Unable to parse date header")
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                else:
+                    timestamp = timestamp.astimezone(timezone.utc)
             except Exception:
-                timestamp = datetime.utcnow()
+                timestamp = datetime.now(timezone.utc)
 
             # Extract plain text and HTML body
             text_body, html_body = "", ""

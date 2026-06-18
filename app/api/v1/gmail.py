@@ -3,7 +3,7 @@ from fastapi.responses import RedirectResponse
 from typing import List, Optional, Dict, Any
 import httpx
 from urllib.parse import urlencode
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.core.security import get_current_user
 from app.core.audit import record_audit_log
 from bson import ObjectId
@@ -694,8 +694,14 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
 
             try:
                 timestamp = parsedate_to_datetime(date)
+                if timestamp is None:
+                    raise ValueError("Unable to parse date header")
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                else:
+                    timestamp = timestamp.astimezone(timezone.utc)
             except Exception:
-                timestamp = datetime.utcnow()
+                timestamp = datetime.now(timezone.utc)
 
             text_body, html_body = "", ""
 

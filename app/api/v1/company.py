@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
-from datetime import datetime
+from datetime import datetime, timezone
 from app.models.company import CompanyCreate, SimpleCompanyOut, CompanyInDB, UpdateCompanyRequest
 from app.models.user import UserPublic
 from bson import ObjectId
@@ -19,6 +19,29 @@ from pymongo import ASCENDING, DESCENDING
 router = APIRouter()
 
 VALID_MESSAGE_DELETE_ROLES = {"company_owner", "store_owner", "agent", "readonly"}
+
+def to_utc_iso(value):
+    if not value:
+        return ""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            return value
+    try:
+        return value.isoformat()
+    except Exception:
+        return str(value)
+
 
 def transform_company(company):
     return {
@@ -57,8 +80,8 @@ def serialize_dashboard_message(message):
         "ticket": message.get("ticket", ""),
         "order_match_status": message.get("order_match_status", "unknown"),
         "matched_order_name": message.get("matched_order_name", ""),
-        "created_at": message.get("started_at").isoformat() if hasattr(message.get("started_at"), "isoformat") else (message.get("created_at") or message.get("started_at") or ""),
-        "last_updated": message.get("last_updated").isoformat() if hasattr(message.get("last_updated"), "isoformat") else message.get("last_updated", ""),
+        "created_at": to_utc_iso(message.get("started_at") or message.get("created_at")),
+        "last_updated": to_utc_iso(message.get("last_updated")),
     }
 
 def serialize_dashboard_approval(request_doc):
@@ -68,7 +91,7 @@ def serialize_dashboard_approval(request_doc):
         "status": request_doc.get("status", ""),
         "requester_name": request_doc.get("requester_name", ""),
         "requester_email": request_doc.get("requester_email", ""),
-        "created_at": request_doc.get("created_at").isoformat() if hasattr(request_doc.get("created_at"), "isoformat") else request_doc.get("created_at", ""),
+        "created_at": to_utc_iso(request_doc.get("created_at")),
         "payload": request_doc.get("payload", {}),
     }
 

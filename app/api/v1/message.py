@@ -68,6 +68,40 @@ ARCHIVED_STATUSES = {
     "Canceled",
 }
 
+def to_utc_iso(value):
+    if not value:
+        return ""
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat().replace("+00:00", "Z")
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except Exception:
+            return value
+    return value
+
+
+def normalize_doc_dates(doc: dict) -> dict:
+    if "started_at" in doc:
+        doc["started_at"] = to_utc_iso(doc.get("started_at"))
+    if "last_updated" in doc:
+        doc["last_updated"] = to_utc_iso(doc.get("last_updated"))
+    if "created_at" in doc:
+        doc["created_at"] = to_utc_iso(doc.get("created_at"))
+    if "messages" in doc and isinstance(doc["messages"], list):
+        for item in doc["messages"]:
+            if isinstance(item, dict) and "timestamp" in item:
+                item["timestamp"] = to_utc_iso(item.get("timestamp"))
+    return doc
+
+
 def normalize_status(status: str) -> str:
     return LEGACY_STATUS_MAP.get(status, status)
 
@@ -161,6 +195,8 @@ async def get_messages(db=Depends(get_database), current_user: dict = Depends(ge
         raw_client = doc.get("client", "")
         cleaned_client = extract_name(raw_client)
         doc["client"] = cleaned_client
+
+        normalize_doc_dates(doc)
 
         # Assigned member
         member = None
@@ -347,6 +383,7 @@ async def get_company_messages(
         doc.pop("messages", None)
         doc.pop("comments", None)
 
+        normalize_doc_dates(doc)
         messages.append(doc)
 
     return {
@@ -369,6 +406,7 @@ async def get_message(
     if "assigned_member_id" in doc and doc["assigned_member_id"]:
         doc["assigned_member_id"] = str(doc["assigned_member_id"])
     doc["status"] = normalize_status(doc.get("status", "Open"))
+    normalize_doc_dates(doc)
 
     # Properly await comment serialization
     comments = []
