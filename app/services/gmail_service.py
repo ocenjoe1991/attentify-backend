@@ -9,6 +9,23 @@ from bson import ObjectId
 import logging
 import requests
 
+def _message_timestamp_bounds(messages):
+    timestamps = []
+    for item in messages:
+        if not isinstance(item, dict) or not item.get("timestamp"):
+            continue
+        timestamp = item["timestamp"]
+        if isinstance(timestamp, datetime):
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            else:
+                timestamp = timestamp.astimezone(timezone.utc)
+        timestamps.append(timestamp)
+    if not timestamps:
+        return None, None
+    return min(timestamps), max(timestamps)
+
+
 async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str):
     creds = Credentials(
         token=account["access_token"],
@@ -83,13 +100,22 @@ async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str)
 
     try:
         service = build("gmail", "v1", credentials=creds)
-        result = service.users().messages().list(
-            userId="me",
-            maxResults=10
-        ).execute()
+        messages = []
+        page_token = None
+        while True:
+            request = service.users().messages().list(
+                userId="me",
+                maxResults=100,
+                pageToken=page_token,
+            )
+            result = request.execute()
+            messages.extend(result.get("messages", []))
+            page_token = result.get("nextPageToken")
+            if not page_token:
+                break
 
-        messages = result.get("messages", [])
         stored_count = 0
+        updated_count = 0
 
         for msg in messages:
             gmail_id = msg["id"]
@@ -168,14 +194,40 @@ async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str)
 
             # Avoid duplicate insert of the same gmail_id in a thread
             if existing_thread:
-                if any(m.get("metadata", {}).get("gmail_id") == gmail_id for m in existing_thread.get("messages", [])):
+                existing_messages = existing_thread.get("messages", [])
+                duplicate_index = next(
+                    (
+                        index
+                        for index, item in enumerate(existing_messages)
+                        if item.get("metadata", {}).get("gmail_id") == gmail_id
+                    ),
+                    None,
+                )
+                if duplicate_index is not None:
+                    existing_messages[duplicate_index] = chat_entry.dict()
+                    started_at, last_updated = _message_timestamp_bounds(existing_messages)
+                    await db["messages"].update_one(
+                        {"_id": existing_thread["_id"]},
+                        {
+                            "$set": {
+                                f"messages.{duplicate_index}": chat_entry.dict(),
+                                "started_at": started_at or existing_thread.get("started_at", timestamp),
+                                "last_updated": last_updated or timestamp,
+                                "title": subject or existing_thread.get("title", ""),
+                            }
+                        },
+                    )
+                    updated_count += 1
                     continue
+                next_messages = existing_messages + [chat_entry.dict()]
+                started_at, last_updated = _message_timestamp_bounds(next_messages)
                 await db["messages"].update_one(
                     {"_id": existing_thread["_id"]},
                     {
                         "$push": {"messages": chat_entry.dict()},
                         "$set": {
-                            "last_updated": timestamp,
+                            "started_at": started_at or existing_thread.get("started_at", timestamp),
+                            "last_updated": last_updated or timestamp,
                             "title": subject,
                             "participants": list(set(existing_thread.get("participants", []) + [sender, to]))
                         }
@@ -202,11 +254,24 @@ async def fetch_and_save_gmail(account: dict, db, user_id: str, company_id: str)
                 await db["messages"].insert_one(message_doc)
             stored_count += 1
 
+        try:
+            profile = service.users().getProfile(userId="me").execute()
+            history_id = profile.get("historyId")
+            if history_id:
+                await db["gmail_accounts"].update_one(
+                    {"_id": account["account_id"]},
+                    {"$set": {"history_id": history_id, "status": "connected"}},
+                )
+        except Exception as e:
+            logging.warning(f"Could not update Gmail history_id after sync for {account['email']}: {e}")
+
         return {
             "email": account["email"],
             "status": "ok",
             "stored_count": stored_count,
-            "message": f"Fetched and stored {stored_count} new messages (grouped by thread) for {account['email']}",
+            "updated_count": updated_count,
+            "fetched_count": len(messages),
+            "message": f"Fetched {len(messages)} messages, stored {stored_count} new messages, and updated {updated_count} existing messages for {account['email']}",
         }
 
     except Exception as e:
@@ -233,7 +298,8 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
                 "expires_at": cred.get("expires_at")
             }
 
-            result = await fetch_and_save_gmail(token_data, db, user_id, company_id)  # now only 2 args
+            account_company_id = str(cred.get("company_id") or company_id)
+            result = await fetch_and_save_gmail(token_data, db, user_id, account_company_id)
             results.append(result)
         except Exception as e:
             results.append({
