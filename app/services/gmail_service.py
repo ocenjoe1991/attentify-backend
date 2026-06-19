@@ -4,7 +4,9 @@ from email.utils import parsedate_to_datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from app.models.message import Message, ChatEntry 
+from app.services.deleted_gmail_service import is_deleted_gmail_message
 from bson import ObjectId
 import logging
 import requests
@@ -32,6 +34,7 @@ async def fetch_and_save_gmail(
     user_id: str,
     company_id: str,
     update_existing: bool = False,
+    force_full_sync: bool = False,
 ):
     creds = Credentials(
         token=account["access_token"],
@@ -107,24 +110,97 @@ async def fetch_and_save_gmail(
     try:
         service = build("gmail", "v1", credentials=creds)
         messages = []
-        page_token = None
-        while True:
-            request = service.users().messages().list(
-                userId="me",
-                maxResults=100,
-                pageToken=page_token,
-            )
-            result = request.execute()
-            messages.extend(result.get("messages", []))
-            page_token = result.get("nextPageToken")
-            if not page_token:
-                break
+        latest_history_id = None
+        sync_mode = "full" if force_full_sync else "history"
+
+        if force_full_sync:
+            page_token = None
+            while True:
+                request = service.users().messages().list(
+                    userId="me",
+                    maxResults=100,
+                    pageToken=page_token,
+                )
+                result = request.execute()
+                messages.extend(result.get("messages", []))
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+        else:
+            last_history_id = account.get("history_id")
+            if not last_history_id:
+                profile = service.users().getProfile(userId="me").execute()
+                latest_history_id = profile.get("historyId")
+                if latest_history_id:
+                    await db["gmail_accounts"].update_one(
+                        {"_id": account["account_id"]},
+                        {"$set": {"history_id": latest_history_id, "status": "connected"}},
+                    )
+                return {
+                    "email": account["email"],
+                    "status": "ok",
+                    "stored_count": 0,
+                    "updated_count": 0,
+                    "fetched_count": 0,
+                    "sync_mode": "baseline",
+                    "message": f"Initialized Gmail sync baseline for {account['email']}. Future syncs will fetch new messages only.",
+                }
+
+            page_token = None
+            seen_gmail_ids = set()
+            try:
+                while True:
+                    result = service.users().history().list(
+                        userId="me",
+                        startHistoryId=str(last_history_id),
+                        historyTypes=["messageAdded"],
+                        pageToken=page_token,
+                    ).execute()
+                    latest_history_id = result.get("historyId") or latest_history_id
+                    for record in result.get("history", []):
+                        for added in record.get("messagesAdded", []):
+                            message_ref = added.get("message", {})
+                            gmail_id = message_ref.get("id")
+                            if gmail_id and gmail_id not in seen_gmail_ids:
+                                messages.append(message_ref)
+                                seen_gmail_ids.add(gmail_id)
+                    page_token = result.get("nextPageToken")
+                    if not page_token:
+                        break
+            except HttpError as e:
+                status = getattr(getattr(e, "resp", None), "status", None)
+                if status in (400, 404):
+                    profile = service.users().getProfile(userId="me").execute()
+                    latest_history_id = profile.get("historyId")
+                    if latest_history_id:
+                        await db["gmail_accounts"].update_one(
+                            {"_id": account["account_id"]},
+                            {"$set": {"history_id": latest_history_id, "status": "connected"}},
+                        )
+                    return {
+                        "email": account["email"],
+                        "status": "ok",
+                        "stored_count": 0,
+                        "updated_count": 0,
+                        "fetched_count": 0,
+                        "sync_mode": "baseline_reset",
+                        "message": f"Gmail history baseline was reset for {account['email']}. Future syncs will fetch new messages only.",
+                    }
+                raise
 
         stored_count = 0
         updated_count = 0
 
         for msg in messages:
             gmail_id = msg["id"]
+            if await is_deleted_gmail_message(
+                db,
+                company_id=company_id,
+                user_id=user_id,
+                gmail_id=gmail_id,
+            ):
+                continue
+
             full_msg = service.users().messages().get(
                 userId="me", id=gmail_id, format="full"
             ).execute()
@@ -263,8 +339,10 @@ async def fetch_and_save_gmail(
             stored_count += 1
 
         try:
-            profile = service.users().getProfile(userId="me").execute()
-            history_id = profile.get("historyId")
+            if not latest_history_id:
+                profile = service.users().getProfile(userId="me").execute()
+                latest_history_id = profile.get("historyId")
+            history_id = latest_history_id
             if history_id:
                 await db["gmail_accounts"].update_one(
                     {"_id": account["account_id"]},
@@ -279,6 +357,7 @@ async def fetch_and_save_gmail(
             "stored_count": stored_count,
             "updated_count": updated_count,
             "fetched_count": len(messages),
+            "sync_mode": sync_mode,
             "message": f"Fetched {len(messages)} messages, stored {stored_count} new messages, and updated {updated_count} existing messages for {account['email']}",
         }
 
@@ -303,7 +382,8 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
                 "refresh_token": cred["refresh_token"],
                 "client_id": cred["client_id"],
                 "client_secret": cred["client_secret"],
-                "expires_at": cred.get("expires_at")
+                "expires_at": cred.get("expires_at"),
+                "history_id": cred.get("history_id"),
             }
 
             account_company_id = str(cred.get("company_id") or company_id)

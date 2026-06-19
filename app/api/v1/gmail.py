@@ -20,6 +20,7 @@ import base64
 import urllib.parse
 from app.db.mongodb import get_database
 from app.services.gmail_service import get_gmail_service
+from app.services.deleted_gmail_service import is_deleted_gmail_message
 from google.oauth2 import service_account
 from email.utils import parsedate_to_datetime
 from app.models.gmail import (
@@ -669,6 +670,14 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
 
         for added in record["messagesAdded"]:
             gmail_id = added["message"]["id"]
+            if await is_deleted_gmail_message(
+                db,
+                company_id=company_object_id,
+                user_id=user_object_id,
+                gmail_id=gmail_id,
+            ):
+                logger.debug("Deleted Gmail %s ignored for %s", gmail_id, email_address)
+                continue
 
             try:
                 full_msg = service.users().messages().get(

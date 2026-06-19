@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Depends, Body, Query, Request
 import os
 import httpx
 from app.services.gmail_service import fetch_all_gmail_accounts, get_gmail_service
+from app.services.deleted_gmail_service import record_deleted_gmail_messages
 from app.db.mongodb import get_database
 from app.models.message import Message, ChatEntry, PyObjectId 
 from typing import List
@@ -501,11 +502,20 @@ async def delete_message(
     if not message.get("trashed"):
         raise HTTPException(status_code=400, detail="Only trashed messages can be permanently deleted")
 
+    deleted_gmail_count = await record_deleted_gmail_messages(db, message, current_user)
+
     result = await db["messages"].delete_one({"_id": message["_id"]})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Message not found")
 
-    await record_ticket_audit_log(db, message, current_user, membership, "Permanently deleted ticket")
+    await record_ticket_audit_log(
+        db,
+        message,
+        current_user,
+        membership,
+        "Permanently deleted ticket",
+        {"deleted_gmail_count": deleted_gmail_count},
+    )
 
     return {"message": "Message permanently deleted"}
 
