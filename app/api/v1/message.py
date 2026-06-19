@@ -29,6 +29,7 @@ from app.core.permissions import (
     has_owner_approval_bypass,
 )
 from app.core.audit import record_audit_log
+from app.utils.datetime_utils import to_utc_iso
 
 from math import ceil
 
@@ -68,26 +69,6 @@ ARCHIVED_STATUSES = {
     "Resolved",
     "Canceled",
 }
-
-def to_utc_iso(value):
-    if not value:
-        return ""
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        else:
-            value = value.astimezone(timezone.utc)
-        return value.isoformat().replace("+00:00", "Z")
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        except Exception:
-            return value
-    return value
-
 
 def normalize_doc_dates(doc: dict) -> dict:
     if "started_at" in doc:
@@ -528,8 +509,8 @@ async def serialize_comment(comment: dict, db) -> dict:
         "content": comment["content"],
         "status": comment.get("status"),
         "edited": comment.get("edited"),
-        "created_at": comment["created_at"].strftime("%Y-%m-%d %H:%M:%S") if comment.get("created_at") else None,
-        "updated_at": comment["updated_at"].strftime("%Y-%m-%d %H:%M:%S") if comment.get("updated_at") else None,
+        "created_at": to_utc_iso(comment.get("created_at")),
+        "updated_at": to_utc_iso(comment.get("updated_at")),
     }
 
 @router.post("/add_comment/{message_id}", response_model=dict)
@@ -880,7 +861,7 @@ def clean_json_response(response: str):
 def serialize_order_action(action: dict) -> dict:
     serialized = dict(action)
     if serialized.get("created_at"):
-        serialized["created_at"] = serialized["created_at"].isoformat() if hasattr(serialized["created_at"], "isoformat") else serialized["created_at"]
+        serialized["created_at"] = to_utc_iso(serialized["created_at"])
     if serialized.get("actor_id"):
         serialized["actor_id"] = str(serialized["actor_id"])
     return serialized
@@ -1207,7 +1188,7 @@ async def get_order_actions(db: AsyncIOMotorDatabase, order: dict) -> list[dict]
             "actor_role": log.get("actor_role", "unknown"),
             "note": details.get("note", ""),
             "details": details,
-            "created_at": log.get("created_at").isoformat() if log.get("created_at") else "",
+            "created_at": to_utc_iso(log.get("created_at")),
         })
 
     return dedupe_order_actions([*stored_actions, *shopify_actions, *audit_actions])

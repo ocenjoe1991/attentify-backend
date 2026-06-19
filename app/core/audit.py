@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from bson import ObjectId
@@ -23,7 +23,11 @@ def to_json_safe(value: Any) -> Any:
     if isinstance(value, ObjectId):
         return str(value)
     if isinstance(value, datetime):
-        return value.isoformat()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        else:
+            value = value.astimezone(timezone.utc)
+        return value.isoformat().replace("+00:00", "Z")
     if isinstance(value, list):
         return [to_json_safe(item) for item in value]
     if isinstance(value, dict):
@@ -56,7 +60,7 @@ async def record_audit_log(
         "ticket": ticket,
         "customer": customer,
         "details": to_json_safe(details or {}),
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
     })
 
 

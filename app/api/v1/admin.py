@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.core.security import get_current_user
+from app.utils.datetime_utils import to_utc_iso
 from app.db.mongodb import get_database
 
 router = APIRouter()
@@ -86,6 +87,10 @@ def serialize_doc(doc: dict) -> dict:
     doc["_id"] = str(doc["_id"])
     if "actor_id" in doc and isinstance(doc["actor_id"], ObjectId):
         doc["actor_id"] = str(doc["actor_id"])
+    if "created_at" in doc:
+        doc["created_at"] = to_utc_iso(doc.get("created_at"))
+    if "updated_at" in doc:
+        doc["updated_at"] = to_utc_iso(doc.get("updated_at"))
     return doc
 
 

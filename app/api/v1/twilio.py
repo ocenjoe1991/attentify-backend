@@ -11,6 +11,7 @@ from app.core.security import get_current_user
 from app.core.audit import record_audit_log
 from app.db.mongodb import get_database
 from app.models.message import ChatEntry
+from app.utils.datetime_utils import to_utc_iso
 
 router = APIRouter()
 
@@ -53,8 +54,8 @@ def phone_account_helper(account: dict) -> dict:
         "status": account.get("status", "connected"),
         "provider": account.get("provider", "twilio"),
         "account_sid": mask_secret(account.get("account_sid", "")),
-        "created_at": account.get("created_at"),
-        "updated_at": account.get("updated_at"),
+        "created_at": to_utc_iso(account.get("created_at")),
+        "updated_at": to_utc_iso(account.get("updated_at")),
     }
 
 

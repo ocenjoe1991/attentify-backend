@@ -23,6 +23,7 @@ from app.core.permissions import (
     has_owner_approval_bypass,
 )
 from app.core.audit import record_audit_log
+from app.utils.datetime_utils import to_utc_iso
 import httpx
 
 router = APIRouter()
@@ -77,7 +78,7 @@ def serialize_order_actions(order: dict) -> list[dict]:
     for action in order.get("order_actions", []):
         serialized = dict(action)
         if serialized.get("created_at") and hasattr(serialized["created_at"], "isoformat"):
-            serialized["created_at"] = serialized["created_at"].isoformat()
+            serialized["created_at"] = to_utc_iso(serialized["created_at"])
         if serialized.get("actor_id"):
             serialized["actor_id"] = str(serialized["actor_id"])
         actions.append(enrich_action_details_with_line_items(serialized, order))
@@ -673,6 +674,9 @@ async def create_approval_request(
 def serialize_approval_request(doc: dict) -> dict:
     doc["_id"] = str(doc["_id"])
     doc["company_id"] = str(doc["company_id"])
+    doc["created_at"] = to_utc_iso(doc.get("created_at"))
+    doc["updated_at"] = to_utc_iso(doc.get("updated_at"))
+    doc["processed_at"] = to_utc_iso(doc.get("processed_at"))
     if doc.get("message_id"):
         doc["message_id"] = str(doc["message_id"])
     if doc.get("requested_by"):
@@ -878,6 +882,8 @@ async def list_shopify_cred(request: Request, current_user: dict = Depends(get_c
         doc['_id'] = str(doc['_id'])
         doc['user_id'] = str(doc['user_id'])  # Convert ObjectId to string
         doc['company_id'] = str(doc['company_id'])  # Convert ObjectId to string
+        doc["created_at"] = to_utc_iso(doc.get("created_at"))
+        doc["updated_at"] = to_utc_iso(doc.get("updated_at"))
         docs.append(doc)
     return docs
 
@@ -901,6 +907,8 @@ async def list_company_shopify_cred(
         doc['_id'] = str(doc['_id'])
         doc['user_id'] = str(doc['user_id'])
         doc['company_id'] = str(doc['company_id'])
+        doc["created_at"] = to_utc_iso(doc.get("created_at"))
+        doc["updated_at"] = to_utc_iso(doc.get("updated_at"))
         docs.append(doc)
 
     return docs

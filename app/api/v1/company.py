@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
-from datetime import datetime, timezone
+from datetime import datetime
 from app.models.company import CompanyCreate, SimpleCompanyOut, CompanyInDB, UpdateCompanyRequest
 from app.models.user import UserPublic
 from bson import ObjectId
@@ -14,34 +14,12 @@ from app.core.permissions import (
     normalize_custom_permissions,
 )
 from app.core.audit import record_audit_log, serialize_audit_log
+from app.utils.datetime_utils import to_utc_iso
 from pymongo import ASCENDING, DESCENDING
 
 router = APIRouter()
 
 VALID_MESSAGE_DELETE_ROLES = {"company_owner", "store_owner", "agent", "readonly"}
-
-def to_utc_iso(value):
-    if not value:
-        return ""
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        else:
-            value = value.astimezone(timezone.utc)
-        return value.isoformat().replace("+00:00", "Z")
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        except Exception:
-            return value
-    try:
-        return value.isoformat()
-    except Exception:
-        return str(value)
-
 
 def transform_company(company):
     return {

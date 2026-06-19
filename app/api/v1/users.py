@@ -9,6 +9,7 @@ from bson import ObjectId
 from app.utils.bson import PyObjectId  # helper to handle ObjectId correctly
 from passlib.context import CryptContext
 from app.api.v1.admin import default_settings
+from app.utils.datetime_utils import to_utc_iso
 
 router = APIRouter()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -68,6 +69,7 @@ async def list_users(
             user["status"] = "active"
 
         user["_id"] = str(user["_id"])
+        user["last_login"] = to_utc_iso(user.get("last_login"))
 
     return users
 
@@ -121,6 +123,7 @@ async def create_user(
         )
 
     created_user["_id"] = str(created_user["_id"])
+    created_user["last_login"] = to_utc_iso(created_user.get("last_login"))
     return created_user
 
 
@@ -190,6 +193,7 @@ async def update_user(
         updated_user["status"] = "active"
 
     updated_user["_id"] = str(updated_user["_id"])
+    updated_user["last_login"] = to_utc_iso(updated_user.get("last_login"))
     return updated_user
 
 

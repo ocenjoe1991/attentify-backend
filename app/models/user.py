@@ -10,7 +10,7 @@ class UserBase(BaseModel):
     last_name: str
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-    last_login: Optional[datetime] = None
+    last_login: Optional[str] = None
     auth_provider: Optional[str] = None
 
 class UserCreate(UserBase):
@@ -51,7 +51,7 @@ class UserPublic(BaseModel):
     team_name: Optional[str] = None
     company_id: Optional[str] = None
     membership_id: Optional[str] = None
-    last_login: Optional[datetime] = None
+    last_login: Optional[str] = None
 
     class Config:
         populate_by_name = True
