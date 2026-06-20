@@ -618,51 +618,47 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
 
     last_history_id = account.get("history_id")
     if not last_history_id:
-        logger.debug("No stored historyId for %s. Fetching latest inbox messages.", email_address)
-        try:
-            latest = service.users().messages().list(
-                userId="me",
-                labelIds=["INBOX"],
-                maxResults=10,
-            ).execute()
-            history = [
-                {
-                    "messagesAdded": [
-                        {"message": item}
-                        for item in latest.get("messages", [])
-                    ]
-                }
-            ]
-        except Exception:
-            logger.error("Failed fetching latest Gmail messages for %s", email_address, exc_info=True)
-            return Response(status_code=500)
+        logger.info("No stored historyId for %s. Setting Gmail baseline to %s.", email_address, history_id)
+        await db["gmail_accounts"].update_one(
+            {"_id": account["_id"]},
+            {"$set": {"history_id": history_id, "status": "connected"}},
+        )
+        return Response(status_code=200)
     else:
         try:
-            results = service.users().history().list(
-                userId="me",
-                startHistoryId=last_history_id
-            ).execute()
-
-            history = results.get("history", [])
-        except Exception:
-            logger.error("Failed fetching Gmail history for %s. Falling back to latest inbox messages.", email_address, exc_info=True)
-            try:
-                latest = service.users().messages().list(
+            history = []
+            latest_history_id = history_id
+            page_token = None
+            while True:
+                results = service.users().history().list(
                     userId="me",
-                    labelIds=["INBOX"],
-                    maxResults=10,
+                    startHistoryId=str(last_history_id),
+                    historyTypes=["messageAdded"],
+                    pageToken=page_token,
                 ).execute()
-                history = [
-                    {
-                        "messagesAdded": [
-                            {"message": item}
-                            for item in latest.get("messages", [])
-                        ]
-                    }
-                ]
-            except Exception:
-                logger.error("Fallback Gmail message fetch failed for %s", email_address, exc_info=True)
-                return Response(status_code=500)
+                latest_history_id = results.get("historyId") or latest_history_id
+                history.extend(results.get("history", []))
+                page_token = results.get("nextPageToken")
+                if not page_token:
+                    break
+        except HttpError as e:
+            status_code = getattr(getattr(e, "resp", None), "status", None)
+            if status_code in (400, 404):
+                logger.warning(
+                    "Gmail historyId expired for %s. Resetting baseline to %s.",
+                    email_address,
+                    history_id,
+                )
+                await db["gmail_accounts"].update_one(
+                    {"_id": account["_id"]},
+                    {"$set": {"history_id": history_id, "status": "connected"}},
+                )
+                return Response(status_code=200)
+            logger.error("Failed fetching Gmail history for %s", email_address, exc_info=True)
+            return Response(status_code=500)
+        except Exception:
+            logger.error("Failed fetching Gmail history for %s", email_address, exc_info=True)
+            return Response(status_code=500)
 
     for record in history:
         if "messagesAdded" not in record:
@@ -828,8 +824,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 
     await db["gmail_accounts"].update_one(
         {"_id": account["_id"]},
-        {"$set": {"history_id": history_id}}
+        {"$set": {"history_id": latest_history_id, "status": "connected"}}
     )
 
-    logger.info("Processed Gmail Pub/Sub for %s up to historyId=%s", email_address, history_id)
+    logger.info("Processed Gmail Pub/Sub for %s up to historyId=%s", email_address, latest_history_id)
     return Response(status_code=200)

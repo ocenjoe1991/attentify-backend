@@ -13,6 +13,7 @@ from googleapiclient.discovery import build
 from app.core.config import settings
 import asyncio
 import json
+from datetime import datetime, timezone
 
 import socketio
 from google.cloud import pubsub_v1
@@ -103,8 +104,23 @@ async def set_gmail_watches_periodically():
                 loop = asyncio.get_running_loop()
                 response = await loop.run_in_executor(None, set_gmail_watch, cred)
                 print(response)
+                update_data = {
+                    "status": "connected",
+                    "watch_expiration": response.get("expiration"),
+                    "last_watch_renewed_at": datetime.now(timezone.utc),
+                }
+                if not cred.get("history_id") and response.get("historyId"):
+                    update_data["history_id"] = response["historyId"]
+                await db["gmail_accounts"].update_one(
+                    {"_id": cred["_id"]},
+                    {"$set": update_data, "$unset": {"last_error": ""}},
+                )
             except Exception as e:
                 print(f"Failed to set Gmail watch for {cred.get('email')}: {e}")
+                await db["gmail_accounts"].update_one(
+                    {"_id": cred["_id"]},
+                    {"$set": {"last_error": f"Failed to renew Gmail watch: {e}"}},
+                )
             
         await asyncio.sleep(24 * 3600)
 
