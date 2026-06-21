@@ -7,6 +7,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from app.models.message import Message, ChatEntry 
 from app.services.deleted_gmail_service import is_deleted_gmail_message
+from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
 from bson import ObjectId
 import logging
 import requests
@@ -206,9 +207,26 @@ async def fetch_and_save_gmail(
             ):
                 continue
 
-            full_msg = service.users().messages().get(
-                userId="me", id=gmail_id, format="full"
-            ).execute()
+            if not await claim_gmail_message(
+                db,
+                company_id=company_id,
+                user_id=user_id,
+                gmail_id=gmail_id,
+            ):
+                continue
+
+            try:
+                full_msg = service.users().messages().get(
+                    userId="me", id=gmail_id, format="full"
+                ).execute()
+            except Exception:
+                await release_gmail_message_claim(
+                    db,
+                    company_id=company_id,
+                    user_id=user_id,
+                    gmail_id=gmail_id,
+                )
+                raise
             thread_id = full_msg.get("threadId", gmail_id)
             payload = full_msg.get("payload", {})
             headers = payload.get("headers", [])

@@ -141,6 +141,11 @@ async def ensure_database_indexes(db):
         unique=True,
     )
     await db["deleted_gmail_messages"].create_index([("deleted_at", -1)])
+    await db["processed_gmail_messages"].create_index(
+        [("company_id", 1), ("user_id", 1), ("gmail_id", 1)],
+        unique=True,
+    )
+    await db["processed_gmail_messages"].create_index([("claimed_at", -1)])
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

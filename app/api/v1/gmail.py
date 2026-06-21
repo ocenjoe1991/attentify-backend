@@ -21,6 +21,7 @@ import urllib.parse
 from app.db.mongodb import get_database
 from app.services.gmail_service import get_gmail_service
 from app.services.deleted_gmail_service import is_deleted_gmail_message
+from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
 from google.oauth2 import service_account
 from email.utils import parsedate_to_datetime
 from app.models.gmail import (
@@ -675,6 +676,15 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 logger.debug("Deleted Gmail %s ignored for %s", gmail_id, email_address)
                 continue
 
+            if not await claim_gmail_message(
+                db,
+                company_id=company_object_id,
+                user_id=user_object_id,
+                gmail_id=gmail_id,
+            ):
+                logger.debug("Already processed Gmail %s ignored for %s", gmail_id, email_address)
+                continue
+
             try:
                 full_msg = service.users().messages().get(
                     userId="me",
@@ -682,11 +692,23 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     format="full"
                 ).execute()
             except Exception:
+                await release_gmail_message_claim(
+                    db,
+                    company_id=company_object_id,
+                    user_id=user_object_id,
+                    gmail_id=gmail_id,
+                )
                 logger.error("Failed fetching Gmail message %s", gmail_id, exc_info=True)
                 continue
 
             labels = full_msg.get("labelIds", [])
             if "INBOX" not in labels:
+                await release_gmail_message_claim(
+                    db,
+                    company_id=company_object_id,
+                    user_id=user_object_id,
+                    gmail_id=gmail_id,
+                )
                 continue
             thread_id = full_msg.get("threadId", gmail_id)
             payload = full_msg.get("payload", {}) or {}
