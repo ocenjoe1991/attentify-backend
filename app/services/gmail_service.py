@@ -35,6 +35,7 @@ async def fetch_and_save_gmail(
     company_id: str,
     update_existing: bool = False,
     force_full_sync: bool = False,
+    include_unread_backfill: bool = False,
 ):
     creds = Credentials(
         token=account["access_token"],
@@ -110,8 +111,15 @@ async def fetch_and_save_gmail(
     try:
         service = build("gmail", "v1", credentials=creds)
         messages = []
+        seen_gmail_ids = set()
         latest_history_id = None
         sync_mode = "full" if force_full_sync else "history"
+
+        def add_message_ref(message_ref):
+            gmail_id = message_ref.get("id")
+            if gmail_id and gmail_id not in seen_gmail_ids:
+                messages.append(message_ref)
+                seen_gmail_ids.add(gmail_id)
 
         if force_full_sync:
             page_token = None
@@ -122,7 +130,8 @@ async def fetch_and_save_gmail(
                     pageToken=page_token,
                 )
                 result = request.execute()
-                messages.extend(result.get("messages", []))
+                for message_ref in result.get("messages", []):
+                    add_message_ref(message_ref)
                 page_token = result.get("nextPageToken")
                 if not page_token:
                     break
@@ -136,57 +145,53 @@ async def fetch_and_save_gmail(
                         {"_id": account["account_id"]},
                         {"$set": {"history_id": latest_history_id, "status": "connected"}},
                     )
-                return {
-                    "email": account["email"],
-                    "status": "ok",
-                    "stored_count": 0,
-                    "updated_count": 0,
-                    "fetched_count": 0,
-                    "sync_mode": "baseline",
-                    "message": f"Initialized Gmail sync baseline for {account['email']}. Future syncs will fetch new messages only.",
-                }
+                sync_mode = "baseline"
 
-            page_token = None
-            seen_gmail_ids = set()
-            try:
+            else:
+                page_token = None
+                try:
+                    while True:
+                        result = service.users().history().list(
+                            userId="me",
+                            startHistoryId=str(last_history_id),
+                            historyTypes=["messageAdded"],
+                            pageToken=page_token,
+                        ).execute()
+                        latest_history_id = result.get("historyId") or latest_history_id
+                        for record in result.get("history", []):
+                            for added in record.get("messagesAdded", []):
+                                add_message_ref(added.get("message", {}))
+                        page_token = result.get("nextPageToken")
+                        if not page_token:
+                            break
+                except HttpError as e:
+                    status = getattr(getattr(e, "resp", None), "status", None)
+                    if status in (400, 404):
+                        profile = service.users().getProfile(userId="me").execute()
+                        latest_history_id = profile.get("historyId")
+                        if latest_history_id:
+                            await db["gmail_accounts"].update_one(
+                                {"_id": account["account_id"]},
+                                {"$set": {"history_id": latest_history_id, "status": "connected"}},
+                            )
+                        sync_mode = "baseline_reset"
+                    else:
+                        raise
+
+            if include_unread_backfill:
+                page_token = None
                 while True:
-                    result = service.users().history().list(
+                    result = service.users().messages().list(
                         userId="me",
-                        startHistoryId=str(last_history_id),
-                        historyTypes=["messageAdded"],
+                        labelIds=["INBOX", "UNREAD"],
+                        maxResults=100,
                         pageToken=page_token,
                     ).execute()
-                    latest_history_id = result.get("historyId") or latest_history_id
-                    for record in result.get("history", []):
-                        for added in record.get("messagesAdded", []):
-                            message_ref = added.get("message", {})
-                            gmail_id = message_ref.get("id")
-                            if gmail_id and gmail_id not in seen_gmail_ids:
-                                messages.append(message_ref)
-                                seen_gmail_ids.add(gmail_id)
+                    for message_ref in result.get("messages", []):
+                        add_message_ref(message_ref)
                     page_token = result.get("nextPageToken")
                     if not page_token:
                         break
-            except HttpError as e:
-                status = getattr(getattr(e, "resp", None), "status", None)
-                if status in (400, 404):
-                    profile = service.users().getProfile(userId="me").execute()
-                    latest_history_id = profile.get("historyId")
-                    if latest_history_id:
-                        await db["gmail_accounts"].update_one(
-                            {"_id": account["account_id"]},
-                            {"$set": {"history_id": latest_history_id, "status": "connected"}},
-                        )
-                    return {
-                        "email": account["email"],
-                        "status": "ok",
-                        "stored_count": 0,
-                        "updated_count": 0,
-                        "fetched_count": 0,
-                        "sync_mode": "baseline_reset",
-                        "message": f"Gmail history baseline was reset for {account['email']}. Future syncs will fetch new messages only.",
-                    }
-                raise
 
         stored_count = 0
         updated_count = 0
@@ -357,7 +362,7 @@ async def fetch_and_save_gmail(
             "stored_count": stored_count,
             "updated_count": updated_count,
             "fetched_count": len(messages),
-            "sync_mode": sync_mode,
+            "sync_mode": f"{sync_mode}+unread" if include_unread_backfill and not force_full_sync else sync_mode,
             "message": f"Fetched {len(messages)} messages, stored {stored_count} new messages, and updated {updated_count} existing messages for {account['email']}",
         }
 
@@ -387,7 +392,13 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
             }
 
             account_company_id = str(cred.get("company_id") or company_id)
-            result = await fetch_and_save_gmail(token_data, db, user_id, account_company_id)
+            result = await fetch_and_save_gmail(
+                token_data,
+                db,
+                user_id,
+                account_company_id,
+                include_unread_backfill=True,
+            )
             results.append(result)
         except Exception as e:
             results.append({
