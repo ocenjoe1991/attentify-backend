@@ -160,12 +160,14 @@ async def set_gmail_watches_periodically():
         await asyncio.sleep(sleep_duration)
 
 async def ensure_database_indexes(db):
+    # Orders
     await db["orders"].create_index([("company_id", 1), ("created_at", -1)])
     await db["orders"].create_index([("company_id", 1), ("shop", 1), ("created_at", -1)])
     await db["orders"].create_index([("company_id", 1), ("name", 1)])
     await db["orders"].create_index([("company_id", 1), ("order_id", 1)])
     await db["orders"].create_index([("company_id", 1), ("customer.email", 1)])
 
+    # Messages
     await db["messages"].create_index([("company_id", 1), ("last_updated", -1)])
     await db["messages"].create_index([("company_id", 1), ("started_at", -1)])
     await db["messages"].create_index([("company_id", 1), ("status", 1), ("last_updated", -1)])
@@ -181,6 +183,24 @@ async def ensure_database_indexes(db):
         unique=True,
     )
     await db["processed_gmail_messages"].create_index([("claimed_at", -1)])
+
+    # Memberships — frequently queried by user+status and company+role
+    await db["memberships"].create_index([("user_id", 1), ("status", 1)])
+    await db["memberships"].create_index([("company_id", 1), ("role", 1), ("status", 1)])
+
+    # Users — lookup by email (login)
+    await db["users"].create_index([("email", 1)], unique=True)
+
+    # Gmail accounts — lookup by company
+    await db["gmail_accounts"].create_index([("company_id", 1)])
+    await db["gmail_accounts"].create_index([("email", 1)])
+
+    # Shopify credentials — lookup by company and shop
+    await db["shopify_cred"].create_index([("company_id", 1)])
+    await db["shopify_cred"].create_index([("shop", 1)])
+
+    # Audit logs — lookup by company + date
+    await db["audit_logs"].create_index([("company_id", 1), ("created_at", -1)])
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

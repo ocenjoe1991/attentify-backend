@@ -129,42 +129,61 @@ async def record_ticket_audit_log(
         details=details,
     )
 
+async def _batch_get_users(db, user_ids: list) -> dict:
+    """Fetch multiple users in a single query and return a lookup dict keyed by ObjectId string."""
+    if not user_ids:
+        return {}
+    # Normalize all IDs to ObjectId
+    oids = []
+    for uid in user_ids:
+        try:
+            oids.append(uid if isinstance(uid, ObjectId) else ObjectId(uid))
+        except Exception:
+            continue
+    if not oids:
+        return {}
+    users = {}
+    cursor = db["users"].find({"_id": {"$in": oids}})
+    async for u in cursor:
+        users[str(u["_id"])] = {
+            "id": str(u["_id"]),
+            "name": f"{u.get('first_name', '')} {u.get('last_name', '')}".strip(),
+            "email": u.get("email", ""),
+        }
+    return users
+
+
 @router.get("/", response_model=List[dict])
 async def get_messages(db=Depends(get_database), current_user: dict = Depends(get_current_user)):
     cursor = db["messages"].find({"user_id": current_user["_id"]}).sort("last_updated", DESCENDING)
     messages = []
+    # Collect assigned member IDs for batch query
+    assigned_ids = set()
     async for doc in cursor:
-        doc["_id"] = str(doc["_id"]) 
+        messages.append(doc)
+        aid = doc.get("assigned_member_id")
+        if aid:
+            assigned_ids.add(str(aid))
+
+    # Batch fetch all assigned users
+    user_map = await _batch_get_users(db, list(assigned_ids))
+
+    result = []
+    for doc in messages:
+        doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
         doc["company_id"] = str(doc["company_id"])
-        raw_client = doc.get("client", "")
-        cleaned_client = extract_name(raw_client)
-        doc["client"] = cleaned_client
-
+        doc["client"] = extract_name(doc.get("client", ""))
         normalize_doc_dates(doc)
 
-        # Assigned member
-        member = None
-        assigned_member_id = doc.get("assigned_member_id")
-        if assigned_member_id:
-            try:
-                member_obj = await db["users"].find_one({"_id": assigned_member_id if isinstance(assigned_member_id, ObjectId) else ObjectId(assigned_member_id)})
-                if member_obj:
-                    member_obj["_id"] = str(member_obj["_id"])
-                    # Include only desired member fields
-                    member = {
-                        "id": member_obj["_id"],
-                        "name": f"{member_obj.get('first_name', '')} {member_obj.get('last_name', '')}".strip(),
-                        "email": member_obj.get("email", "")
-                    }
-            except Exception:
-                member = None
-        doc["assigned_to"] = member
-        if "assigned_member_id" in doc and doc["assigned_member_id"]:
-            doc.pop("assigned_member_id", None)
+        # Map assigned member from batch lookup
+        aid = doc.get("assigned_member_id")
+        doc["assigned_to"] = user_map.get(str(aid)) if aid else None
+        doc.pop("assigned_member_id", None)
         doc.pop("messages", None)
-        messages.append(doc)
-    return messages
+        result.append(doc)
+
+    return result
 
 @router.get("/company_messages", response_model=dict)
 async def get_company_messages(
@@ -303,6 +322,7 @@ async def get_company_messages(
     ]
 
     messages = []
+    assigned_ids = set()
     async for doc in db["messages"].aggregate(pipeline):
         doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
@@ -310,36 +330,25 @@ async def get_company_messages(
         doc["status"] = normalize_status(doc.get("status", "Open"))
         doc["order_match_status"] = doc.get("order_match_status", "unknown")
         doc.pop("_sort_date", None)
+        doc["client"] = extract_name(doc.get("client", ""))
 
-        # Clean client name
-        raw_client = doc.get("client", "")
-        doc["client"] = extract_name(raw_client)
+        # Collect assigned_member_id BEFORE popping
+        aid = doc.get("assigned_member_id")
+        if aid:
+            assigned_ids.add(str(aid))
+            doc["_assigned_member_id"] = str(aid)  # temp field for later lookup
 
-        # Get assigned member details
-        assigned_member_id = doc.get("assigned_member_id")
-        member = None
-        if assigned_member_id:
-            try:
-                member_obj = await db["users"].find_one(
-                    {"_id": assigned_member_id if isinstance(assigned_member_id, ObjectId) else ObjectId(assigned_member_id)}
-                )
-                if member_obj:
-                    member = {
-                        "id": str(member_obj["_id"]),
-                        "name": f"{member_obj.get('first_name', '')} {member_obj.get('last_name', '')}".strip(),
-                        "email": member_obj.get("email", "")
-                    }
-            except Exception:
-                member = None
-        doc["assigned_to"] = member
-
-        # Cleanup unused fields
         doc.pop("assigned_member_id", None)
         doc.pop("messages", None)
         doc.pop("comments", None)
-
         normalize_doc_dates(doc)
         messages.append(doc)
+
+    # Batch fetch all assigned users
+    user_map = await _batch_get_users(db, list(assigned_ids))
+
+    for doc in messages:
+        doc["assigned_to"] = user_map.get(doc.pop("_assigned_member_id", "")) or None
 
     return {
         "messages": messages,
