@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from bson import ObjectId
@@ -119,7 +119,7 @@ async def create_twilio_account(
 
     validate_twilio_number(payload.account_sid, payload.auth_token, phone_number)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     account_doc = {
         "company_id": ObjectId(payload.company_id),
         "user_id": current_user["_id"],
@@ -230,7 +230,7 @@ async def send_sms(
     account = await get_company_twilio_account(db, company_id, data.from_phone)
     sent = await send_twilio_sms(account, data.to, data.message)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     chat_entry = ChatEntry(
         sender=account["phone_number"],
         recipient=normalize_phone(data.to),
@@ -308,7 +308,7 @@ async def reply_to_sms_message(
             break
 
     sent = await send_twilio_sms(account, to_phone, content)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     chat_entry = ChatEntry(
         sender=account["phone_number"],
         recipient=normalize_phone(to_phone),

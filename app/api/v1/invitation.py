@@ -1,6 +1,6 @@
 # routers/invitations.py
 from fastapi import APIRouter, Depends, HTTPException, status
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from app.db.mongodb import get_database
 from app.models.invitation import InvitationBase, InvitationDetails, AcceptInvitationRequest
@@ -31,7 +31,7 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
         raise HTTPException(status_code=403, detail="Only administrators or owners can send invitations")
 
     custom_permissions = normalize_custom_permissions(invite.custom_permissions)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     existing_user = await db["users"].find_one({"email": invite.email})
     if existing_user:
@@ -162,7 +162,7 @@ async def accept_invitation_token(
         # Frontend can redirect to signup page if user doesn't exist
         return {"redirect_url": f"/signup?token={payload.token}"}
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     existing_membership = await db["memberships"].find_one({
         "user_id": user["_id"],
         "company_id": ObjectId(company_id),
@@ -213,7 +213,7 @@ def get_invitation(token: str):
         email=payload["email"],
         company_id=payload["company_id"],
         role=payload["role"],
-        expires_at=datetime.utcnow() + timedelta(seconds=172800)  # optional
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=172800)
     )
 
 @router.get("/invitation-status")
@@ -240,7 +240,7 @@ async def get_invitation_status(db=Depends(get_database), current_user=Depends(g
 @router.post("/invitation-accept")
 async def accept_invitation(db=Depends(get_database), current_user=Depends(get_current_user)):
     """Accepts the pending invitation."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     invitation = await db.invitations.find_one({
         "email": current_user["email"],
         "status": "pending"

@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from bson import ObjectId
@@ -29,7 +29,7 @@ async def record_deleted_gmail_messages(db, message: dict, actor: dict | None = 
     if not gmail_ids:
         return 0
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     company_id = _as_object_id(message.get("company_id"))
     user_id = _as_object_id(message.get("user_id"))
     actor_id = _as_object_id(actor.get("_id")) if actor else None

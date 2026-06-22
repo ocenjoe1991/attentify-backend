@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timezone
 from email.utils import parsedate_to_datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -59,7 +59,7 @@ async def fetch_and_save_gmail(
             )
             if expires_at_dt.tzinfo:
                 expires_at_dt = expires_at_dt.astimezone(timezone.utc).replace(tzinfo=None)
-            token_expired = datetime.utcnow() >= expires_at_dt
+            token_expired = datetime.now(timezone.utc) >= expires_at_dt
         except Exception as e:
             logging.warning(f"Could not parse expires_at: {expires_at} ({e})")
             token_expired = creds.expired

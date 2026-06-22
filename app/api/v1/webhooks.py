@@ -2,7 +2,7 @@ from fastapi import APIRouter, Form, Request, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 
 router = APIRouter()
@@ -41,7 +41,7 @@ async def twilio_sms_webhook(
 
     # Try to find the existing thread
     doc = await db.messages.find_one({"thread_id": thread_id, "channel": "sms"})
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     chat_entry = ChatEntry(
         sender=from_phone,

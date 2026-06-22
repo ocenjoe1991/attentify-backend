@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from typing import List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from bson import ObjectId
 from app.services.shopify_service import (
@@ -72,7 +72,7 @@ def build_order_action(
         "actor_role": membership.get("role", "unknown") if membership else "unknown",
         "note": note,
         "details": details or {},
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
     }
 
 
@@ -370,7 +370,7 @@ async def record_order_action_and_audit(
     details: dict | None = None,
     order_updates: dict | None = None,
 ) -> dict:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     action_details = {
         "order_id": str(order_doc.get("order_id", "")),
         "shop": order_doc.get("shop", ""),
@@ -627,7 +627,7 @@ async def create_approval_request(
     company_id: ObjectId,
     message_id: str = "",
 ) -> dict:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     request_doc = {
         "type": action_type,
         "payload": payload,
@@ -1315,7 +1315,7 @@ async def reject_approval_request(
     if request_doc.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Approval request has already been processed")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     await db["approval_requests"].update_one(
         {"_id": request_doc["_id"]},
         {
@@ -1380,7 +1380,7 @@ async def approve_approval_request(
     if isinstance(result, JSONResponse) and result.status_code >= 400:
         return result
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     await db["approval_requests"].update_one(
         {"_id": request_doc["_id"]},
         {
@@ -1563,7 +1563,7 @@ async def refund_order(
         logger.error("Refund failed: %s %s", refund_response.status_code, refund_response.text)
         return JSONResponse(status_code=refund_response.status_code, content=refund_response.json())
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     order_action = build_order_action(
         action_type="refund",
         amount=actual_refund_amount,
@@ -1709,7 +1709,7 @@ async def cancel_order(
     # --- Step 6: Handle Shopify response ---
     if response.status_code == 200:
         data = response.json()
-        cancelled_at = datetime.utcnow()
+        cancelled_at = datetime.now(timezone.utc)
         cancellation_amount = to_float_amount(order_doc.get("total_price"))
         order_action = build_order_action(
             action_type="cancellation",

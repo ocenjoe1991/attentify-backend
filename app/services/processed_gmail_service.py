@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from bson import ObjectId
@@ -23,7 +23,7 @@ async def claim_gmail_message(db, *, company_id, user_id, gmail_id: str, thread_
                 "user_id": _as_object_id(user_id),
                 "gmail_id": gmail_id,
                 "thread_id": thread_id,
-                "claimed_at": datetime.utcnow(),
+                "claimed_at": datetime.now(timezone.utc),
             }
         )
         return True

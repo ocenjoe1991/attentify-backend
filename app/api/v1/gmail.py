@@ -34,6 +34,7 @@ from app.models.gmail import (
 from app.models.message import Message, ChatEntry 
 from app.utils.logger import logger
 from app.main import sio
+from app.utils.datetime_utils import to_utc_iso
 import re
 
 logger = logging.getLogger("attentify.gmail")
@@ -48,12 +49,12 @@ def gmail_account_helper(account: dict) -> dict:
         "access_token": account["access_token"],
         "refresh_token": account["refresh_token"],
         "token_type": account.get("token_type", "Bearer"),
-        "expires_at": account["expires_at"],
+        "expires_at": to_utc_iso(account.get("expires_at")),
         "client_id": account["client_id"],
         "client_secret": account["client_secret"],
         "status": account.get("status", "connected"),
         "scope": account.get("scope"),
-        "token_issued_at": account.get("token_issued_at"),
+        "token_issued_at": to_utc_iso(account.get("token_issued_at")),
         "is_primary": account.get("is_primary", False),
         "provider": account.get("provider", "google"),
         "history_id":  account.get("history_id", ""),
@@ -431,7 +432,7 @@ async def google_oauth_callback(
             ),
         )
 
-    expires_at = datetime.utcnow() + timedelta(seconds=expires_in or 3600)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in or 3600)
 
     db = request.app.state.db
 
@@ -539,7 +540,7 @@ async def google_oauth_callback(
             "https://www.googleapis.com/auth/gmail.send",
         ],
         "scope": token_data.get("scope"),
-        "token_issued_at": datetime.utcnow(),
+        "token_issued_at": datetime.now(timezone.utc),
         "provider": "google",
         "history_id": history_id,
         "subscription": subscription_path,
@@ -807,10 +808,10 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 shopify_order_match = re.search(r"#([A-Z]{2}\d+)", subject or content or "")
                 shopify_order = shopify_order_match.group(1) if shopify_order_match else None
 
-                today = datetime.utcnow().strftime("%Y-%m-%d")
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 count_today = await db["messages"].count_documents({
                     "company_id": company_object_id,
-                    "started_at": {"$gte": datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)}
+                    "started_at": {"$gte": datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)}
                 })
                 ticket_number = f"CA-{today}-{count_today + 1:04d}"
 

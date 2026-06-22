@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
@@ -150,7 +150,7 @@ async def update_governance_settings(
             merged["permissions"][role].update(permissions)
     merged["approvals"].update(payload.approvals)
     merged["notifications"].update(payload.notifications)
-    merged["updated_at"] = datetime.utcnow()
+    merged["updated_at"] = datetime.now(timezone.utc)
     merged["updated_by"] = str(current_user["_id"])
 
     await db["admin_settings"].update_one(
@@ -166,7 +166,7 @@ async def update_governance_settings(
             "message": "Permissions, approval rules, or notification policies were changed.",
             "actor_id": current_user["_id"],
             "actor_email": current_user.get("email"),
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(timezone.utc),
             "read": False,
         }
     )

@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Literal, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 from app.utils.bson import PyObjectId
 
@@ -9,7 +9,7 @@ class ChatEntry(BaseModel):
     recipient: Optional[str] = None  # For email/SMS
     content: str
     title: Optional[str] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     channel: Optional[Literal["chat", "sms", "email", "voice"]] = None
     message_type: Optional[Literal["text", "html", "file", "voice", "system"]] = "text"
     metadata: Optional[Dict[str, Any]] = {}
@@ -18,7 +18,7 @@ class Comment(BaseModel):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
     user_id: PyObjectId = Field(..., description="ID of the user who wrote the comment")
     content: str = Field(..., description="Comment text")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: Optional[datetime] = None
     status: Literal["Pending", "Resolved", "Awaiting Approval"] = "Pending"
     edited: Optional[bool] = False
@@ -43,8 +43,8 @@ class Message(BaseModel):
     agent: Optional[str] = None
     session_id: Optional[str] = None
 
-    started_at: datetime = Field(default_factory=datetime.utcnow)
-    last_updated: datetime = Field(default_factory=datetime.utcnow)
+    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_updated: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     status: Literal["Open", "Assigned", "In Progress", "Pending", "Resolved", "Escalated", "Awaiting Approval", "Canceled"] = "Open"
     archived: bool = False
     trashed: bool = False

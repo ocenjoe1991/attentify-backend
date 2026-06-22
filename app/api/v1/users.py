@@ -4,7 +4,7 @@ from pymongo.collection import Collection
 from app.models.user import AdminUserCreate, AdminUserUpdate, UserPublic
 from app.db.mongodb import get_database
 from app.core.security import get_current_user
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 from app.utils.bson import PyObjectId  # helper to handle ObjectId correctly
 from passlib.context import CryptContext
@@ -88,7 +88,7 @@ async def create_user(
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already exists")
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     hashed_pw = pwd_context.hash(user.password or "changeme")
 
     user_doc = {
@@ -117,7 +117,7 @@ async def create_user(
                 "message": f"{user.email} was created with the {user.role or 'readonly'} role.",
                 "actor_id": current_user["_id"],
                 "actor_email": current_user.get("email"),
-                "created_at": datetime.utcnow(),
+                "created_at": datetime.now(timezone.utc),
                 "read": False,
             }
         )
@@ -147,7 +147,7 @@ async def update_user(
     if not existing:
         raise HTTPException(status_code=404, detail="User not found")
 
-    update_data = {"updated_at": datetime.utcnow()}
+    update_data = {"updated_at": datetime.now(timezone.utc)}
 
     for field in ["email", "first_name", "last_name", "role", "status", "team_id"]:
         value = getattr(user, field)

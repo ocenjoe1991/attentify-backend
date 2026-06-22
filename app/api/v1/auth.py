@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.models.user import UserCreate
 from app.core.security import verify_password, get_password_hash, create_access_token, get_current_user
 from app.db.mongodb import get_database
@@ -69,7 +69,7 @@ async def build_membership_login_payload(db, user: dict, user_id: str):
 
     await db.memberships.update_one(
         {"_id": selected_membership["_id"]},
-        {"$set": {"last_used_at": datetime.utcnow()}}
+        {"$set": {"last_used_at": datetime.now(timezone.utc)}}
     )
 
     company_ids = [m["company_id"] for m in memberships]
@@ -142,7 +142,7 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
     
     # If user doesn't exist, sign up
     if not user:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         user_doc = {
             "email": email,
@@ -182,7 +182,7 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
     # If user exists, sign in
     await db["users"].update_one(
         {"email": user["email"]},
-        {"$set": {"last_login": datetime.utcnow()}}
+        {"$set": {"last_login": datetime.now(timezone.utc)}}
     )
 
     user_id = str(user["_id"])
@@ -286,7 +286,7 @@ async def register(
         raise HTTPException(status_code=400, detail="Email already registered")
 
     hashed_password = get_password_hash(user.password)
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     user_doc = {
         "email": user.email,
@@ -417,7 +417,7 @@ async def login(
 
     await db.users.update_one(
         {"email": user["email"]},
-        {"$set": {"last_login": datetime.utcnow()}}
+        {"$set": {"last_login": datetime.now(timezone.utc)}}
     )
 
     user_id = str(user["_id"])  # Convert ObjectId to string
@@ -464,7 +464,7 @@ async def forgot_password(
         # Create token valid for 15 minutes (works for both regular and Google OAuth users)
         payload = {
             "sub": str(user["_id"]),
-            "exp": datetime.utcnow() + timedelta(minutes=15)
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=15)
         }
         token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
         reset_link = f"{FRONTEND_URL}/reset-password?token={token}"

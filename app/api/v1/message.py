@@ -399,7 +399,7 @@ async def update_message(
             and not has_owner_approval_bypass(membership, PERMISSION_RESOLVE_WITHOUT_OWNER_APPROVAL)
         ):
             safe_payload["status"] = "Awaiting Approval"
-    safe_payload["last_updated"] = datetime.utcnow()
+    safe_payload["last_updated"] = datetime.now(timezone.utc)
     await db["messages"].find_one_and_update(
         {"_id": ObjectId(id)},
         {"$set": safe_payload}
@@ -526,8 +526,8 @@ async def add_comment(
         "_id": ObjectId(),  # unique ID for comment
         "user_id": ObjectId(user["_id"]),
         "content": content,
-        "created_at": datetime.utcnow(),
-        "updated_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
         "status": status
     }
 
@@ -578,7 +578,7 @@ async def edit_comment(
             "$set": {
                 "comments.$.content": content,
                 "comments.$.edited": True,
-                "comments.$.updated_at": datetime.utcnow()
+                "comments.$.updated_at": datetime.now(timezone.utc)
             }
         }
     )
@@ -628,7 +628,7 @@ async def approve_comment(
         {
             "$set": {
                 "comments.$.status": status,
-                "comments.$.updated_at": datetime.utcnow()
+                "comments.$.updated_at": datetime.now(timezone.utc)
             }
         }
     )
@@ -763,7 +763,7 @@ async def update_message_field(
     user_agent = request.headers.get("user-agent", "") if request else ""
 
     # Perform update
-    set_payload = {field: value, "last_updated": datetime.utcnow()}
+    set_payload = {field: value, "last_updated": datetime.now(timezone.utc)}
     if field == "assigned_member_id" and value and normalize_status(message.get("status", "Open")) == "Open":
         set_payload["status"] = "Assigned"
     result = await db["messages"].update_one(
@@ -1404,7 +1404,7 @@ async def reply_to_message(
         "recipient": to_addr,
         "content": content,
         "title": subject if subject.lower().startswith("re:") else f"Re: {subject}",
-        "timestamp": datetime.utcnow(),
+        "timestamp": datetime.now(timezone.utc),
         "message_type": "html",
         "channel": "email",
         "metadata": {
