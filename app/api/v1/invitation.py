@@ -1,5 +1,5 @@
 # routers/invitations.py
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 from app.db.mongodb import get_database
@@ -14,6 +14,25 @@ from app.core.permissions import ROLE_ADMIN, ROLE_COMPANY_OWNER, normalize_custo
 from app.core.audit import record_audit_log
 
 router = APIRouter()
+
+async def get_authenticated_user_from_request(request: Request, db):
+    auth_header = request.headers.get("authorization", "")
+    token = None
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        token = request.cookies.get("access_token")
+    if not token:
+        return None
+
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("user_id")
+        if not user_id:
+            return None
+        return await db["users"].find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        return None
 
 # POST /api/v1/invitations/send
 @router.post("/send")
@@ -41,57 +60,6 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
         })
         if existing_membership and existing_membership.get("status") == "active":
             return {"message": "This user is already a team member."}
-        if existing_membership:
-            await db["memberships"].update_one(
-                {"_id": existing_membership["_id"]},
-                {
-                    "$set": {
-                        "role": invite.role,
-                        "status": "active",
-                        "custom_permissions": custom_permissions,
-                        "rejoined_at": now,
-                        "last_used_at": now,
-                        "updated_at": now,
-                    },
-                    "$unset": {
-                        "removed_at": "",
-                        "removed_by": "",
-                    },
-                },
-            )
-        else:
-            await db["memberships"].insert_one({
-                "user_id": existing_user["_id"],
-                "company_id": company_id,
-                "role": invite.role,
-                "status": "active",
-                "custom_permissions": custom_permissions,
-                "joined_at": now,
-                "last_used_at": now,
-            })
-
-        await db["invitations"].update_many(
-            {"email": invite.email, "company_id": company_id, "status": {"$in": ["pending", "accepted", "cancelled"]}},
-            {
-                "$set": {
-                    "status": "accepted",
-                    "role": invite.role,
-                    "custom_permissions": custom_permissions,
-                    "updated_at": now,
-                }
-            },
-        )
-        await record_audit_log(
-            db,
-            company_id=company_id,
-            actor=current_user,
-            actor_role=membership.get("role") if membership else ROLE_ADMIN,
-            action="Restored team member",
-            entity_type="membership",
-            entity_id=existing_membership["_id"] if existing_membership else existing_user["_id"],
-            details={"target_email": invite.email, "role": invite.role, "custom_permissions": custom_permissions},
-        )
-        return {"message": "Existing user restored to the team."}
 
     # Check if invitation already exists
     existing_invite = await db["invitations"].find_one(
@@ -142,6 +110,7 @@ async def send_invitation(invite: InvitationBase, db=Depends(get_database), curr
 @router.post("/accept-invitation-token")
 async def accept_invitation_token(
     payload: AcceptInvitationRequest,
+    request: Request,
     db=Depends(get_database)
 ):
     try:
@@ -161,6 +130,10 @@ async def accept_invitation_token(
     if not user:
         # Frontend can redirect to signup page if user doesn't exist
         return {"redirect_url": f"/signup?token={payload.token}"}
+
+    authenticated_user = await get_authenticated_user_from_request(request, db)
+    if authenticated_user and authenticated_user.get("email") != email:
+        raise HTTPException(status_code=403, detail="This invitation belongs to a different email address")
 
     now = datetime.now(timezone.utc)
     existing_membership = await db["memberships"].find_one({
@@ -201,6 +174,39 @@ async def accept_invitation_token(
         {"_id": invitation["_id"]},
         {"$set": {"status": "accepted"}}
     )
+
+    if authenticated_user:
+        company = await db.companies.find_one({"_id": ObjectId(company_id)})
+        company_list = []
+        if company:
+            company_list.append({
+                "id": str(company["_id"]),
+                "name": company.get("name", "")
+            })
+
+        token = create_access_token(data={
+            "sub": user["email"],
+            "user_id": str(user["_id"]),
+            "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+            "email": user["email"],
+            "company_id": str(company_id),
+            "role": invitation["role"],
+            "companies": company_list,
+            "redirect_url": "/dashboard",
+        })
+
+        return {
+            "token": token,
+            "user": {
+                "id": str(user["_id"]),
+                "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+                "email": user["email"],
+                "company_id": str(company_id),
+                "role": invitation["role"],
+                "companies": company_list,
+            },
+            "redirect_url": "/dashboard",
+        }
 
     return {"redirect_url": f"/login"}
 

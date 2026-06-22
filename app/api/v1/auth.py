@@ -16,10 +16,13 @@ from app.utils.email_utils import send_reset_password_email
 from app.models.auth import ForgotPasswordRequest, ResetPasswordRequest
 from app.core.config import settings
 from app.utils.rate_limit import auth_rate_limiter, sensitive_rate_limiter
+from urllib.parse import urlencode
+import logging
 
 router = APIRouter()
+logger = logging.getLogger("auth")
 
-VALID_ROLES = {"admin", "store_owner", "agent", "readonly"}
+VALID_ROLES = {"admin", "company_owner", "store_owner", "agent", "readonly"}
 
 SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = "HS256"
@@ -29,6 +32,12 @@ GOOGLE_AUTH_REDIRECT_URI = os.getenv(
     "GOOGLE_AUTH_REDIRECT_URI",
     f"{BACKEND_URL}/api/v1/auth/google/callback",
 )
+
+def frontend_redirect(path: str, **params: str) -> RedirectResponse:
+    query = urlencode({key: value for key, value in params.items() if value})
+    separator = "&" if "?" in path else "?"
+    url = f"{FRONTEND_URL}{path}{separator}{query}" if query else f"{FRONTEND_URL}{path}"
+    return RedirectResponse(url=url)
 
 async def build_membership_login_payload(db, user: dict, user_id: str):
     needs_password = not bool(user.get("hashed_password"))
@@ -137,11 +146,15 @@ async def google_login(request: Request):
 # /api/v1/auth/google/callback
 @router.get("/google/callback")
 async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(get_database)):
-    token = await oauth.google.authorize_access_token(request)
-    user_info = token.get("userinfo")
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        user_info = token.get("userinfo")
+    except Exception:
+        logger.exception("Google OAuth token exchange failed")
+        return frontend_redirect("/login", error="google_sign_in_failed")
 
     if not user_info:
-        raise HTTPException(status_code=400, detail="Google login failed")
+        return frontend_redirect("/login", error="google_sign_in_failed")
 
     email = user_info["email"]
     first_name = user_info.get("given_name", "")
@@ -185,11 +198,14 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
             "needs_password": True,
         })
 
-        response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/register?code={jwt_token}")
+        response = frontend_redirect("/oauth/callback/register", code=jwt_token)
         _set_auth_cookies(response, jwt_token)
         return response
 
     # If user exists, sign in
+    if user.get("status") == "suspended":
+        return frontend_redirect("/login", error="account_suspended")
+
     await db["users"].update_one(
         {"email": user["email"]},
         {"$set": {"last_login": datetime.now(timezone.utc)}}
@@ -210,13 +226,13 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
 
         jwt_token = create_access_token(data=token_data)
 
-        response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/login?code={jwt_token}")
+        response = frontend_redirect("/oauth/callback/login", code=jwt_token)
         _set_auth_cookies(response, jwt_token)
         return response
     
     payload = await build_membership_login_payload(db, user, user_id)
     callback_path = "login" if payload.get("user", {}).get("company_id") else "register"
-    response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/{callback_path}?code={payload['token']}")
+    response = frontend_redirect(f"/oauth/callback/{callback_path}", code=payload["token"])
     _set_auth_cookies(response, payload["token"])
     return response
 
@@ -531,4 +547,35 @@ async def set_password(
         {"$set": {"hashed_password": hashed_pw}}
     )
 
-    return {"message": "Password set successfully"}
+    updated_user = {**current_user, "hashed_password": hashed_pw}
+    user_id = str(current_user["_id"])
+
+    if current_user.get("role") == "admin":
+        token = create_access_token(data={
+            "sub": user_id,
+            "user_id": user_id,
+            "name": f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}".strip(),
+            "email": current_user["email"],
+            "role": "admin",
+            "redirect_url": "/admin/dashboard",
+        })
+        response = JSONResponse({
+            "message": "Password set successfully",
+            "token": token,
+            "user": {
+                "id": user_id,
+                "name": f"{current_user.get('first_name', '')} {current_user.get('last_name', '')}".strip(),
+                "email": current_user["email"],
+                "role": "admin",
+                "companies": [],
+            },
+            "redirect_url": "/admin/dashboard",
+        })
+        _set_auth_cookies(response, token)
+        return response
+
+    payload = await build_membership_login_payload(db, updated_user, user_id)
+    payload["message"] = "Password set successfully"
+    response = JSONResponse(payload)
+    _set_auth_cookies(response, payload["token"])
+    return response
