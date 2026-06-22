@@ -855,6 +855,31 @@ def cacheable_order_info(order_info: dict, *, source: str = "ai") -> dict:
     return cached
 
 
+async def update_message_analysis_state(
+    db: AsyncIOMotorDatabase,
+    message_id: ObjectId,
+    *,
+    state: str,
+    source: str = "",
+    error: str = "",
+) -> None:
+    update = {
+        "order_analysis.status": state,
+        "order_analysis.updated_at": datetime.now(timezone.utc),
+    }
+    if source:
+        update["order_analysis.source"] = source
+    if error:
+        update["order_analysis.error"] = error[:500]
+    elif state in {"started", "success", "cached"}:
+        update["order_analysis.error"] = ""
+
+    await db["messages"].update_one(
+        {"_id": message_id},
+        {"$set": update},
+    )
+
+
 def serialize_order_action(action: dict) -> dict:
     serialized = dict(action)
     if serialized.get("created_at"):
@@ -1238,15 +1263,26 @@ async def analyze_email_message(
     message_doc = await ensure_message_access(message_id, db, current_user, action="update")
 
     if not (order_info := message_doc.get('order_info')):
+        logger.info(
+            "Order analysis started",
+            extra={
+                "message_id": message_id,
+                "company_id": str(message_doc.get("company_id", "")),
+                "ticket": message_doc.get("ticket", ""),
+                "actor_email": current_user.get("email", ""),
+            },
+        )
+        await update_message_analysis_state(db, message_doc["_id"], state="started", source="gemini")
         result = await analyze_emails_with_ai(message_doc)
         # result is now a single dict, not a list
 
         if isinstance(result, dict) and result.get("error"):
+            error_message = str(result["error"])
             order_info = {
                 "order_id": "",
                 "type": "",
                 "status": 0,
-                "msg": result["error"],
+                "msg": error_message,
             }
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
@@ -1257,8 +1293,24 @@ async def analyze_email_message(
                     }
                 },
             )
+            await update_message_analysis_state(
+                db,
+                message_doc["_id"],
+                state="failed",
+                source="gemini",
+                error=error_message,
+            )
             # Log the real error for debugging but return a clean message to the UI
-            logger.warning("AI analysis failed for message %s: %s", message_id, result["error"])
+            logger.warning(
+                "Order analysis failed",
+                extra={
+                    "message_id": message_id,
+                    "company_id": str(message_doc.get("company_id", "")),
+                    "ticket": message_doc.get("ticket", ""),
+                    "actor_email": current_user.get("email", ""),
+                    "error": error_message[:500],
+                },
+            )
             order_info["shopify_order"] = {}
             return order_info
         
@@ -1267,11 +1319,12 @@ async def analyze_email_message(
         try:
             order_info = clean_json_response(response)
         except ValueError as exc:
+            error_message = str(exc)
             order_info = {
                 "order_id": "",
                 "type": "",
                 "status": 0,
-                "msg": str(exc),
+                "msg": error_message,
             }
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
@@ -1280,6 +1333,23 @@ async def analyze_email_message(
                         "order_info": cacheable_order_info(order_info, source="parse_error"),
                         "order_match_status": "unknown",
                     }
+                },
+            )
+            await update_message_analysis_state(
+                db,
+                message_doc["_id"],
+                state="failed",
+                source="parse",
+                error=error_message,
+            )
+            logger.warning(
+                "Order analysis parse failed",
+                extra={
+                    "message_id": message_id,
+                    "company_id": str(message_doc.get("company_id", "")),
+                    "ticket": message_doc.get("ticket", ""),
+                    "actor_email": current_user.get("email", ""),
+                    "error": error_message[:500],
                 },
             )
             order_info["shopify_order"] = {}
@@ -1293,6 +1363,29 @@ async def analyze_email_message(
                 }
             }
         )
+        await update_message_analysis_state(db, message_doc["_id"], state="success", source="gemini")
+        logger.info(
+            "Order analysis stored",
+            extra={
+                "message_id": message_id,
+                "company_id": str(message_doc.get("company_id", "")),
+                "ticket": message_doc.get("ticket", ""),
+                "actor_email": current_user.get("email", ""),
+                "order_id": str(order_info.get("order_id", "")),
+            },
+        )
+    else:
+        await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
+        logger.info(
+            "Order analysis skipped; cached order_info found",
+            extra={
+                "message_id": message_id,
+                "company_id": str(message_doc.get("company_id", "")),
+                "ticket": message_doc.get("ticket", ""),
+                "actor_email": current_user.get("email", ""),
+                "order_id": str(order_info.get("order_id", "")),
+            },
+        )
     
     order_id = str(order_info.get("order_id", ""))
     if not order_id:
@@ -1304,6 +1397,15 @@ async def analyze_email_message(
                     "order_info": cacheable_order_info(order_info),
                     "order_match_status": "not_order",
                 }
+            },
+        )
+        await update_message_analysis_state(db, message_doc["_id"], state="success", source="not_order")
+        logger.info(
+            "Order analysis completed as not_order",
+            extra={
+                "message_id": message_id,
+                "company_id": str(message_doc.get("company_id", "")),
+                "ticket": message_doc.get("ticket", ""),
             },
         )
         order_info["shopify_order"] = {}
@@ -1337,6 +1439,16 @@ async def analyze_email_message(
                     }
                 },
             )
+            await update_message_analysis_state(db, message_doc["_id"], state="success", source="matched")
+            logger.info(
+                "Order analysis matched order",
+                extra={
+                    "message_id": message_id,
+                    "company_id": str(message_doc.get("company_id", "")),
+                    "ticket": message_doc.get("ticket", ""),
+                    "order_name": db_order.get("name", ""),
+                },
+            )
 
         else:
             order_info["msg"] = "Email not matched"
@@ -1352,6 +1464,16 @@ async def analyze_email_message(
                     }
                 },
             )
+            await update_message_analysis_state(db, message_doc["_id"], state="success", source="possible")
+            logger.info(
+                "Order analysis found possible order",
+                extra={
+                    "message_id": message_id,
+                    "company_id": str(message_doc.get("company_id", "")),
+                    "ticket": message_doc.get("ticket", ""),
+                    "order_name": db_order.get("name", ""),
+                },
+            )
 
     else:
         order_info["msg"] = "Order not found"
@@ -1363,6 +1485,16 @@ async def analyze_email_message(
                     "order_info": cacheable_order_info(order_info),
                     "order_match_status": "unmatched",
                 }
+            },
+        )
+        await update_message_analysis_state(db, message_doc["_id"], state="success", source="unmatched")
+        logger.info(
+            "Order analysis did not find order",
+            extra={
+                "message_id": message_id,
+                "company_id": str(message_doc.get("company_id", "")),
+                "ticket": message_doc.get("ticket", ""),
+                "order_id": order_id,
             },
         )
 
