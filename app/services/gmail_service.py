@@ -3,6 +3,7 @@ from datetime import datetime, timezone, timezone
 from email.utils import parsedate_to_datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from app.models.message import Message, ChatEntry 
@@ -79,6 +80,7 @@ async def fetch_and_save_gmail(
                         "$set": {
                             "status": "disconnected",
                             "last_error": "Google refresh token is invalid or revoked. Reconnect this Gmail account.",
+                            "last_error_at": datetime.now(timezone.utc),
                         }
                     },
                 )
@@ -448,8 +450,12 @@ def get_gmail_service(user_credentials: dict):
     try:
         creds.refresh(request)
         logging.info("Credentials refreshed successfully for %s", user_credentials.get("email", "unknown Gmail account"))
-    except Exception as e:
-        logging.error("Error refreshing Gmail credentials for %s: %s", user_credentials.get("email", "unknown Gmail account"), e)
+    except RefreshError:
+        logging.exception("Error refreshing Gmail credentials for %s", user_credentials.get("email", "unknown Gmail account"))
+        raise
+    except Exception:
+        logging.exception("Error refreshing Gmail credentials for %s", user_credentials.get("email", "unknown Gmail account"))
+        raise
 
     service = build('gmail', 'v1', credentials=creds)
     return service

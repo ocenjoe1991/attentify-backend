@@ -11,6 +11,7 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 import os
 from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import pubsub_v1
@@ -40,6 +41,24 @@ import re
 logger = logging.getLogger("attentify.gmail")
 
 router = APIRouter()
+
+GMAIL_REAUTH_REQUIRED_MESSAGE = (
+    "Google refresh token is invalid or revoked. Reconnect this Gmail account."
+)
+
+
+async def mark_gmail_account_disconnected(db, account: dict, error_message: str = GMAIL_REAUTH_REQUIRED_MESSAGE):
+    await db["gmail_accounts"].update_one(
+        {"_id": account["_id"]},
+        {
+            "$set": {
+                "status": "disconnected",
+                "last_error": error_message,
+                "last_error_at": datetime.now(timezone.utc),
+            },
+            "$unset": {"watch_expiration": ""},
+        },
+    )
 
 def gmail_account_helper(account: dict) -> dict:
     return {
@@ -616,6 +635,14 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
 
     try:
         service = get_gmail_service(account)
+    except RefreshError:
+        logger.warning(
+            "Gmail credentials need reconnect for %s; acknowledging Pub/Sub push.",
+            email_address,
+            exc_info=True,
+        )
+        await mark_gmail_account_disconnected(db, account)
+        return Response(status_code=200)
     except Exception:
         logger.error("Failed to initialize Gmail API service for %s", email_address, exc_info=True)
         return Response(status_code=500)
@@ -645,6 +672,14 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 page_token = results.get("nextPageToken")
                 if not page_token:
                     break
+        except RefreshError:
+            logger.warning(
+                "Gmail credentials need reconnect while fetching history for %s; acknowledging Pub/Sub push.",
+                email_address,
+                exc_info=True,
+            )
+            await mark_gmail_account_disconnected(db, account)
+            return Response(status_code=200)
         except HttpError as e:
             status_code = getattr(getattr(e, "resp", None), "status", None)
             if status_code in (400, 404):
@@ -694,6 +729,21 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     id=gmail_id,
                     format="full"
                 ).execute()
+            except RefreshError:
+                await release_gmail_message_claim(
+                    db,
+                    company_id=company_object_id,
+                    user_id=user_object_id,
+                    gmail_id=gmail_id,
+                )
+                logger.warning(
+                    "Gmail credentials need reconnect while fetching message %s for %s; acknowledging Pub/Sub push.",
+                    gmail_id,
+                    email_address,
+                    exc_info=True,
+                )
+                await mark_gmail_account_disconnected(db, account)
+                return Response(status_code=200)
             except Exception:
                 await release_gmail_message_claim(
                     db,

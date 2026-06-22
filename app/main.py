@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()  # Load from .env at startup
 from app.db.mongodb import get_database
 from google.oauth2.credentials import Credentials
+from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from app.core.config import settings
 import asyncio
@@ -147,9 +148,18 @@ async def set_gmail_watches_periodically():
                 success_count += 1
             except Exception as e:
                 logger.error(f"Failed to set Gmail watch for {cred.get('email')}: {e}")
+                update_data = {
+                    "last_error": f"Failed to renew Gmail watch: {e}",
+                    "last_error_at": datetime.now(timezone.utc),
+                }
+                if isinstance(e, RefreshError) or "invalid_grant" in str(e):
+                    update_data["status"] = "disconnected"
+                    update_data["last_error"] = (
+                        "Google refresh token is invalid or revoked. Reconnect this Gmail account."
+                    )
                 await db["gmail_accounts"].update_one(
                     {"_id": cred["_id"]},
-                    {"$set": {"last_error": f"Failed to renew Gmail watch: {e}"}},
+                    {"$set": update_data, "$unset": {"watch_expiration": ""}},
                 )
                 fail_count += 1
 
