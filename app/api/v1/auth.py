@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, BackgroundTasks
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
 from app.models.user import UserCreate
 from app.core.security import verify_password, get_password_hash, create_access_token, get_current_user
@@ -30,6 +31,8 @@ GOOGLE_AUTH_REDIRECT_URI = os.getenv(
 )
 
 async def build_membership_login_payload(db, user: dict, user_id: str):
+    needs_password = not bool(user.get("hashed_password"))
+
     memberships_cursor = db.memberships.find({
         "user_id": user["_id"],
         "status": "active"
@@ -44,14 +47,17 @@ async def build_membership_login_payload(db, user: dict, user_id: str):
         })
 
         redirect_url = "/ask-accept-invitation" if invitation_result else "/register-company"
-        token = create_access_token({
+        token_data = {
             "sub": user_id,
             "user_id": user_id,
             "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
             "email": user["email"],
             "companies": [],
             "redirect_url": redirect_url,
-        })
+        }
+        if needs_password:
+            token_data["needs_password"] = True
+        token = create_access_token(token_data)
         return {
             "token": token,
             "user": {
@@ -86,7 +92,7 @@ async def build_membership_login_payload(db, user: dict, user_id: str):
                 "name": company.get("name", "")
             })
     
-    token = create_access_token(data={
+    token_data = {
         "sub": user_id,
         "user_id": user_id,
         "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
@@ -95,7 +101,10 @@ async def build_membership_login_payload(db, user: dict, user_id: str):
         "role": role,
         "companies": company_list,
         "redirect_url": "/dashboard",
-    })
+    }
+    if needs_password:
+        token_data["needs_password"] = True
+    token = create_access_token(data=token_data)
 
     return {
         "token": token,
@@ -172,10 +181,11 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
             "user_id": user_id,
             "name": f"{first_name} {last_name}".strip(),
             "email": email,
-            "redirect_url": redirect_url
+            "redirect_url": redirect_url,
+            "needs_password": True,
         })
 
-        response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/register")
+        response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/register?code={jwt_token}")
         _set_auth_cookies(response, jwt_token)
         return response
 
@@ -188,21 +198,25 @@ async def google_callback(request: Request, db: AsyncIOMotorDatabase = Depends(g
     user_id = str(user["_id"])
 
     if user.get("role") == "admin":
-        jwt_token = create_access_token(data={
+        token_data = {
             "sub": user_id,
             "user_id": user_id,
             "name":  f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
             "email": user["email"],
             "role": "admin"
-        })
+        }
+        if not user.get("hashed_password"):
+            token_data["needs_password"] = True
 
-        response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/login")
+        jwt_token = create_access_token(data=token_data)
+
+        response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/login?code={jwt_token}")
         _set_auth_cookies(response, jwt_token)
         return response
     
     payload = await build_membership_login_payload(db, user, user_id)
     callback_path = "login" if payload.get("user", {}).get("company_id") else "register"
-    response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/{callback_path}")
+    response = RedirectResponse(url=f"{FRONTEND_URL}/oauth/callback/{callback_path}?code={payload['token']}")
     _set_auth_cookies(response, payload["token"])
     return response
 
@@ -495,3 +509,26 @@ async def reset_password(
     )
 
     return {"message": "Password reset successful"}
+
+
+# /api/v1/auth/set-password — for Google OAuth users to set their first password
+class SetPasswordRequest(BaseModel):
+    password: str
+
+
+@router.post("/set-password")
+async def set_password(
+    request: SetPasswordRequest,
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if len(request.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    hashed_pw = get_password_hash(request.password)
+    await db["users"].update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {"hashed_password": hashed_pw}}
+    )
+
+    return {"message": "Password set successfully"}
