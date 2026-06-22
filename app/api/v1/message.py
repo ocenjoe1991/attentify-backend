@@ -846,6 +846,15 @@ def clean_json_response(response: str):
         raise ValueError(f"Invalid JSON response: {e}\nRaw text: {response}")
 
 
+def cacheable_order_info(order_info: dict, *, source: str = "ai") -> dict:
+    """Strip volatile fields before storing analysis results on the message."""
+    cached = dict(order_info or {})
+    cached.pop("shopify_order", None)
+    cached["analysis_source"] = source
+    cached["analyzed_at"] = datetime.now(timezone.utc)
+    return cached
+
+
 def serialize_order_action(action: dict) -> dict:
     serialized = dict(action)
     if serialized.get("created_at"):
@@ -1233,54 +1242,70 @@ async def analyze_email_message(
         # result is now a single dict, not a list
 
         if isinstance(result, dict) and result.get("error"):
-            await db["messages"].update_one(
-                {"_id": message_doc["_id"]},
-                {"$set": {"order_match_status": "unknown"}},
-            )
-            # Log the real error for debugging but return a clean message to the UI
-            logger.warning("AI analysis failed for message %s: %s", message_id, result["error"])
-            return {
+            order_info = {
                 "order_id": "",
                 "type": "",
                 "status": 0,
                 "msg": result["error"],
-                "shopify_order": {},
             }
+            await db["messages"].update_one(
+                {"_id": message_doc["_id"]},
+                {
+                    "$set": {
+                        "order_info": cacheable_order_info(order_info, source="ai_error"),
+                        "order_match_status": "unknown",
+                    }
+                },
+            )
+            # Log the real error for debugging but return a clean message to the UI
+            logger.warning("AI analysis failed for message %s: %s", message_id, result["error"])
+            order_info["shopify_order"] = {}
+            return order_info
         
         response = getattr(result, 'content', str(result))
         print("Email AI process response: ", response)
         try:
             order_info = clean_json_response(response)
         except ValueError as exc:
-            await db["messages"].update_one(
-                {"_id": message_doc["_id"]},
-                {"$set": {"order_match_status": "unknown"}},
-            )
-            return {
+            order_info = {
                 "order_id": "",
                 "type": "",
                 "status": 0,
                 "msg": str(exc),
-                "shopify_order": {},
             }
-
-        if (order_info.get('order_id')):
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {
                     "$set": {
-                        "order_info": order_info,
+                        "order_info": cacheable_order_info(order_info, source="parse_error"),
+                        "order_match_status": "unknown",
                     }
-                }
+                },
             )
+            order_info["shopify_order"] = {}
+            return order_info
+
+        await db["messages"].update_one(
+            {"_id": message_doc["_id"]},
+            {
+                "$set": {
+                    "order_info": cacheable_order_info(order_info),
+                }
+            }
+        )
     
     order_id = str(order_info.get("order_id", ""))
     if not order_id:
+        order_info["msg"] = order_info.get("msg") or "No order found in message"
         await db["messages"].update_one(
             {"_id": message_doc["_id"]},
-            {"$set": {"order_match_status": "not_order"}},
+            {
+                "$set": {
+                    "order_info": cacheable_order_info(order_info),
+                    "order_match_status": "not_order",
+                }
+            },
         )
-        order_info["msg"] = order_info.get("msg") or "No order found in message"
         order_info["shopify_order"] = {}
         return order_info
 
@@ -1305,6 +1330,7 @@ async def analyze_email_message(
                 {"_id": message_doc["_id"]},
                 {
                     "$set": {
+                        "order_info": cacheable_order_info(order_info),
                         "order_match_status": "matched",
                         "matched_order_id": str(db_order.get("order_id", "")),
                         "matched_order_name": db_order.get("name", ""),
@@ -1319,6 +1345,7 @@ async def analyze_email_message(
                 {"_id": message_doc["_id"]},
                 {
                     "$set": {
+                        "order_info": cacheable_order_info(order_info),
                         "order_match_status": "possible",
                         "matched_order_id": str(db_order.get("order_id", "")),
                         "matched_order_name": db_order.get("name", ""),
@@ -1331,7 +1358,12 @@ async def analyze_email_message(
         order_info["shopify_order"] = {}
         await db["messages"].update_one(
             {"_id": message_doc["_id"]},
-            {"$set": {"order_match_status": "unmatched"}},
+            {
+                "$set": {
+                    "order_info": cacheable_order_info(order_info),
+                    "order_match_status": "unmatched",
+                }
+            },
         )
 
     return order_info
