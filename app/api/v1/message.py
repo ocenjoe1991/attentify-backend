@@ -1237,6 +1237,8 @@ async def analyze_email_message(
                 {"_id": message_doc["_id"]},
                 {"$set": {"order_match_status": "unknown"}},
             )
+            # Log the real error for debugging but return a clean message to the UI
+            logger.warning("AI analysis failed for message %s: %s", message_id, result["error"])
             return {
                 "order_id": "",
                 "type": "",

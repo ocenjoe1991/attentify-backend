@@ -93,7 +93,13 @@ async def analyze_emails_with_ai(message: Dict[str, Any]):
         try:
             result =  await llm.ainvoke(prompt)
         except Exception as llm_exc:
-            return {"error": f"LLM invocation failed: {llm_exc}"}
+            error_str = str(llm_exc)
+            # Check for common API errors and return user-friendly messages
+            if "429" in error_str or "quota" in error_str.lower() or "rate" in error_str.lower():
+                return {"error": "AI service is temporarily unavailable (rate limit). Please try again later."}
+            if "401" in error_str or "403" in error_str or "api_key" in error_str.lower():
+                return {"error": "AI service configuration error. Please contact support."}
+            return {"error": "AI analysis could not be completed at this time."}
 
         return result
     except Exception as e:
