@@ -6,7 +6,7 @@ import httpx
 from app.services.gmail_service import fetch_all_gmail_accounts, get_gmail_service
 from app.services.deleted_gmail_service import record_deleted_gmail_messages
 from app.db.mongodb import get_database
-from app.models.message import Message, ChatEntry, PyObjectId 
+from app.models.message import Message, ChatEntry 
 from typing import List
 import re
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -103,43 +103,6 @@ def extract_name(email_str: str) -> str:
     match = re.match(r"^(.*?)\s*<", email_str)
     return match.group(1).strip() if match else email_str
 
-def doc_to_message(doc: dict) -> Message:
-    # Clean client
-    raw_client = doc.get("client", "")
-    cleaned_client = extract_name(raw_client)
-
-    return Message(
-        id=PyObjectId(doc['_id']),
-        client=cleaned_client,
-        agent=doc.get("agent"),
-        session_id=doc.get("session_id"),
-        started_at=doc.get("started_at"),
-        last_updated=doc.get("last_updated"),
-        status=normalize_status(doc.get("status", "Open")),
-        channel=doc.get("channel"),
-        title=doc.get("title"),
-        ai_summary=doc.get("ai_summary"),
-        tags=doc.get("tags", []),
-        resolved_by_ai=doc.get("resolved_by_ai", False),
-    )
-
-def doc_to_message_detail(doc: dict) -> Message:
-    return Message(
-        id=doc["_id"],
-        client=extract_name(doc.get("client", "")),
-        agent=doc.get("agent"),
-        session_id=doc.get("session_id"),
-        started_at=doc.get("started_at"),
-        last_updated=doc.get("last_updated"),
-        status=normalize_status(doc.get("status", "Open")),
-        channel=doc.get("channel"),
-        title=doc.get("title"),
-        ai_summary=doc.get("ai_summary"),
-        tags=doc.get("tags", []),
-        resolved_by_ai=doc.get("resolved_by_ai", False),
-        messages=[]  # or omit this line if optional in schema
-    )
-
 async def get_user_display_name(user: dict) -> str:
     name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
     return name or user.get("email", "Unknown user")
@@ -233,7 +196,17 @@ async def get_company_messages(
     # Base query depending on role
     query = {"company_id": ObjectId(company_id)}
     if role == "agent":
-        query["assigned_member_id"] = current_user["_id"]
+        # Agents can see tickets assigned to them AND unassigned tickets
+        query["$or"] = [
+            {"assigned_member_id": current_user["_id"]},
+            {
+                "$or": [
+                    {"assigned_member_id": {"$exists": False}},
+                    {"assigned_member_id": None},
+                    {"assigned_member_id": ""},
+                ]
+            },
+        ]
     elif role not in ["company_owner", "store_owner", "agent", "readonly"]:
         query["user_id"] = current_user["_id"]
 
@@ -457,8 +430,14 @@ async def ensure_message_access(
     role = membership.get("role")
     if action != "read" and role == "readonly":
         raise HTTPException(status_code=403, detail="Read-only users cannot modify messages")
-    if role == "agent" and message.get("assigned_member_id") != current_user["_id"]:
-        raise HTTPException(status_code=403, detail="Message is not assigned to this user")
+    if role == "agent":
+        assigned = message.get("assigned_member_id")
+        is_assigned_to_agent = assigned and str(assigned) == str(current_user["_id"])
+        is_unassigned = not assigned or assigned is None or assigned == ""
+        if not is_assigned_to_agent and not is_unassigned:
+            raise HTTPException(status_code=403, detail="Message is assigned to another agent")
+        if not is_assigned_to_agent and is_unassigned and action != "read":
+            raise HTTPException(status_code=403, detail="Only read access is allowed for unassigned messages")
     if role not in ["company_owner", "store_owner", "agent", "readonly"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 

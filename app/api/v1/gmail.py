@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Request, HTTPException, Response, Depends, Body
 from fastapi.responses import RedirectResponse
 from typing import List, Optional, Dict, Any
+import logging
 import httpx
 from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,8 @@ from app.models.message import Message, ChatEntry
 from app.utils.logger import logger
 from app.main import sio
 import re
+
+logger = logging.getLogger("attentify.gmail")
 
 router = APIRouter()
 
@@ -112,7 +115,6 @@ async def list_gmail_accounts(
         if account.get("store_id"):
             store = await db.shopify_cred.find_one({"_id": account["store_id"]})
             if store:
-                print(store)
                 account_data["store"] = {
                     "id": str(store["_id"]),
                     "shop": store.get("shop", "")
@@ -235,7 +237,7 @@ async def delete_gmail_account(
         service.users().stop(userId="me").execute()
     except Exception as e:
         # Don't block delete if Gmail stop fails
-        print(f"Failed to stop watch for {account['email']}: {e}")
+        logger.warning("Failed to stop watch for %s: %s", account['email'], e)
 
     # Step 2: Delete from DB
     result = await db.gmail_accounts.delete_one({"_id": ObjectId(account_id)})
@@ -516,7 +518,7 @@ async def google_oauth_callback(
                 ),
             )
         raise HTTPException(status_code=502, detail="Failed to start Gmail watch")
-    print(watch_response)
+    logger.debug("Gmail watch response: %s", watch_response)
 
     history_id = watch_response["historyId"]
 

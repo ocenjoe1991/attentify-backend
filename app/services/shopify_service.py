@@ -1,9 +1,12 @@
 import re
 import urllib.parse
+import logging
 import requests
 from datetime import datetime
 from pymongo import UpdateOne
 from bson import ObjectId
+
+logger = logging.getLogger("attentify.shopify_service")
 
 async def get_all_shopify_creds(db):
     """Fetch all Shopify store credentials from the database."""
@@ -85,7 +88,7 @@ async def upsert_orders(db, shop, orders):
 
     cred = await db.shopify_cred.find_one({"shop": shop})
     if not cred:
-        print(f"[!] Shopify credentials not found for shop: {shop}")
+        logger.warning("Shopify credentials not found for shop: %s", shop)
         user_id = None
         company_id = None
     else:

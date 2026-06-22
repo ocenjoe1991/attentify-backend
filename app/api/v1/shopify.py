@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request, HTTPException, Header, status, Backgroun
 from fastapi.responses import RedirectResponse, JSONResponse
 from urllib.parse import urlencode
 import hmac, hashlib, requests, base64
+import logging
 import os
 import re
 from typing import List, Dict
@@ -25,6 +26,8 @@ from app.core.permissions import (
 from app.core.audit import record_audit_log
 from app.utils.datetime_utils import to_utc_iso
 import httpx
+
+logger = logging.getLogger("attentify.shopify")
 
 router = APIRouter()
 
@@ -844,7 +847,7 @@ def decode_host_func(base64_host: str) -> str:
         decoded_bytes = base64.urlsafe_b64decode(padded)
         return decoded_bytes.decode("utf-8")
     except Exception as ex:
-        print(f"Error decoding Base64 host: {ex}")
+        logger.error("Error decoding Base64 host: %s", ex)
         return ""
     
 #/api/v1/shopify/orders
@@ -946,13 +949,13 @@ async def delete_shopify_cred(
         try:
             response = requests.delete(webhook_url, headers=headers)
             if response.status_code == 200:
-                print(f"[OK] Webhook {webhook_id} deleted successfully for {shop}")
+                logger.info("Webhook %s deleted successfully for %s", webhook_id, shop)
             elif response.status_code == 404:
-                print(f"[!] Webhook {webhook_id} not found in Shopify (may already be deleted).")
+                logger.warning("Webhook %s not found in Shopify for %s (may already be deleted)", webhook_id, shop)
             else:
-                print(f"[!] Webhook delete failed: {response.status_code} {response.text}")
+                logger.error("Webhook delete failed for %s: %s %s", shop, response.status_code, response.text)
         except requests.RequestException as e:
-            print(f"[!] Webhook delete exception: {e}")
+            logger.error("Webhook delete exception for %s: %s", shop, e)
 
     # Delete the credential document from MongoDB
     result = await db.shopify_cred.delete_one({"_id": ObjectId(shopify_id)})
@@ -991,16 +994,16 @@ def register_shopify_webhook(shop: str, access_token: str):
     try:
         response = requests.post(webhook_url, json=data, headers=headers)
     except requests.RequestException as e:
-        print(f"[!] Webhook request exception: {e}")
+        logger.error("Webhook request exception for %s: %s", shop, e)
         return None
 
     if response.status_code == 201:
         webhook = response.json().get("webhook", {})
         webhook_id = webhook.get("id")
-        print(f"[OK] Webhook registered for {shop} (ID: {webhook_id})")
+        logger.info("Webhook registered for %s (ID: %s)", shop, webhook_id)
         return webhook_id
     else:
-        print(f"[!] Webhook failed: {response.status_code} {response.text}")
+        logger.error("Webhook registration failed for %s: %s %s", shop, response.status_code, response.text)
         return None
 
 # Delete Shopify Webhook
@@ -1014,14 +1017,14 @@ def delete_shopify_webhook(shop: str, access_token: str, webhook_id: str):
     try:
         response = requests.delete(webhook_url, headers=headers)
     except requests.RequestException as e:
-        print(f"[!] Webhook delete exception: {e}")
+        logger.error("Webhook delete exception for %s: %s", shop, e)
         return False
 
     if response.status_code == 200:
-        print(f"[OK] Webhook {webhook_id} deleted successfully for {shop}")
+        logger.info("Webhook %s deleted successfully for %s", webhook_id, shop)
         return True
     else:
-        print(f"[!] Webhook delete failed: {response.status_code} {response.text}")
+        logger.error("Webhook delete failed for %s: %s %s", shop, response.status_code, response.text)
         return False
     
 @router.post("/webhook/orders_create")
@@ -1041,22 +1044,19 @@ async def shopify_orders_create_webhook(
                 hashlib.sha256
             ).digest()
         ).decode()
-        print(f"[OK] x_shopify_hmac_sha256: {x_shopify_hmac_sha256}")
-        print(f"[OK] Computed HMAC: {computed_hmac}")
         # Shopify sends the HMAC header as base64 (case-insensitive)
         if not hmac.compare_digest(computed_hmac, x_shopify_hmac_sha256):
-            print("[!] Invalid HMAC received")
+            logger.warning("Invalid HMAC received from shop: %s", x_shopify_shop_domain)
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid HMAC")
         
         data = json.loads(raw_body)
-        print(f"[OK] x_shopify_shop_domain: {x_shopify_shop_domain}")
 
-        db = await get_database()
+        db = request.app.state.db
         user_id, company_id = None, None
 
         cred = await db.shopify_cred.find_one({"shop": x_shopify_shop_domain})
         if not cred:
-            print(f"[!] Shopify credentials not found for shop: {x_shopify_shop_domain}")
+            logger.warning("Shopify credentials not found for shop: %s", x_shopify_shop_domain)
             user_id = None
             company_id = None
         else:
@@ -1114,14 +1114,13 @@ async def shopify_orders_create_webhook(
 
         
         # async Motor: must await db operations
-        print(f"[OK] Inserting/updating order: {order_document['order_id']} in shop: {order_document['shop']}")
         if not await db.orders.find_one({"order_id": order_document["order_id"]}):
-            print(f"[OK] Order {order_document['order_id']} not found, inserting new document.")
+            logger.info("Order %s not found in %s, inserting new document", order_document['order_id'], order_document['shop'])
             await db.orders.insert_one(order_document)
 
         return {"success": True}
     except Exception as e:
-        print(f"[!] Error processing webhook: {str(e)}")
+        logger.error("Error processing webhook: %s", e)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Webhook processing failed: {str(e)}")
     
 # Endpoint: Get all orders (for all stores)
@@ -1259,7 +1258,7 @@ async def sync_all_stores_orders():
             orders = await fetch_orders_from_shop(shop, access_token)
             await upsert_orders(db, shop, orders)
         except Exception as e:
-            print(f"Error syncing {shop}: {e}")
+            logger.error("Error syncing %s: %s", shop, e)
 
 
 async def sync_company_orders(company_id: ObjectId):
@@ -1274,7 +1273,7 @@ async def sync_company_orders(company_id: ObjectId):
             orders = await fetch_orders_from_shop(shop, access_token)
             await upsert_orders(db, shop, orders)
         except Exception as e:
-            print(f"Error syncing {shop}: {e}")
+            logger.error("Error syncing %s: %s", shop, e)
 
 
 @router.get("/approval-requests")
@@ -1513,10 +1512,8 @@ async def refund_order(
             json=calculate_payload,
         )
 
-    print("Calculate Status:", calc_response.status_code)
-    print("Calculate Body:", calc_response.text)
-
     if calc_response.status_code >= 400:
+        logger.error("Calculate refund failed: %s %s", calc_response.status_code, calc_response.text)
         return JSONResponse(status_code=calc_response.status_code, content=calc_response.json())
 
     calc_refund = calc_response.json()["refund"]
@@ -1562,10 +1559,8 @@ async def refund_order(
             json=final_payload,
         )
 
-    print("Refund Status:", refund_response.status_code)
-    print("Refund Body:", refund_response.text)
-
     if refund_response.status_code >= 400:
+        logger.error("Refund failed: %s %s", refund_response.status_code, refund_response.text)
         return JSONResponse(status_code=refund_response.status_code, content=refund_response.json())
 
     now = datetime.utcnow()

@@ -1,16 +1,7 @@
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
-import certifi
+from fastapi import Request
+from motor.motor_asyncio import AsyncIOMotorDatabase
 
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017").strip()
-DB_NAME = os.getenv("DB_NAME", "attentify").strip()
 
-mongo_options = {}
-if MONGO_URL.startswith("mongodb+srv://"):
-    mongo_options["tlsCAFile"] = certifi.where()
-
-client = AsyncIOMotorClient(MONGO_URL, **mongo_options)
-db = client[DB_NAME]
-
-async def get_database():
-    return db
+async def get_database(request: Request) -> AsyncIOMotorDatabase:
+    """Dependency that returns the database instance from the app's lifespan state."""
+    return request.app.state.db

@@ -13,9 +13,14 @@ from googleapiclient.discovery import build
 from app.core.config import settings
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 
+logger = logging.getLogger("attentify")
+
 import socketio
+from socketio.exceptions import ConnectionRefusedError
+from bson import ObjectId
 from google.cloud import pubsub_v1
 from google.oauth2 import service_account
 
@@ -88,22 +93,46 @@ def ensure_pubsub_subscription():
     return subscription_path
 
 async def set_gmail_watches_periodically():
-    while True:
-        print("Setting up Gmail Watches...")
-        try:
-            loop = asyncio.get_running_loop()
-            subscription_path = await loop.run_in_executor(None, ensure_pubsub_subscription)
-            print(f"Pub/Sub subscription ready: {subscription_path}")
-        except Exception as e:
-            print(f"Failed to ensure Pub/Sub subscription: {e}")
+    """Periodically renew Gmail watch subscriptions with retry logic."""
+    import logging
+    logger = logging.getLogger("gmail_watch")
 
+    retry_delay = 300  # 5 minutes initial retry if PubSub setup fails
+    max_retry_delay = 3600  # max 1 hour between retries
+
+    while True:
+        logger.info("Setting up Gmail Watches...")
+        pubsub_ok = False
+
+        # Retry Pub/Sub subscription setup with exponential backoff
+        for attempt in range(3):
+            try:
+                loop = asyncio.get_running_loop()
+                subscription_path = await loop.run_in_executor(None, ensure_pubsub_subscription)
+                logger.info(f"Pub/Sub subscription ready: {subscription_path}")
+                pubsub_ok = True
+                retry_delay = 300  # reset retry delay on success
+                break
+            except Exception as e:
+                logger.error(f"Pub/Sub setup attempt {attempt + 1}/3 failed: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(min(retry_delay * (2 ** attempt), max_retry_delay))
+
+        if not pubsub_ok:
+            logger.error("Pub/Sub subscription failed after 3 attempts, will retry in %s seconds", retry_delay)
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
+            continue
+
+        # Set watches for all Gmail accounts
         db = app.state.db
+        success_count = 0
+        fail_count = 0
         cursor = db["gmail_accounts"].find()
         async for cred in cursor:
             try:
                 loop = asyncio.get_running_loop()
                 response = await loop.run_in_executor(None, set_gmail_watch, cred)
-                print(response)
                 update_data = {
                     "status": "connected",
                     "watch_expiration": response.get("expiration"),
@@ -115,14 +144,20 @@ async def set_gmail_watches_periodically():
                     {"_id": cred["_id"]},
                     {"$set": update_data, "$unset": {"last_error": ""}},
                 )
+                success_count += 1
             except Exception as e:
-                print(f"Failed to set Gmail watch for {cred.get('email')}: {e}")
+                logger.error(f"Failed to set Gmail watch for {cred.get('email')}: {e}")
                 await db["gmail_accounts"].update_one(
                     {"_id": cred["_id"]},
                     {"$set": {"last_error": f"Failed to renew Gmail watch: {e}"}},
                 )
-            
-        await asyncio.sleep(24 * 3600)
+                fail_count += 1
+
+        logger.info("Gmail watch renewal complete: %d succeeded, %d failed", success_count, fail_count)
+
+        # If all watches failed, retry sooner; otherwise wait 24 hours
+        sleep_duration = 3600 if fail_count > 0 and success_count == 0 else 24 * 3600
+        await asyncio.sleep(sleep_duration)
 
 async def ensure_database_indexes(db):
     await db["orders"].create_index([("company_id", 1), ("created_at", -1)])
@@ -157,19 +192,19 @@ async def lifespan(app: FastAPI):
         mongo_client = AsyncIOMotorClient(MONGO_URL, **mongo_options)
         # Try to ping the server to check connection
         await mongo_client.admin.command("ping")
-        print("Connected to MongoDB")
+        logger.info("Connected to MongoDB")
         app.state.mongo_client = mongo_client
         app.state.db = mongo_client[DB_NAME]
         await ensure_database_indexes(app.state.db)
     except Exception as e:
-        print("Failed to connect to MongoDB:", e)
-        raise e  # Optional: prevent app from starting if DB fails
+        logger.critical("Failed to connect to MongoDB: %s", e)
+        raise e
 
     asyncio.create_task(set_gmail_watches_periodically())
 
     yield  # App runs
 
-    print("Closing MongoDB connection")
+    logger.info("Closing MongoDB connection")
     mongo_client.close()
 
 app = FastAPI(title="Attentify APP", lifespan=lifespan)
@@ -185,7 +220,7 @@ async def pingtest():
 async def pingtest_head():
     return Response(status_code=200)
 
-app.add_middleware(SessionMiddleware, secret_key="supersecret")
+app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY)
 # CORS setup
 app.add_middleware(
     CORSMiddleware,
@@ -195,19 +230,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Example event
+# Socket.IO authentication and events
 @sio.event
-async def connect(sid, environ):
-    print("Client connected:", sid)
+async def connect(sid, environ, auth):
+    """Authenticate socket connection using JWT token."""
+    if not auth or not isinstance(auth, dict):
+        raise ConnectionRefusedError("Authentication required")
+
+    token = auth.get("token")
+    if not token:
+        raise ConnectionRefusedError("Authentication token required")
+
+    try:
+        from jose import jwt as jose_jwt, JWTError as JOSEJWTError
+        payload = jose_jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        user_id = payload.get("user_id")
+        if not user_id:
+            raise ConnectionRefusedError("Invalid token payload")
+
+        # Optionally verify user exists in DB
+        db = app.state.db
+        user = await db.users.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise ConnectionRefusedError("User not found")
+
+        # Store user info in session for later use
+        async with sio.session(sid) as session:
+            session["user_id"] = user_id
+            session["email"] = user.get("email", "")
+            session["name"] = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+
+        logger.info("Authenticated client connected: %s (user: %s)", sid, user.get("email"))
+
+    except ConnectionRefusedError:
+        raise
+    except JOSEJWTError:
+        raise ConnectionRefusedError("Invalid or expired token")
+    except Exception as e:
+        logger.error("Socket auth error: %s", e)
+        raise ConnectionRefusedError("Authentication failed")
 
 @sio.event
 async def disconnect(sid):
-    print("Client disconnected:", sid)
+    logger.info("Client disconnected: %s", sid)
 
 # Custom event
 @sio.event
 async def ping_from_client(sid, data):
-    print("Received:", data)
+    logger.debug("Socket ping received: %s", data)
     await sio.emit("pong_from_server", {"msg": "pong!"}, to=sid)
 
 # Routers
