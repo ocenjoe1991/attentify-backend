@@ -125,11 +125,11 @@ async def set_gmail_watches_periodically():
             retry_delay = min(retry_delay * 2, max_retry_delay)
             continue
 
-        # Set watches for all Gmail accounts
+        # Set watches for all CONNECTED Gmail accounts only
         db = app.state.db
         success_count = 0
         fail_count = 0
-        cursor = db["gmail_accounts"].find()
+        cursor = db["gmail_accounts"].find({"status": {"$ne": "disconnected"}})
         async for cred in cursor:
             try:
                 loop = asyncio.get_running_loop()

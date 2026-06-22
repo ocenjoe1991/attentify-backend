@@ -117,12 +117,12 @@ async def list_gmail_accounts(
     
     role = membership.get("role")
 
-    if role == "company_owner":
+    if role in ("company_owner", "store_owner", "agent"):
         accounts_cursor = db.gmail_accounts.find({"company_id": ObjectId(company_id)})
-    elif role == "store_owner":
+    elif role == "readonly":
+        accounts_cursor = db.gmail_accounts.find({"company_id": ObjectId(company_id)})
+    else:
         accounts_cursor = db.gmail_accounts.find({"user_id": current_user["_id"]})
-    else:  # agent and fallback
-        accounts_cursor = db.gmail_accounts.find({"company_id": ObjectId(company_id)})
     
     accounts = []
     async for account in accounts_cursor:
