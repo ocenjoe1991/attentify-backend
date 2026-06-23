@@ -1,5 +1,6 @@
 import base64
-from datetime import datetime, timezone, timezone
+import asyncio
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -361,6 +362,8 @@ async def fetch_and_save_gmail(
                     "resolved_by_ai": False
                 }
                 await db["messages"].insert_one(message_doc)
+                # Trigger AI analysis in background for new email messages
+                asyncio.create_task(_auto_analyze_message(db, message_doc["_id"]))
             stored_count += 1
 
         try:
@@ -459,3 +462,33 @@ def get_gmail_service(user_credentials: dict):
 
     service = build('gmail', 'v1', credentials=creds)
     return service
+
+
+async def _auto_analyze_message(db, message_id):
+    """Background task: auto-analyze a new email message with Gemini and save order_info."""
+    import logging
+    _logger = logging.getLogger("attentify.gmail.auto_analyze")
+    try:
+        from app.services.ai_service import analyze_emails_with_ai
+        from app.api.v1.message import cacheable_order_info
+
+        doc = await db["messages"].find_one({"_id": message_id})
+        if not doc or doc.get("order_info"):
+            return  # Already analyzed or message deleted
+
+        result = await analyze_emails_with_ai(doc)
+        if isinstance(result, dict) and result.get("error"):
+            _logger.info("Auto-analyze failed for %s: %s", str(message_id), result["error"][:200])
+            return
+
+        response = getattr(result, 'content', str(result))
+        import json as _json
+        order_info = _json.loads(response.strip().removeprefix("```json").removesuffix("```").strip())
+
+        await db["messages"].update_one(
+            {"_id": message_id},
+            {"$set": {"order_info": cacheable_order_info(order_info)}}
+        )
+        _logger.info("Auto-analyze saved for %s: order_id=%s", str(message_id), order_info.get("order_id", ""))
+    except Exception as e:
+        _logger.warning("Auto-analyze error for %s: %s", str(message_id), str(e)[:300])
