@@ -1267,7 +1267,22 @@ async def analyze_email_message(
     has_messages = bool(message_doc.get("messages"))
     logger.info("[ANALYZE] message_id=%s has_messages=%s has_order_info=%s", message_id, has_messages, bool(message_doc.get("order_info")))
 
-    if not (order_info := message_doc.get('order_info')):
+    # Only skip analysis if order_info has a valid order_id (not a failed/empty one)
+    order_info = message_doc.get('order_info')
+    if order_info and order_info.get("order_id"):
+        await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
+        logger.info(
+            "Order analysis skipped; cached order_info found",
+            extra={
+                "message_id": message_id,
+                "company_id": str(message_doc.get("company_id", "")),
+                "ticket": message_doc.get("ticket", ""),
+                "actor_email": current_user.get("email", ""),
+                "order_id": str(order_info.get("order_id", "")),
+            },
+        )
+    else:
+        # No valid order_info — run AI analysis
         logger.info(
             "Order analysis started",
             extra={
@@ -1294,11 +1309,12 @@ async def analyze_email_message(
                 "status": 0,
                 "msg": error_message,
             }
+            # Only save order_match_status on failure - do NOT save order_info
+            # so that retry can happen on next load
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {
                     "$set": {
-                        "order_info": cacheable_order_info(order_info, source="ai_error"),
                         "order_match_status": "unknown",
                     }
                 },
@@ -1334,11 +1350,11 @@ async def analyze_email_message(
                 "status": 0,
                 "msg": error_message,
             }
+            # Don't save failed order_info - allow retry on next load
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {
                     "$set": {
-                        "order_info": cacheable_order_info(order_info, source="parse_error"),
                         "order_match_status": "unknown",
                     }
                 },
@@ -1374,18 +1390,6 @@ async def analyze_email_message(
         await update_message_analysis_state(db, message_doc["_id"], state="success", source="gemini")
         logger.info(
             "Order analysis stored",
-            extra={
-                "message_id": message_id,
-                "company_id": str(message_doc.get("company_id", "")),
-                "ticket": message_doc.get("ticket", ""),
-                "actor_email": current_user.get("email", ""),
-                "order_id": str(order_info.get("order_id", "")),
-            },
-        )
-    else:
-        await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
-        logger.info(
-            "Order analysis skipped; cached order_info found",
             extra={
                 "message_id": message_id,
                 "company_id": str(message_doc.get("company_id", "")),
