@@ -478,7 +478,13 @@ async def _auto_analyze_message(db, message_id):
 
         result = await analyze_emails_with_ai(doc)
         if isinstance(result, dict) and result.get("error"):
-            _logger.info("Auto-analyze failed for %s: %s", str(message_id), result["error"][:200])
+            error_code = result.get("error", "UNKNOWN")
+            error_reason = result.get("reason", "")
+            error_model = result.get("model", "")
+            _logger.warning(
+                "[AUTO-ANALYZE FAIL] msg=%s code=%s reason=%s model=%s",
+                str(message_id), error_code, error_reason[:200], error_model
+            )
             return
 
         response = getattr(result, 'content', str(result))

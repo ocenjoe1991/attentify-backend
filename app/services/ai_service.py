@@ -39,6 +39,17 @@ prompt_template = PromptTemplate(
     template=EMAIL_ANALYSIS_PROMPT
 )
 
+
+def _get_user_friendly_error(error_text: str) -> str:
+    """Return a user-safe error message based on the raw API error."""
+    if "429" in error_text or "quota" in error_text.lower() or "rate" in error_text.lower():
+        return "AI service is temporarily unavailable (rate limit). Please try again later."
+    if "401" in error_text or "403" in error_text:
+        return "AI service configuration error. Please contact support."
+    if "api_key" in error_text.lower():
+        return "AI service configuration error. Please contact support."
+    return "AI analysis could not be completed at this time."
+
 async def analyze_emails_with_ai_as_list(message: Dict[str, Any]):
     """
     Args:
@@ -97,12 +108,35 @@ async def analyze_emails_with_ai(message: Dict[str, Any]):
             result =  await llm.ainvoke(prompt)
         except Exception as llm_exc:
             error_str = str(llm_exc)
-            # Check for common API errors and return user-friendly messages
-            if "429" in error_str or "quota" in error_str.lower() or "rate" in error_str.lower():
-                return {"error": "AI service is temporarily unavailable (rate limit). Please try again later."}
-            if "401" in error_str or "403" in error_str or "api_key" in error_str.lower():
-                return {"error": "AI service configuration error. Please contact support."}
-            return {"error": "AI analysis could not be completed at this time."}
+            # Extract key details for logging
+            error_detail = {
+                "error": "AI service error",
+                "raw_error": error_str[:500],
+            }
+            if "429" in error_str:
+                error_detail["error"] = "AI_RATE_LIMIT"
+                error_detail["reason"] = "Gemini API quota exceeded (429)"
+                # Extract retry delay if available
+                import re as _re
+                retry_match = _re.search(r'retry in (\d+\.?\d*)s', error_str)
+                if retry_match:
+                    error_detail["retry_after_seconds"] = float(retry_match.group(1))
+                # Extract model name
+                model_match = _re.search(r'model:\s*(\S+)', error_str)
+                if model_match:
+                    error_detail["model"] = model_match.group(1)
+            elif "401" in error_str or "403" in error_str:
+                error_detail["error"] = "AI_AUTH_ERROR"
+                error_detail["reason"] = "Invalid or expired API key"
+            elif "api_key" in error_str.lower():
+                error_detail["error"] = "AI_AUTH_ERROR"
+                error_detail["reason"] = "API key not configured"
+            else:
+                error_detail["error"] = "AI_UNKNOWN_ERROR"
+                error_detail["reason"] = error_str[:200]
+            # Still return user-friendly message for UI
+            error_detail["msg"] = _get_user_friendly_error(error_str)
+            return error_detail
 
         return result
     except Exception as e:

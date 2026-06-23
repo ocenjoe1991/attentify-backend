@@ -1282,7 +1282,12 @@ async def analyze_email_message(
         # result is now a single dict, not a list
 
         if isinstance(result, dict) and result.get("error"):
-            error_message = str(result["error"])
+            error_message = str(result.get("msg", result.get("error", "Unknown AI error")))
+            error_detail = result.get("error", "UNKNOWN")
+            error_reason = result.get("reason", "")
+            error_model = result.get("model", "")
+            error_retry = result.get("retry_after_seconds", "")
+
             order_info = {
                 "order_id": "",
                 "type": "",
@@ -1305,16 +1310,14 @@ async def analyze_email_message(
                 source="gemini",
                 error=error_message,
             )
-            # Log the real error for debugging but return a clean message to the UI
             logger.warning(
-                "Order analysis failed",
-                extra={
-                    "message_id": message_id,
-                    "company_id": str(message_doc.get("company_id", "")),
-                    "ticket": message_doc.get("ticket", ""),
-                    "actor_email": current_user.get("email", ""),
-                    "error": error_message[:500],
-                },
+                "[ANALYZE FAIL] message_id=%s code=%s reason=%s model=%s retry_after=%s msg=%s",
+                message_id,
+                error_detail,
+                error_reason,
+                error_model,
+                error_retry,
+                error_message[:200],
             )
             order_info["shopify_order"] = {}
             return order_info
