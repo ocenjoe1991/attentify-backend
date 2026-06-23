@@ -1,4 +1,5 @@
 import os
+import asyncio
 import logging
 from langchain_core.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -32,19 +33,27 @@ async def _try_invoke(prompt, model_name: str):
 
 
 async def invoke_with_fallback(prompt):
-    """Try each model in MODEL_CHAIN until one succeeds."""
+    """Try each model in MODEL_CHAIN. On rate-limit, wait then retry same model."""
     last_error = None
     for model_name in MODEL_CHAIN:
-        try:
-            _logger.info("Trying model: %s", model_name)
-            return await _try_invoke(prompt, model_name)
-        except Exception as e:
-            error_str = str(e)
-            _logger.warning("Model %s failed: %s", model_name, error_str[:150])
-            last_error = e
-            # 404 = model not found, skip to next immediately
-            # 429 = rate limited, still try next
-            continue
+        for attempt in range(2):  # 2 attempts per model
+            try:
+                _logger.info("Trying model: %s (attempt %d)", model_name, attempt + 1)
+                return await _try_invoke(prompt, model_name)
+            except Exception as e:
+                error_str = str(e)
+                is_rate_limit = "429" in error_str
+                _logger.warning("Model %s attempt %d failed: %s", model_name, attempt + 1, error_str[:120])
+                last_error = e
+                if is_rate_limit and attempt == 0:
+                    # Wait before retrying same model
+                    import re
+                    match = re.search(r"retry in (\d+\.?\d*)s", error_str)
+                    wait = float(match.group(1)) if match else 30
+                    _logger.info("Rate limited, waiting %.0fs before retry...", wait)
+                    await asyncio.sleep(wait)
+                    continue
+                break  # Not rate limit or already retried, try next model
     raise last_error
 
 EMAIL_ANALYSIS_PROMPT = (
