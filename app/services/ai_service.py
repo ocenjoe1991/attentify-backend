@@ -1,60 +1,58 @@
 import os
-import asyncio
 import logging
 from langchain_core.prompts import PromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
 from typing import List, Dict, Any
 import base64
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    raise RuntimeError("GOOGLE_API_KEY environment variable is not set")
-
-# Models to try in order (first success wins)
-MODEL_CHAIN = [
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-]
-
 _logger = logging.getLogger("attentify.ai")
 
+# Try Gemini first, fall back to Groq (both have free tiers)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-async def _try_invoke(prompt, model_name: str):
-    """Try invoking a specific Gemini model. Returns result or raises."""
-    llm = ChatGoogleGenerativeAI(
-        model=model_name,
-        google_api_key=GOOGLE_API_KEY,
-        temperature=0,
-        max_tokens=256,
-        timeout=60,
-        max_retries=1,
-    )
-    return await llm.ainvoke(prompt)
+if not GOOGLE_API_KEY and not GROQ_API_KEY:
+    raise RuntimeError("Either GOOGLE_API_KEY or GROQ_API_KEY must be set")
 
 
 async def invoke_with_fallback(prompt):
-    """Try each model in MODEL_CHAIN. On rate-limit, wait then retry same model."""
-    last_error = None
-    for model_name in MODEL_CHAIN:
-        for attempt in range(2):  # 2 attempts per model
-            try:
-                _logger.info("Trying model: %s (attempt %d)", model_name, attempt + 1)
-                return await _try_invoke(prompt, model_name)
-            except Exception as e:
-                error_str = str(e)
-                is_rate_limit = "429" in error_str
-                _logger.warning("Model %s attempt %d failed: %s", model_name, attempt + 1, error_str[:120])
-                last_error = e
-                if is_rate_limit and attempt == 0:
-                    # Wait before retrying same model
-                    import re
-                    match = re.search(r"retry in (\d+\.?\d*)s", error_str)
-                    wait = float(match.group(1)) if match else 30
-                    _logger.info("Rate limited, waiting %.0fs before retry...", wait)
-                    await asyncio.sleep(wait)
-                    continue
-                break  # Not rate limit or already retried, try next model
-    raise last_error
+    """Try Gemini models, then Groq as fallback."""
+
+    # ---- Try Gemini models ----
+    if GOOGLE_API_KEY:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        for model_name in ["gemini-2.0-flash-lite", "gemini-2.0-flash"]:
+            for attempt in range(2):
+                try:
+                    _logger.info("Gemini %s (attempt %d)", model_name, attempt + 1)
+                    llm = ChatGoogleGenerativeAI(
+                        model=model_name, google_api_key=GOOGLE_API_KEY,
+                        temperature=0, max_tokens=256, timeout=60, max_retries=1,
+                    )
+                    return await llm.ainvoke(prompt)
+                except Exception as e:
+                    err = str(e)
+                    _logger.warning("Gemini %s failed: %s", model_name, err[:120])
+                    if "429" in err and attempt == 0:
+                        import re
+                        m = re.search(r"retry in (\d+\.?\d*)s", err)
+                        wait = float(m.group(1)) if m else 30
+                        _logger.info("Waiting %.0fs...", wait)
+                        import asyncio
+                        await asyncio.sleep(wait)
+                        continue
+                    break
+
+    # ---- Fallback: Groq (free tier, faster) ----
+    if GROQ_API_KEY:
+        from langchain_groq import ChatGroq
+        _logger.info("Trying Groq (llama3-8b)")
+        llm = ChatGroq(
+            model="llama3-8b-8192", api_key=GROQ_API_KEY,
+            temperature=0, max_tokens=256, timeout=60, max_retries=2,
+        )
+        return await llm.ainvoke(prompt)
+
+    raise RuntimeError("All AI models failed. Check API keys.")
 
 EMAIL_ANALYSIS_PROMPT = (
     "You are a very talented order email analysis assistant."
