@@ -1320,7 +1320,7 @@ async def analyze_email_message(
             return order_info
         
         response = getattr(result, 'content', str(result))
-        print("Email AI process response: ", response)
+        logger.debug("Email AI process response: %s", str(response)[:200])
         try:
             order_info = clean_json_response(response)
         except ValueError as exc:

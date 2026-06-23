@@ -470,7 +470,7 @@ async def _auto_analyze_message(db, message_id):
     _logger = logging.getLogger("attentify.gmail.auto_analyze")
     try:
         from app.services.ai_service import analyze_emails_with_ai
-        from app.api.v1.message import cacheable_order_info
+        from app.api.v1.message import cacheable_order_info, clean_json_response
 
         doc = await db["messages"].find_one({"_id": message_id})
         if not doc or doc.get("order_info"):
@@ -482,8 +482,7 @@ async def _auto_analyze_message(db, message_id):
             return
 
         response = getattr(result, 'content', str(result))
-        import json as _json
-        order_info = _json.loads(response.strip().removeprefix("```json").removesuffix("```").strip())
+        order_info = clean_json_response(response)
 
         await db["messages"].update_one(
             {"_id": message_id},
