@@ -1,8 +1,8 @@
 import os
+import re
 import logging
 from langchain_core.prompts import PromptTemplate
 from typing import List, Dict, Any
-import base64
 
 _logger = logging.getLogger("attentify.ai")
 
@@ -40,7 +40,7 @@ async def invoke_with_fallback(prompt):
     # ---- Groq (free, fast, reliable) ----
     if GROQ_API_KEY:
         from langchain_groq import ChatGroq
-        _logger.info("Using Groq (llama3-8b)")
+        _logger.info("Using Groq (llama-3.1-8b-instant)")
         llm = ChatGroq(
             model="llama-3.1-8b-instant", api_key=GROQ_API_KEY,
             temperature=0, max_tokens=256, timeout=60, max_retries=2,
@@ -50,17 +50,9 @@ async def invoke_with_fallback(prompt):
     raise RuntimeError("All AI models failed. Check API keys.")
 
 EMAIL_ANALYSIS_PROMPT = (
-    "You are a very talented order email analysis assistant."
-    "The following text is an order, cancellation, or refund email encoded in Base64 from a Shopify customer. "
-    "You must analyze BOTH the email title and the decoded email content to determine the order_id and request type. "
-    "Check if the order_id field exists and is valid based on either the title, the content, or both.\n\n"
-    "Common order id format is #CA0000 or #NZ0000, you should extrach correct order id as it is in email, not make new order. "
-    "If the email is correct, output ONLY a valid JSON object (no markdown, no backticks, no explanations). "
-    "The JSON must include these fields: order_id, type (either 'cancel' or 'refund'), status (1 if correct, otherwise 0), and msg. "
-    "If the email is incorrect or missing an order ID, status must be 0 and msg should be a message requesting the order ID. "
-    "If the email is correct, status must be 1 and msg should be an appropriate reply to the customer such as "
-    "'Your order has been canceled.' or 'Your refund has been processed.'\n\n"
-    "Analyze the following email:\n"
+    "Extract order information from this customer email.\n"
+    "Output ONLY a valid JSON object (no markdown, no backticks).\n"
+    "Fields: order_id (e.g. #CA0001), type (cancel/refund), status (1=found, 0=not found), msg (reply to customer).\n\n"
     "Title: {email_title}\n"
     "Content: {email_contents}"
 )
@@ -75,6 +67,8 @@ def _get_user_friendly_error(error_text: str) -> str:
     """Return a user-safe error message based on the raw API error."""
     if "429" in error_text or "quota" in error_text.lower() or "rate" in error_text.lower():
         return "AI service is temporarily unavailable (rate limit). Please try again later."
+    if "413" in error_text or "too large" in error_text.lower():
+        return "Email content is too large for analysis. Please try again later."
     if "401" in error_text or "403" in error_text:
         return "AI service configuration error. Please contact support."
     if "api_key" in error_text.lower():
@@ -106,6 +100,14 @@ async def analyze_emails_with_ai_as_list(message: Dict[str, Any]):
         })
     return results
 
+def _strip_html(text: str) -> str:
+    """Remove HTML tags, decode entities, collapse whitespace."""
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'&[a-z]+;', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
 async def analyze_emails_with_ai(message: Dict[str, Any]):
     """
     Args:
@@ -122,17 +124,17 @@ async def analyze_emails_with_ai(message: Dict[str, Any]):
         # Get the last 3 entries (or fewer if not enough)
         # last_entries = entries[-3:]
         try:
-            combined_content = "\n\n".join(entry.get("content", "") for entry in entries)
+            combined_content = "\n".join(
+                _strip_html(entry.get("content", "")) for entry in entries
+            )
+            # Keep first 3000 chars of plain text (enough for order ID extraction)
+            if len(combined_content) > 3000:
+                combined_content = combined_content[:3000]
         except Exception as content_exc:
             return {"error": f"Failed to combine message contents: {content_exc}"}
 
         try:
-            encoded_content = base64.b64encode(combined_content.encode("utf-8")).decode("utf-8")
-        except Exception as encode_exc:
-            return {"error": f"Failed to encode contents: {encode_exc}"}
-        
-        try:
-            prompt = prompt_template.format(email_title=title ,email_contents=encoded_content)
+            prompt = prompt_template.format(email_title=title, email_contents=combined_content)
         except Exception as prompt_exc:
             return {"error": f"Failed to format prompt: {prompt_exc}"}
         try:
