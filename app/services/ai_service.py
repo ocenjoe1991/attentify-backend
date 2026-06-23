@@ -50,11 +50,11 @@ async def invoke_with_fallback(prompt):
     raise RuntimeError("All AI models failed. Check API keys.")
 
 EMAIL_ANALYSIS_PROMPT = (
-    "Extract order information from this customer email.\n"
-    "Output ONLY a valid JSON object (no markdown, no backticks).\n"
-    "Fields: order_id (e.g. #CA0001), type (cancel/refund), status (1=found, 0=not found), msg (reply to customer).\n\n"
-    "Title: {email_title}\n"
-    "Content: {email_contents}"
+    "Task: Extract order ID from this email. Reply with ONLY a JSON object, nothing else.\n"
+    "Format: {{\"order_id\":\"#...\",\"type\":\"refund or cancel\",\"status\":1 or 0,\"msg\":\"reply\"}}\n"
+    "If no order found: {{\"order_id\":\"\",\"type\":\"\",\"status\":0,\"msg\":\"Please provide your order number.\"}}\n\n"
+    "Email title: {email_title}\n"
+    "Email content: {email_contents}"
 )
 
 prompt_template = PromptTemplate(

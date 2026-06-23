@@ -827,10 +827,10 @@ async def update_message_field(
 def clean_json_response(response: str):
     """
     Cleans a model-generated JSON response by removing code fences and extra text.
-    Returns a parsed Python dict.
+    Returns a parsed Python dict, or a default 'no order' dict if parsing fails.
     """
     if not response:
-        return {}
+        return {"order_id": "", "type": "", "status": 0, "msg": "No order found in message"}
 
     # Remove common Markdown code fences like ```json ... ```
     cleaned = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", response.strip())
@@ -842,8 +842,11 @@ def clean_json_response(response: str):
 
     try:
         return json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON response: {e}\nRaw text: {response}")
+    except json.JSONDecodeError:
+        # AI returned non-JSON text (e.g. "I don't see any order...")
+        # Return a clean default instead of crashing
+        logger.warning("AI response was not valid JSON: %s", response[:200])
+        return {"order_id": "", "type": "", "status": 0, "msg": "No order found in message"}
 
 
 def cacheable_order_info(order_info: dict, *, source: str = "ai") -> dict:
@@ -1340,44 +1343,7 @@ async def analyze_email_message(
         
         response = getattr(result, 'content', str(result))
         logger.debug("Email AI process response: %s", str(response)[:200])
-        try:
-            order_info = clean_json_response(response)
-        except ValueError as exc:
-            error_message = str(exc)
-            order_info = {
-                "order_id": "",
-                "type": "",
-                "status": 0,
-                "msg": error_message,
-            }
-            # Don't save failed order_info - allow retry on next load
-            await db["messages"].update_one(
-                {"_id": message_doc["_id"]},
-                {
-                    "$set": {
-                        "order_match_status": "unknown",
-                    }
-                },
-            )
-            await update_message_analysis_state(
-                db,
-                message_doc["_id"],
-                state="failed",
-                source="parse",
-                error=error_message,
-            )
-            logger.warning(
-                "Order analysis parse failed",
-                extra={
-                    "message_id": message_id,
-                    "company_id": str(message_doc.get("company_id", "")),
-                    "ticket": message_doc.get("ticket", ""),
-                    "actor_email": current_user.get("email", ""),
-                    "error": error_message[:500],
-                },
-            )
-            order_info["shopify_order"] = {}
-            return order_info
+        order_info = clean_json_response(response)
 
         await db["messages"].update_one(
             {"_id": message_doc["_id"]},
