@@ -1,4 +1,5 @@
 import os
+import logging
 from langchain_core.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from typing import List, Dict, Any
@@ -8,15 +9,46 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 if not GOOGLE_API_KEY:
     raise RuntimeError("GOOGLE_API_KEY environment variable is not set")
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",
-    google_api_key=GOOGLE_API_KEY,
-    temperature=0,
-    max_tokens=None,
-    timeout=None,
-    max_retries=2,
-    # other params...
-)
+# Models to try in order (first success wins)
+MODEL_CHAIN = [
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+]
+
+_logger = logging.getLogger("attentify.ai")
+
+
+async def _try_invoke(prompt, model_name: str):
+    """Try invoking a specific Gemini model. Returns result or raises."""
+    llm = ChatGoogleGenerativeAI(
+        model=model_name,
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0,
+        max_tokens=256,
+        timeout=60,
+        max_retries=1,
+    )
+    return await llm.ainvoke(prompt)
+
+
+async def invoke_with_fallback(prompt):
+    """Try each model in MODEL_CHAIN until one succeeds."""
+    last_error = None
+    for model_name in MODEL_CHAIN:
+        try:
+            _logger.info("Trying model: %s", model_name)
+            return await _try_invoke(prompt, model_name)
+        except Exception as e:
+            error_str = str(e)
+            _logger.warning("Model %s failed: %s", model_name, error_str[:150])
+            last_error = e
+            # 404 = model not found, skip to next immediately
+            # 429 = rate limited, still try next
+            continue
+    raise last_error
 
 EMAIL_ANALYSIS_PROMPT = (
     "You are a very talented order email analysis assistant."
@@ -105,7 +137,7 @@ async def analyze_emails_with_ai(message: Dict[str, Any]):
         except Exception as prompt_exc:
             return {"error": f"Failed to format prompt: {prompt_exc}"}
         try:
-            result =  await llm.ainvoke(prompt)
+            result = await invoke_with_fallback(prompt)
         except Exception as llm_exc:
             error_str = str(llm_exc)
             # Extract key details for logging
