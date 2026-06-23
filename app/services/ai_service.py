@@ -15,39 +15,34 @@ if not GOOGLE_API_KEY and not GROQ_API_KEY:
 
 
 async def invoke_with_fallback(prompt):
-    """Try Gemini models, then Groq as fallback."""
+    """Try Gemini once, if 429 go straight to Groq."""
 
-    # ---- Try Gemini models ----
+    # ---- Try Gemini (single attempt) ----
     if GOOGLE_API_KEY:
         from langchain_google_genai import ChatGoogleGenerativeAI
         for model_name in ["gemini-2.0-flash-lite", "gemini-2.0-flash"]:
-            for attempt in range(2):
-                try:
-                    _logger.info("Gemini %s (attempt %d)", model_name, attempt + 1)
-                    llm = ChatGoogleGenerativeAI(
-                        model=model_name, google_api_key=GOOGLE_API_KEY,
-                        temperature=0, max_tokens=256, timeout=60, max_retries=1,
-                    )
-                    return await llm.ainvoke(prompt)
-                except Exception as e:
-                    err = str(e)
-                    _logger.warning("Gemini %s failed: %s", model_name, err[:120])
-                    if "429" in err and attempt == 0:
-                        import re
-                        m = re.search(r"retry in (\d+\.?\d*)s", err)
-                        wait = float(m.group(1)) if m else 30
-                        _logger.info("Waiting %.0fs...", wait)
-                        import asyncio
-                        await asyncio.sleep(wait)
-                        continue
-                    break
+            try:
+                _logger.info("Gemini %s", model_name)
+                llm = ChatGoogleGenerativeAI(
+                    model=model_name, google_api_key=GOOGLE_API_KEY,
+                    temperature=0, max_tokens=256, timeout=15, max_retries=0,
+                )
+                return await llm.ainvoke(prompt)
+            except Exception as e:
+                err = str(e)
+                if "429" in err:
+                    _logger.warning("Gemini %s rate-limited, skipping to Groq", model_name)
+                    break  # Stop trying Gemini, go to Groq
+                _logger.warning("Gemini %s failed: %s", model_name, err[:120])
+                # Non-429 error, try next Gemini model
+                continue
 
-    # ---- Fallback: Groq (free tier, faster) ----
+    # ---- Groq (free, fast, reliable) ----
     if GROQ_API_KEY:
         from langchain_groq import ChatGroq
-        _logger.info("Trying Groq (llama3-8b)")
+        _logger.info("Using Groq (llama3-8b)")
         llm = ChatGroq(
-            model="llama3-8b-8192", api_key=GROQ_API_KEY,
+            model="llama-3.1-8b-instant", api_key=GROQ_API_KEY,
             temperature=0, max_tokens=256, timeout=60, max_retries=2,
         )
         return await llm.ainvoke(prompt)
