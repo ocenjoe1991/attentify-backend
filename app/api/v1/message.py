@@ -1260,7 +1260,12 @@ async def analyze_email_message(
     if not message_id or not ObjectId.is_valid(message_id):
         raise HTTPException(status_code=400, detail="Invalid message ID")
 
+    logger.info("[ANALYZE] Request received for message_id=%s from user=%s", message_id, current_user.get("email", "?"))
+
     message_doc = await ensure_message_access(message_id, db, current_user, action="update")
+
+    has_messages = bool(message_doc.get("messages"))
+    logger.info("[ANALYZE] message_id=%s has_messages=%s has_order_info=%s", message_id, has_messages, bool(message_doc.get("order_info")))
 
     if not (order_info := message_doc.get('order_info')):
         logger.info(
