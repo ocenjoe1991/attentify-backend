@@ -51,9 +51,13 @@ def fetch_orders_from_shop1(shop, access_token):
             break
     return orders
 
-async def fetch_orders_from_shop(shop, access_token):
-    """Fetch all available orders from a Shopify store using cursor pagination."""
-    url = f"https://{shop}/admin/api/2025-10/orders.json?status=any&limit=250&order=created_at desc"
+async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
+    """Fetch orders from a Shopify store using cursor pagination.
+    If updated_at_min is provided (ISO 8601), only orders updated after that time are fetched."""
+    url = f"https://{shop}/admin/api/2025-10/orders.json?status=any&limit=250"
+    if updated_at_min:
+        url += f"&updated_at_min={updated_at_min}"
+    url += "&order=created_at desc"
     headers = {
         "X-Shopify-Access-Token": access_token,
         "Content-Type": "application/json"

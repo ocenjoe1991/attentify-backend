@@ -802,8 +802,8 @@ async def shopify_callback(request: Request):
 
     access_token = response.json().get("access_token")
 
-    # Register webhook
-    webhook_id = register_shopify_webhook(shop, access_token)
+    # Register webhooks (orders/create + orders/updated)
+    webhook_ids = register_shopify_webhook(shop, access_token)
 
     db = request.app.state.db
     await db.shopify_cred.update_one(
@@ -815,7 +815,8 @@ async def shopify_callback(request: Request):
                 "status": "connected",
                 "user_id": ObjectId(user_id),
                 "company_id": ObjectId(company_id),
-                "webhook_id": webhook_id
+                "webhook_id": webhook_ids.get("create_id") if webhook_ids else None,
+                "webhook_update_id": webhook_ids.get("update_id") if webhook_ids else None,
             }
         },
         upsert=True
@@ -977,7 +978,8 @@ async def delete_shopify_cred(
     return {"detail": "Deleted successfully"}
 
 # Register Shopify Webhook
-def register_shopify_webhook(shop: str, access_token: str):
+def _register_single_webhook(shop: str, access_token: str, topic: str, address: str) -> str | None:
+    """Register a single webhook topic. Returns webhook ID or None."""
     webhook_url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/webhooks.json"
     headers = {
         "X-Shopify-Access-Token": access_token,
@@ -985,26 +987,41 @@ def register_shopify_webhook(shop: str, access_token: str):
     }
     data = {
         "webhook": {
-            "topic": "orders/create",
-            "address": f"{BACKEND_URL}/api/v1/shopify/webhook/orders_create",
+            "topic": topic,
+            "address": address,
             "format": "json"
         }
     }
-
     try:
         response = requests.post(webhook_url, json=data, headers=headers)
     except requests.RequestException as e:
-        logger.error("Webhook request exception for %s: %s", shop, e)
+        logger.error("Webhook request exception for %s (%s): %s", shop, topic, e)
         return None
-
     if response.status_code == 201:
-        webhook = response.json().get("webhook", {})
-        webhook_id = webhook.get("id")
-        logger.info("Webhook registered for %s (ID: %s)", shop, webhook_id)
+        webhook_id = response.json().get("webhook", {}).get("id")
+        logger.info("Webhook '%s' registered for %s (ID: %s)", topic, shop, webhook_id)
         return webhook_id
     else:
-        logger.error("Webhook registration failed for %s: %s %s", shop, response.status_code, response.text)
+        logger.error("Webhook registration failed for %s (%s): %s %s", shop, topic, response.status_code, response.text)
         return None
+
+
+def register_shopify_webhook(shop: str, access_token: str) -> dict | None:
+    """Register both orders/create and orders/updated webhooks.
+    Returns dict with 'create_id' and 'update_id' keys, or None if both fail."""
+    create_id = _register_single_webhook(
+        shop, access_token,
+        "orders/create",
+        f"{BACKEND_URL}/api/v1/shopify/webhook/orders_create"
+    )
+    update_id = _register_single_webhook(
+        shop, access_token,
+        "orders/updated",
+        f"{BACKEND_URL}/api/v1/shopify/webhook/orders_updated"
+    )
+    if create_id or update_id:
+        return {"create_id": create_id, "update_id": update_id}
+    return None
 
 # Delete Shopify Webhook
 def delete_shopify_webhook(shop: str, access_token: str, webhook_id: str):
@@ -1121,6 +1138,46 @@ async def shopify_orders_create_webhook(
         return {"success": True}
     except Exception as e:
         logger.error("Error processing webhook: %s", e)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Webhook processing failed: {str(e)}")
+
+
+@router.post("/webhook/orders_updated")
+async def shopify_orders_updated_webhook(
+    request: Request,
+    x_shopify_hmac_sha256: str = Header(...),
+    x_shopify_shop_domain: str = Header(...)
+):
+    """Handle orders/updated webhook from Shopify – upsert the changed order."""
+    try:
+        raw_body = await request.body()
+
+        # HMAC verification
+        computed_hmac = base64.b64encode(
+            hmac.new(
+                SHOPIFY_API_SECRET.encode("utf-8"),
+                raw_body,
+                hashlib.sha256
+            ).digest()
+        ).decode()
+        if not hmac.compare_digest(computed_hmac, x_shopify_hmac_sha256):
+            logger.warning("Invalid HMAC received from shop: %s", x_shopify_shop_domain)
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid HMAC")
+
+        data = json.loads(raw_body)
+        db = request.app.state.db
+
+        cred = await db.shopify_cred.find_one({"shop": x_shopify_shop_domain})
+        user_id = cred.get("user_id") if cred else None
+        company_id = cred.get("company_id") if cred else None
+
+        # Upsert the single updated order using the same upsert_orders helper
+        from app.services.shopify_service import upsert_orders
+        await upsert_orders(db, x_shopify_shop_domain, [data])
+
+        logger.info("Order %s updated via webhook for %s", data.get("id"), x_shopify_shop_domain)
+        return {"success": True}
+    except Exception as e:
+        logger.error("Error processing orders/updated webhook: %s", e)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Webhook processing failed: {str(e)}")
     
 # Endpoint: Get all orders (for all stores)
@@ -1249,20 +1306,29 @@ async def sync_orders(
 async def sync_all_stores_orders():
     db = await get_database()
     creds = await get_all_shopify_creds(db)
+    now = datetime.now(timezone.utc)
     for cred in creds:
         shop = cred.get("shop")
         access_token = cred.get("access_token")
         if not shop or not access_token:
             continue
         try:
-            orders = await fetch_orders_from_shop(shop, access_token)
+            last_synced = cred.get("last_synced_at")
+            updated_at_min = last_synced.isoformat() if last_synced else None
+            orders = await fetch_orders_from_shop(shop, access_token, updated_at_min)
             await upsert_orders(db, shop, orders)
+            await db["shopify_cred"].update_one(
+                {"shop": shop},
+                {"$set": {"last_synced_at": now}}
+            )
+            logger.info("Synced %d orders for shop %s (since %s)", len(orders), shop, updated_at_min or "beginning")
         except Exception as e:
             logger.error("Error syncing %s: %s", shop, e)
 
 
 async def sync_company_orders(company_id: ObjectId):
     db = await get_database()
+    now = datetime.now(timezone.utc)
     cursor = db["shopify_cred"].find({"company_id": company_id, "status": "connected"})
     async for cred in cursor:
         shop = cred.get("shop")
@@ -1270,8 +1336,15 @@ async def sync_company_orders(company_id: ObjectId):
         if not shop or not access_token:
             continue
         try:
-            orders = await fetch_orders_from_shop(shop, access_token)
+            last_synced = cred.get("last_synced_at")
+            updated_at_min = last_synced.isoformat() if last_synced else None
+            orders = await fetch_orders_from_shop(shop, access_token, updated_at_min)
             await upsert_orders(db, shop, orders)
+            await db["shopify_cred"].update_one(
+                {"shop": shop},
+                {"$set": {"last_synced_at": now}}
+            )
+            logger.info("Synced %d orders for shop %s (since %s)", len(orders), shop, updated_at_min or "beginning")
         except Exception as e:
             logger.error("Error syncing %s: %s", shop, e)
 

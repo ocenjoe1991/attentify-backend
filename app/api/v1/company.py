@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
-from datetime import datetime, timezone
+from datetime import datetime
 from app.models.company import CompanyCreate, SimpleCompanyOut, CompanyInDB, UpdateCompanyRequest
 from app.models.user import UserPublic
 from bson import ObjectId
@@ -117,7 +117,7 @@ from bson import ObjectId
 
 @router.post("/create")
 async def create_company(company: CompanyCreate, current_user: dict = Depends(get_current_user), db=Depends(get_database)):
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     company_doc = {
         "name": company.name,
         "site_url": company.site_url,
@@ -644,7 +644,7 @@ async def delete_membership(
         raise HTTPException(status_code=400, detail="Invalid status")
     
     result = None
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     if status == "active":
         membership = await db.memberships.find_one({"_id": ObjectId(id)})
 
