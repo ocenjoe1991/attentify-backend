@@ -7,7 +7,7 @@ import os
 import certifi
 from dotenv import load_dotenv
 load_dotenv()  # Load from .env at startup
-from app.db.mongodb import get_database
+from app.db.mongodb import get_database, set_database
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
@@ -238,6 +238,7 @@ async def lifespan(app: FastAPI):
         logger.info("Connected to MongoDB")
         app.state.mongo_client = mongo_client
         app.state.db = mongo_client[DB_NAME]
+        set_database(app.state.db)
         await ensure_database_indexes(app.state.db)
         await migrate_order_dates(app.state.db)
     except Exception as e:
