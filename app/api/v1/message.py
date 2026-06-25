@@ -1267,23 +1267,84 @@ async def analyze_email_message(
 
     message_doc = await ensure_message_access(message_id, db, current_user, action="update")
 
+    # Extract customer email for order lookups
+    client_email = ""
+    client_str = message_doc.get("client") or ""
+    email_match = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', client_str)
+    if email_match:
+        client_email = email_match[0]
+
+    # Requirement 1: If customer email has zero orders, skip AI entirely (no loading)
+    if client_email:
+        order_count = await db["orders"].count_documents({
+            "company_id": message_doc["company_id"],
+            "customer.email": client_email,
+        })
+        if order_count == 0:
+            logger.info("[ANALYZE] message_id=%s customer has no orders, skipping AI", message_id)
+            order_info = {
+                "order_id": "",
+                "type": "",
+                "status": 0,
+                "msg": "No orders for this customer",
+                "no_orders": True,
+            }
+            await db["messages"].update_one(
+                {"_id": message_doc["_id"]},
+                {"$set": {
+                    "order_info": cacheable_order_info(order_info),
+                    "order_match_status": "not_order",
+                }}
+            )
+            await update_message_analysis_state(db, message_doc["_id"], state="success", source="no_orders")
+            order_info["shopify_order"] = {}
+            return order_info
+
     has_messages = bool(message_doc.get("messages"))
     logger.info("[ANALYZE] message_id=%s has_messages=%s has_order_info=%s", message_id, has_messages, bool(message_doc.get("order_info")))
 
-    # Only skip analysis if order_info has a valid order_id (not a failed/empty one)
+    # Check cached order_info
     order_info = message_doc.get('order_info')
     if order_info and order_info.get("order_id"):
-        await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
-        logger.info(
-            "Order analysis skipped; cached order_info found",
-            extra={
-                "message_id": message_id,
-                "company_id": str(message_doc.get("company_id", "")),
-                "ticket": message_doc.get("ticket", ""),
-                "actor_email": current_user.get("email", ""),
-                "order_id": str(order_info.get("order_id", "")),
-            },
-        )
+        # Requirement 3: Check if Shopify order was updated since last analysis
+        shopify_updated = False
+        order_name = order_info["order_id"] if order_info["order_id"].startswith("#") else "#" + order_info["order_id"]
+        db_order = await db["orders"].find_one({"name": order_name})
+
+        if db_order and order_info.get("analyzed_at"):
+            try:
+                from app.services.shopify_service import _to_datetime
+                analyzed_dt = _to_datetime(order_info["analyzed_at"])
+                shopify_dt = _to_datetime(db_order.get("updated_at"))
+                if analyzed_dt and shopify_dt and shopify_dt > analyzed_dt:
+                    shopify_updated = True
+                    logger.info("[ANALYZE] message_id=%s Shopify order updated, re-fetching", message_id)
+            except Exception:
+                pass
+
+        if not shopify_updated and db_order and client_email and db_order.get("customer", {}).get("email", "") == client_email:
+            # Cached order_info is fresh – return immediately with attached shopify_order
+            db_order["order_actions"] = await get_order_actions(db, db_order)
+            db_order["_id"] = str(db_order["_id"])
+            db_order["user_id"] = str(db_order.get("user_id", ""))
+            db_order["company_id"] = str(db_order.get("company_id", ""))
+            order_info["shopify_order"] = db_order
+            await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
+            logger.info(
+                "Order analysis skipped; cached order_info is fresh",
+                extra={
+                    "message_id": message_id,
+                    "company_id": str(message_doc.get("company_id", "")),
+                    "ticket": message_doc.get("ticket", ""),
+                    "order_id": str(order_info.get("order_id", "")),
+                },
+            )
+            return order_info
+
+        # Cached but shopify was updated or email mismatch – fall through to re-attach shopify_order
+        if not shopify_updated:
+            await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
+        # else: fall through to re-process the shopify_order attachment below
     else:
         # No valid order_info — run AI analysis
         logger.info(
@@ -1297,7 +1358,6 @@ async def analyze_email_message(
         )
         await update_message_analysis_state(db, message_doc["_id"], state="started", source="gemini")
         result = await analyze_emails_with_ai(message_doc)
-        # result is now a single dict, not a list
 
         if isinstance(result, dict) and result.get("error"):
             error_message = str(result.get("msg", result.get("error", "Unknown AI error")))
@@ -1312,8 +1372,6 @@ async def analyze_email_message(
                 "status": 0,
                 "msg": error_message,
             }
-            # Only save order_match_status on failure - do NOT save order_info
-            # so that retry can happen on next load
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {
@@ -1365,6 +1423,7 @@ async def analyze_email_message(
             },
         )
     
+    # --- Attach shopify_order from DB (runs for: fresh AI result, or cached but re-fetch needed) ---
     order_id = str(order_info.get("order_id", ""))
     if not order_id:
         order_info["msg"] = order_info.get("msg") or "No order found in message"
@@ -1394,13 +1453,7 @@ async def analyze_email_message(
     db_order = await db["orders"].find_one({"name": order_name})
     
     if db_order:
-        match = re.findall(
-            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b',
-            message_doc.get("client") or "",
-        )
-        email = match[0] if match else ""
-
-        if email and db_order.get("customer", {}).get("email", "") == email:
+        if client_email and db_order.get("customer", {}).get("email", "") == client_email:
             db_order["order_actions"] = await get_order_actions(db, db_order)
             db_order["_id"] = str(db_order["_id"])
             db_order["user_id"] = str(db_order.get("user_id", ""))
