@@ -13,6 +13,7 @@ from app.services.shopify_service import (
     get_all_shopify_creds,
     fetch_orders_from_shop,
     upsert_orders,
+    _to_datetime,
 )
 
 from math import ceil
@@ -1087,7 +1088,7 @@ async def shopify_orders_create_webhook(
             "company_id": ObjectId(company_id),
             "order_number": data.get("order_number"),
             "name": data.get("name"),
-            "created_at": data.get("created_at"),
+            "created_at": _to_datetime(data.get("created_at")),
             "customer": {
                 "id": data.get("customer", {}).get("id"),
                 "email": data.get("customer", {}).get("email"),
@@ -1304,6 +1305,7 @@ async def sync_orders(
 
 # Background job: fetch and upsert all orders for all stores
 async def sync_all_stores_orders():
+    """Background incremental sync – only fetches orders updated since last_synced_at."""
     db = await get_database()
     creds = await get_all_shopify_creds(db)
     now = datetime.now(timezone.utc)
@@ -1327,6 +1329,7 @@ async def sync_all_stores_orders():
 
 
 async def sync_company_orders(company_id: ObjectId):
+    """Incremental sync – only fetches orders updated since last_synced_at."""
     db = await get_database()
     now = datetime.now(timezone.utc)
     cursor = db["shopify_cred"].find({"company_id": company_id, "status": "connected"})

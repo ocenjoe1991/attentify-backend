@@ -2,11 +2,26 @@ import re
 import urllib.parse
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from pymongo import UpdateOne
 from bson import ObjectId
 
 logger = logging.getLogger("attentify.shopify_service")
+
+
+def _to_datetime(value):
+    """Convert a Shopify ISO 8601 string to a timezone-aware datetime.
+    Returns None if parsing fails (TTL index won't apply, order still stored)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        logger.debug("Failed to parse date: %s", value)
+        return None
 
 async def get_all_shopify_creds(db):
     """Fetch all Shopify store credentials from the database."""
@@ -108,7 +123,7 @@ async def upsert_orders(db, shop, orders):
             "order_number": order.get("order_number"),
             "name": order.get("name"),
             "shop": shop,
-            "created_at": order.get("created_at"),
+            "created_at": _to_datetime(order.get("created_at")),
             "customer": {
                 "id": order.get("customer", {}).get("id"),
                 "email": order.get("customer", {}).get("email"),

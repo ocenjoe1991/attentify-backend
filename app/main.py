@@ -176,6 +176,8 @@ async def ensure_database_indexes(db):
     await db["orders"].create_index([("company_id", 1), ("name", 1)])
     await db["orders"].create_index([("company_id", 1), ("order_id", 1)])
     await db["orders"].create_index([("company_id", 1), ("customer.email", 1)])
+    # TTL: auto-delete orders older than 6 months (180 days)
+    await db["orders"].create_index("created_at", expireAfterSeconds=15552000)
 
     # Messages
     await db["messages"].create_index([("company_id", 1), ("last_updated", -1)])
@@ -212,6 +214,17 @@ async def ensure_database_indexes(db):
     # Audit logs — lookup by company + date
     await db["audit_logs"].create_index([("company_id", 1), ("created_at", -1)])
 
+
+async def migrate_order_dates(db):
+    """One-time migration: convert string created_at to BSON Date for TTL index."""
+    result = await db["orders"].update_many(
+        {"created_at": {"$type": "string"}},
+        [{"$set": {"created_at": {"$toDate": "$created_at"}}}],
+    )
+    if result.modified_count:
+        logger.info("Migrated %d orders: created_at string → Date", result.modified_count)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -226,6 +239,7 @@ async def lifespan(app: FastAPI):
         app.state.mongo_client = mongo_client
         app.state.db = mongo_client[DB_NAME]
         await ensure_database_indexes(app.state.db)
+        await migrate_order_dates(app.state.db)
     except Exception as e:
         logger.critical("Failed to connect to MongoDB: %s", e)
         raise e
