@@ -17,7 +17,7 @@ from app.services.shopify_service import (
 )
 
 from math import ceil
-from app.db.mongodb import get_database
+from app.db.mongodb import get_database, get_db
 from app.core.security import get_current_user
 from app.core.permissions import (
     PERMISSION_CANCELLATION_WITHOUT_OWNER_APPROVAL,
@@ -1306,7 +1306,7 @@ async def sync_orders(
 # Background job: fetch and upsert all orders for all stores
 async def sync_all_stores_orders():
     """Background incremental sync – only fetches orders updated since last_synced_at."""
-    db = await get_database()
+    db = get_db()
     creds = await get_all_shopify_creds(db)
     now = datetime.now(timezone.utc)
     for cred in creds:
@@ -1330,7 +1330,7 @@ async def sync_all_stores_orders():
 
 async def sync_company_orders(company_id: ObjectId):
     """Incremental sync – only fetches orders updated since last_synced_at."""
-    db = await get_database()
+    db = get_db()
     now = datetime.now(timezone.utc)
     cursor = db["shopify_cred"].find({"company_id": company_id, "status": "connected"})
     async for cred in cursor:
@@ -1498,7 +1498,7 @@ async def refund_order(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
 ):
-    db = await get_database()
+    db = get_db()
 
     order_id = payload.get("order_id")
     shop = payload.get("shop")
@@ -1699,7 +1699,7 @@ async def cancel_order(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
 ):
-    db = await get_database()
+    db = get_db()
 
     # --- Step 1: Validate input ---
     order_id = payload.get("order_id")
@@ -1858,7 +1858,7 @@ async def create_return_action(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
 ):
-    db = await get_database()
+    db = get_db()
     context = await get_order_action_context(db, payload, current_user)
     if isinstance(context, JSONResponse):
         return context
@@ -1909,7 +1909,7 @@ async def create_exchange_action(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
 ):
-    db = await get_database()
+    db = get_db()
     context = await get_order_action_context(db, payload, current_user)
     if isinstance(context, JSONResponse):
         return context
@@ -1975,7 +1975,7 @@ async def resend_order_notification(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
 ):
-    db = await get_database()
+    db = get_db()
     context = await get_order_action_context(db, payload, current_user)
     if isinstance(context, JSONResponse):
         return context
@@ -2018,7 +2018,7 @@ async def add_order_note(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
 ):
-    db = await get_database()
+    db = get_db()
     context = await get_order_action_context(db, payload, current_user)
     if isinstance(context, JSONResponse):
         return context
@@ -2063,7 +2063,7 @@ async def hold_fulfillment(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
 ):
-    db = await get_database()
+    db = get_db()
     context = await get_order_action_context(db, payload, current_user)
     if isinstance(context, JSONResponse):
         return context
@@ -2118,7 +2118,7 @@ async def release_fulfillment_hold(
     payload: dict = Body(...),
     current_user: dict = Depends(get_current_user),
 ):
-    db = await get_database()
+    db = get_db()
     context = await get_order_action_context(db, payload, current_user)
     if isinstance(context, JSONResponse):
         return context
