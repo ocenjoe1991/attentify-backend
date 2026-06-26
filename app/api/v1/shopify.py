@@ -19,6 +19,7 @@ from app.services.shopify_service import (
 from math import ceil
 from app.db.mongodb import get_database, get_db
 from app.core.security import get_current_user
+from app.main import sio
 from app.core.permissions import (
     PERMISSION_CANCELLATION_WITHOUT_OWNER_APPROVAL,
     PERMISSION_REFUND_WITHOUT_OWNER_APPROVAL,
@@ -732,20 +733,30 @@ def shopify_auth(request: Request,
                  company_id: str = Query(...)
                 ):
     """
-    Redirect user to Shopify OAuth consent page
+    Redirect user to Shopify OAuth consent page.
+    Stores user_id + company_id in session AND passes them via state param for reliability.
     """
-    #shop = request.query_params.get("shop")
-    #if not shop:
-    #    raise HTTPException(status_code=400, detail="Missing 'shop' parameter")
-
-    # Generate the install URL
-    #install_url = (
-    #    f"https://{shop}/admin/oauth/authorize?client_id={SHOPIFY_API_KEY}"
-    #    f"&scope={quote(SHOPIFY_SCOPE)}&redirect_uri={quote(SHOPIFY_REDIRECT_URI)}"
-    #)
-
     request.session["user_id"] = user_id
     request.session["company_id"] = company_id
+
+    # Build a proper Shopify OAuth URL with state parameter as fallback
+    import base64 as b64
+    import json
+    state_data = b64.urlsafe_b64encode(
+        json.dumps({"user_id": user_id, "company_id": company_id}).encode()
+    ).decode()
+    shop = request.query_params.get("shop", "")
+    if shop:
+        redirect_uri = f"{BACKEND_URL}/api/v1/shopify/callback"
+        auth_url = (
+            f"https://{shop}/admin/oauth/authorize"
+            f"?client_id={SHOPIFY_API_KEY}"
+            f"&scope={SHOPIFY_SCOPE}"
+            f"&redirect_uri={redirect_uri}"
+            f"&state={state_data}"
+        )
+        return RedirectResponse(url=auth_url)
+    
     return RedirectResponse(url=SHOPIFY_INSTALL_URL)
 
 @router.get("/install")
@@ -772,6 +783,18 @@ async def shopify_callback(request: Request):
 
     user_id = request.session.get("user_id")
     company_id = request.session.get("company_id")
+
+    # Fallback: decode state parameter if session is missing
+    if (not user_id or not company_id) and params.get("state"):
+        try:
+            import base64 as b64
+            import json
+            state_raw = b64.urlsafe_b64decode(params["state"].encode()).decode()
+            state_data = json.loads(state_raw)
+            user_id = user_id or state_data.get("user_id")
+            company_id = company_id or state_data.get("company_id")
+        except Exception:
+            pass
 
     if not shop or not code or not hmac_received or not user_id:
         raise HTTPException(status_code=400, detail="Missing parameters")
@@ -1350,6 +1373,8 @@ async def sync_company_orders(company_id: ObjectId):
             logger.info("Synced %d orders for shop %s (since %s)", len(orders), shop, updated_at_min or "beginning")
         except Exception as e:
             logger.error("Error syncing %s: %s", shop, e)
+    # Notify clients that sync completed for this company
+    await sio.emit("shopify_sync_complete", {"company_id": str(company_id)})
 
 
 @router.get("/approval-requests")
