@@ -68,10 +68,14 @@ def fetch_orders_from_shop1(shop, access_token):
 
 async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
     """Fetch orders from a Shopify store using cursor pagination.
-    If updated_at_min is provided (ISO 8601), only orders updated after that time are fetched."""
+    If updated_at_min is provided, only orders updated after that time are fetched.
+    Otherwise, sets created_at_min far in the past to bypass Shopify's 60-day default limit."""
     url = f"https://{shop}/admin/api/2025-10/orders.json?status=any&limit=250"
     if updated_at_min:
         url += f"&updated_at_min={updated_at_min}"
+    else:
+        # First sync: bypass Shopify's 60-day default by setting a very old created_at_min
+        url += "&created_at_min=2020-01-01T00:00:00Z"
     url += "&order=created_at desc"
     headers = {
         "X-Shopify-Access-Token": access_token,
