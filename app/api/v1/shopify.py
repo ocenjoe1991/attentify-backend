@@ -753,13 +753,12 @@ async def shopify_auth(request: Request,
     shop = request.query_params.get("shop", "")
     if shop:
         redirect_uri = f"{BACKEND_URL}/api/v1/shopify/callback"
-        auth_url = (
-            f"https://{shop}/admin/oauth/authorize"
-            f"?client_id={SHOPIFY_API_KEY}"
-            f"&scope={SHOPIFY_SCOPE}"
-            f"&redirect_uri={redirect_uri}"
-            f"&state={state_data}"
-        )
+        auth_url = f"https://{shop}/admin/oauth/authorize?{urlencode({
+            'client_id': SHOPIFY_API_KEY,
+            'scope': SHOPIFY_SCOPES,
+            'redirect_uri': redirect_uri,
+            'state': state_data,
+        })}"
         return RedirectResponse(url=auth_url)
     
     # No shop → use SHOPIFY_INSTALL_URL + store pending record for callback recovery
