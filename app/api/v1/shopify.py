@@ -852,6 +852,12 @@ async def shopify_callback(request: Request):
         raise HTTPException(status_code=500, detail="Token exchange failed")
 
     access_token = response.json().get("access_token")
+    token_scopes = fetch_access_scopes(shop, access_token) if access_token else []
+    if "read_all_orders" not in token_scopes:
+        logger.warning(
+            "New Shopify token for %s does not include read_all_orders after OAuth callback.",
+            shop,
+        )
 
     # Register webhooks (orders/create + orders/updated)
     webhook_ids = register_shopify_webhook(shop, access_token)
@@ -867,6 +873,8 @@ async def shopify_callback(request: Request):
                 "company_id": ObjectId(company_id),
                 "webhook_id": webhook_ids.get("create_id") if webhook_ids else None,
                 "webhook_update_id": webhook_ids.get("update_id") if webhook_ids else None,
+                "last_checked_scopes": token_scopes,
+                "has_read_all_orders": "read_all_orders" in token_scopes,
             },
             "$unset": {"last_synced_at": ""},
         },
