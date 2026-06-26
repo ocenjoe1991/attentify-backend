@@ -211,6 +211,9 @@ async def ensure_database_indexes(db):
     await db["shopify_cred"].create_index([("company_id", 1)])
     await db["shopify_cred"].create_index([("shop", 1)])
 
+    # Shopify pending auth tokens — auto-clean after 15 minutes
+    await db["shopify_pending"].create_index("created_at", expireAfterSeconds=900)
+
     # Audit logs — lookup by company + date
     await db["audit_logs"].create_index([("company_id", 1), ("created_at", -1)])
 

@@ -761,17 +761,13 @@ async def shopify_auth(request: Request,
         )
         return RedirectResponse(url=auth_url)
     
-    # No shop → use SHOPIFY_INSTALL_URL + store pending token for callback recovery
-    pending_id = str(_uuid.uuid4())
+    # No shop → use SHOPIFY_INSTALL_URL + store pending record for callback recovery
     await db["shopify_pending"].insert_one({
-        "_id": pending_id,
         "user_id": user_id,
         "company_id": company_id,
         "created_at": datetime.now(timezone.utc)
     })
-    response = RedirectResponse(url=SHOPIFY_INSTALL_URL)
-    response.set_cookie("pending_id", pending_id, httponly=True, samesite="lax", max_age=600)
-    return response
+    return RedirectResponse(url=SHOPIFY_INSTALL_URL)
 
 @router.get("/install")
 def shopify_install(
@@ -811,15 +807,20 @@ async def shopify_callback(request: Request):
         except Exception:
             pass
 
-    # Fallback 2: look up pending token (SHOPIFY_INSTALL_URL route)
+    # Fallback 2: find most recent pending record (SHOPIFY_INSTALL_URL route, no cookie)
     if (not user_id or not company_id):
-        pending_id = request.cookies.get("pending_id")
-        if pending_id:
-            pending = await db["shopify_pending"].find_one({"_id": pending_id})
-            if pending:
-                user_id = user_id or pending.get("user_id")
-                company_id = company_id or pending.get("company_id")
-                await db["shopify_pending"].delete_one({"_id": pending_id})
+        from datetime import timedelta
+        pending = await db["shopify_pending"].find_one(
+            {"created_at": {"$gte": datetime.now(timezone.utc) - timedelta(minutes=10)}},
+            sort=[("created_at", -1)]
+        )
+        if pending:
+            user_id = user_id or pending.get("user_id")
+            company_id = company_id or pending.get("company_id")
+            await db["shopify_pending"].delete_many({
+                "user_id": pending["user_id"],
+                "company_id": pending["company_id"]
+            })
 
     if not shop or not code or not hmac_received or not user_id:
         raise HTTPException(status_code=400, detail="Missing parameters")
