@@ -728,14 +728,17 @@ shopify_auth_helper = ShopifyAuthHelper(SHOPIFY_API_KEY, SHOPIFY_API_SECRET)
 
 #/api/v1/shopify/auth
 @router.get("/auth")
-def shopify_auth(request: Request, 
+async def shopify_auth(request: Request, 
                  user_id: str = Query(...),
-                 company_id: str = Query(...)
+                 company_id: str = Query(...),
+                 db: AsyncIOMotorDatabase = Depends(get_database),
                 ):
     """
     Redirect user to Shopify OAuth consent page.
-    Stores user_id + company_id in session AND passes them via state param for reliability.
+    Sets session + persistent cookie with user_id/company_id for callback recovery.
     """
+    import uuid as _uuid
+    
     request.session["user_id"] = user_id
     request.session["company_id"] = company_id
 
@@ -757,7 +760,17 @@ def shopify_auth(request: Request,
         )
         return RedirectResponse(url=auth_url)
     
-    return RedirectResponse(url=SHOPIFY_INSTALL_URL)
+    # No shop → use SHOPIFY_INSTALL_URL + store pending token for callback recovery
+    pending_id = str(_uuid.uuid4())
+    await db["shopify_pending"].insert_one({
+        "_id": pending_id,
+        "user_id": user_id,
+        "company_id": company_id,
+        "created_at": datetime.now(timezone.utc)
+    })
+    response = RedirectResponse(url=SHOPIFY_INSTALL_URL)
+    response.set_cookie("pending_id", pending_id, httponly=True, samesite="lax", max_age=600)
+    return response
 
 @router.get("/install")
 def shopify_install(
@@ -776,6 +789,7 @@ def shopify_install(
 #/api/v1/shopify/callback
 @router.get("/callback")
 async def shopify_callback(request: Request):
+    db = request.app.state.db
     params = dict(request.query_params)
     shop = params.get("shop")
     code = params.get("code")
@@ -784,7 +798,7 @@ async def shopify_callback(request: Request):
     user_id = request.session.get("user_id")
     company_id = request.session.get("company_id")
 
-    # Fallback: decode state parameter if session is missing
+    # Fallback 1: decode state parameter if session is missing
     if (not user_id or not company_id) and params.get("state"):
         try:
             import base64 as b64
@@ -795,6 +809,16 @@ async def shopify_callback(request: Request):
             company_id = company_id or state_data.get("company_id")
         except Exception:
             pass
+
+    # Fallback 2: look up pending token (SHOPIFY_INSTALL_URL route)
+    if (not user_id or not company_id):
+        pending_id = request.cookies.get("pending_id")
+        if pending_id:
+            pending = await db["shopify_pending"].find_one({"_id": pending_id})
+            if pending:
+                user_id = user_id or pending.get("user_id")
+                company_id = company_id or pending.get("company_id")
+                await db["shopify_pending"].delete_one({"_id": pending_id})
 
     if not shop or not code or not hmac_received or not user_id:
         raise HTTPException(status_code=400, detail="Missing parameters")
@@ -829,7 +853,6 @@ async def shopify_callback(request: Request):
     # Register webhooks (orders/create + orders/updated)
     webhook_ids = register_shopify_webhook(shop, access_token)
 
-    db = request.app.state.db
     await db.shopify_cred.update_one(
         {"shop": shop, "user_id": ObjectId(user_id)},
         {
