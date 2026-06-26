@@ -72,11 +72,12 @@ async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
     Otherwise, sets created_at_min far in the past to bypass Shopify's 60-day default limit."""
     url = f"https://{shop}/admin/api/2025-10/orders.json?status=any&limit=250"
     if updated_at_min:
-        url += f"&updated_at_min={updated_at_min}"
+        url += f"&updated_at_min={urllib.parse.quote(updated_at_min)}"
     else:
         # First sync: bypass Shopify's 60-day default by setting a very old created_at_min
-        url += "&created_at_min=2020-01-01T00:00:00Z"
+        url += "&created_at_min=" + urllib.parse.quote("2020-01-01T00:00:00Z")
     url += "&order=created_at desc"
+    logger.info("Fetching orders from Shopify: %s", url)
     headers = {
         "X-Shopify-Access-Token": access_token,
         "Content-Type": "application/json"
