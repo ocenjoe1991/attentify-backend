@@ -79,14 +79,19 @@ async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
     }
     orders = []
     next_url = url
+    page_count = 0
 
     while next_url:
+        page_count += 1
         resp = requests.get(next_url, headers=headers)
         if resp.status_code != 200:
+            logger.warning("Shopify fetch page %d failed: HTTP %d for %s", page_count, resp.status_code, shop)
             break
 
         data = resp.json()
-        orders.extend(data.get("orders", []))
+        page_orders = data.get("orders", [])
+        orders.extend(page_orders)
+        logger.info("Shopify fetch page %d: got %d orders (total so far: %d) for %s", page_count, len(page_orders), len(orders), shop)
 
         link = resp.headers.get("link", "")
         match = re.search(r'<([^>]+)>;\s*rel="next"', link)
@@ -97,6 +102,9 @@ async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
             query = urllib.parse.parse_qs(parsed.query)
             page_info = query.get("page_info", [None])[0]
             next_url = f"https://{shop}/admin/api/2025-10/orders.json?limit=250&page_info={page_info}" if page_info else None
+        
+        if not next_url:
+            logger.info("Shopify fetch complete: %d total orders, %d pages for %s", len(orders), page_count, shop)
 
     return orders
 
