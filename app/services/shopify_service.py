@@ -1,12 +1,14 @@
 import re
 import urllib.parse
 import logging
+import os
 import requests
 from datetime import datetime, timezone
 from pymongo import UpdateOne
 from bson import ObjectId
 
 logger = logging.getLogger("attentify.shopify_service")
+SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
 
 
 def _to_datetime(value):
@@ -28,11 +30,42 @@ async def get_all_shopify_creds(db):
     # Use .to_list() with a reasonable length
     return await db.shopify_cred.find({}).to_list(length=100)
 
+
+def fetch_access_scopes(shop, access_token):
+    """Return the scopes granted to the current Shopify access token."""
+    url = f"https://{shop}/admin/oauth/access_scopes.json"
+    headers = {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+    except Exception as exc:
+        logger.warning("Failed to fetch Shopify access scopes for %s: %s", shop, exc)
+        return []
+
+    if resp.status_code != 200:
+        logger.warning(
+            "Failed to fetch Shopify access scopes for %s: HTTP %d %s",
+            shop,
+            resp.status_code,
+            resp.text[:300],
+        )
+        return []
+
+    scopes = [
+        item.get("handle")
+        for item in resp.json().get("access_scopes", [])
+        if item.get("handle")
+    ]
+    logger.info("Shopify access scopes for %s: %s", shop, ",".join(scopes) or "(none)")
+    return scopes
+
 # Fetch full orders from a shopify store
 def fetch_orders_from_shop1(shop, access_token):
     """Fetch all orders from a Shopify store using the access token."""
     orders = []
-    url = f"https://{shop}/admin/api/2025-10/orders.json?status=any&limit=250"
+    url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders.json?status=any&limit=250"
     headers = {
         "X-Shopify-Access-Token": access_token,
         "Content-Type": "application/json"
@@ -70,7 +103,7 @@ async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
     """Fetch orders from a Shopify store using cursor pagination.
     If updated_at_min is provided, only orders updated after that time are fetched.
     Otherwise, sets created_at_min far in the past to bypass Shopify's 60-day default limit."""
-    url = f"https://{shop}/admin/api/2025-10/orders.json?limit=250&status=any"
+    url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders.json?limit=250&status=any"
     if updated_at_min:
         url += f"&updated_at_min={urllib.parse.quote(updated_at_min)}"
     else:
@@ -101,12 +134,19 @@ async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
         link = resp.headers.get("link", "")
         match = re.search(r'<([^>]+)>;\s*rel="next"', link)
         next_url = match.group(1) if match else None
+        if not next_url:
+            logger.info(
+                "Shopify fetch page %d has no next page for %s (link header: %s)",
+                page_count,
+                shop,
+                link or "empty",
+            )
 
         if next_url:
             parsed = urllib.parse.urlparse(next_url)
             query = urllib.parse.parse_qs(parsed.query)
             page_info = query.get("page_info", [None])[0]
-            next_url = f"https://{shop}/admin/api/2025-10/orders.json?limit=250&page_info={page_info}" if page_info else None
+            next_url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders.json?limit=250&page_info={page_info}" if page_info else None
         
         if not next_url:
             logger.info("Shopify fetch complete: %d total orders, %d pages for %s", len(orders), page_count, shop)

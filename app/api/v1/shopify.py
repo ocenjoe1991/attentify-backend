@@ -12,6 +12,7 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.services.shopify_service import (
     get_all_shopify_creds,
+    fetch_access_scopes,
     fetch_orders_from_shop,
     upsert_orders,
     _to_datetime,
@@ -1392,13 +1393,23 @@ async def sync_all_stores_orders():
         if not shop or not access_token:
             continue
         try:
+            scopes = fetch_access_scopes(shop, access_token)
+            if "read_all_orders" not in scopes:
+                logger.warning(
+                    "Shopify token for %s does not include read_all_orders; historical orders may be limited to recent orders.",
+                    shop,
+                )
             last_synced = cred.get("last_synced_at")
             updated_at_min = last_synced.isoformat() if last_synced else None
             orders = await fetch_orders_from_shop(shop, access_token, updated_at_min)
             await upsert_orders(db, shop, orders)
             await db["shopify_cred"].update_one(
                 {"shop": shop},
-                {"$set": {"last_synced_at": now}}
+                {"$set": {
+                    "last_synced_at": now,
+                    "last_checked_scopes": scopes,
+                    "has_read_all_orders": "read_all_orders" in scopes,
+                }}
             )
             logger.info("Synced %d orders for shop %s (since %s)", len(orders), shop, updated_at_min or "beginning")
         except Exception as e:
@@ -1416,13 +1427,23 @@ async def sync_company_orders(company_id: ObjectId):
         if not shop or not access_token:
             continue
         try:
+            scopes = fetch_access_scopes(shop, access_token)
+            if "read_all_orders" not in scopes:
+                logger.warning(
+                    "Shopify token for %s does not include read_all_orders; historical orders may be limited to recent orders.",
+                    shop,
+                )
             last_synced = cred.get("last_synced_at")
             updated_at_min = last_synced.isoformat() if last_synced else None
             orders = await fetch_orders_from_shop(shop, access_token, updated_at_min)
             await upsert_orders(db, shop, orders)
             await db["shopify_cred"].update_one(
                 {"shop": shop},
-                {"$set": {"last_synced_at": now}}
+                {"$set": {
+                    "last_synced_at": now,
+                    "last_checked_scopes": scopes,
+                    "has_read_all_orders": "read_all_orders" in scopes,
+                }}
             )
             logger.info("Synced %d orders for shop %s (since %s)", len(orders), shop, updated_at_min or "beginning")
         except Exception as e:
