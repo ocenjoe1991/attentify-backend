@@ -9,6 +9,7 @@ from typing import List, Dict
 from datetime import datetime, timezone
 import json
 from bson import ObjectId
+from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.services.shopify_service import (
     get_all_shopify_creds,
     fetch_orders_from_shop,
