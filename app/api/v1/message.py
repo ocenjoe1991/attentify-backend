@@ -19,7 +19,7 @@ from email.utils import formatdate, format_datetime
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
 from email.utils import parseaddr
-from pymongo import ASCENDING, DESCENDING
+from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from app.core.security import get_current_user
 from app.utils.logger import logger
 from app.core.permissions import (
@@ -82,6 +82,18 @@ def normalize_doc_dates(doc: dict) -> dict:
             if isinstance(item, dict) and "timestamp" in item:
                 item["timestamp"] = to_utc_iso(item.get("timestamp"))
     return doc
+
+
+def serialize_for_json(value):
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, datetime):
+        return to_utc_iso(value)
+    if isinstance(value, list):
+        return [serialize_for_json(item) for item in value]
+    if isinstance(value, dict):
+        return {key: serialize_for_json(item) for key, item in value.items()}
+    return value
 
 
 def normalize_status(status: str) -> str:
@@ -395,9 +407,30 @@ async def update_message(
     })
     safe_payload = {k: v for k, v in payload.items() if k != "_id"}
     if safe_payload.get("order_info.confirmed") is True:
+        order_id = safe_payload.get("order_info.order_id", "")
+        order_info = dict(message.get("order_info") or {})
+        if order_id:
+            order_info["order_id"] = order_id
+        order_info["confirmed"] = True
+        order_name = str(order_info.get("order_id", ""))
+        order_name = order_name if order_name.startswith("#") else f"#{order_name}"
+        db_order = await db["orders"].find_one({
+            "company_id": message["company_id"],
+            "name": order_name,
+        })
+        if db_order:
+            order_info["shopify_order"] = await build_order_snapshot(db, db_order)
+            safe_payload["matched_order_id"] = str(db_order.get("order_id", ""))
+            safe_payload["matched_order_name"] = db_order.get("name", order_info.get("order_id", ""))
+
+        safe_payload.pop("order_info.order_id", None)
+        safe_payload.pop("order_info.confirmed", None)
+        safe_payload["order_info"] = cacheable_order_info(
+            order_info,
+            source="confirmed",
+            keep_shopify_order=True,
+        )
         safe_payload["order_match_status"] = "matched"
-        if safe_payload.get("order_info.order_id"):
-            safe_payload["matched_order_name"] = safe_payload["order_info.order_id"]
     if "status" in safe_payload:
         safe_payload["status"] = normalize_status(safe_payload["status"])
         if safe_payload["status"] not in TICKET_STATUSES:
@@ -409,11 +442,15 @@ async def update_message(
         ):
             safe_payload["status"] = "Awaiting Approval"
     safe_payload["last_updated"] = datetime.now(timezone.utc)
-    await db["messages"].find_one_and_update(
+    updated_message = await db["messages"].find_one_and_update(
         {"_id": ObjectId(id)},
-        {"$set": safe_payload}
+        {"$set": safe_payload},
+        return_document=ReturnDocument.AFTER,
     )
-    return {"message": "Message updated"}
+    return {
+        "message": "Message updated",
+        "order_info": serialize_for_json((updated_message or {}).get("order_info")),
+    }
 
 async def ensure_message_access(
     message_id: str,
@@ -849,10 +886,14 @@ def clean_json_response(response: str):
         return {"order_id": "", "type": "", "status": 0, "msg": "No order found in message"}
 
 
-def cacheable_order_info(order_info: dict, *, source: str = "ai") -> dict:
+def cacheable_order_info(order_info: dict, *, source: str = "ai", keep_shopify_order: bool = False) -> dict:
     """Strip volatile fields before storing analysis results on the message."""
     cached = dict(order_info or {})
-    cached.pop("shopify_order", None)
+    if keep_shopify_order and cached.get("shopify_order"):
+        cached["shopify_order"] = serialize_for_json(cached["shopify_order"])
+        cached["order_snapshot_updated_at"] = cached["shopify_order"].get("updated_at")
+    else:
+        cached.pop("shopify_order", None)
     cached["analysis_source"] = source
     cached["analyzed_at"] = datetime.now(timezone.utc)
     return cached
@@ -1217,6 +1258,12 @@ async def get_order_actions(db: AsyncIOMotorDatabase, order: dict) -> list[dict]
         })
 
     return dedupe_order_actions([*stored_actions, *shopify_actions, *audit_actions])
+
+
+async def build_order_snapshot(db: AsyncIOMotorDatabase, order: dict) -> dict:
+    snapshot = dict(order or {})
+    snapshot["order_actions"] = await get_order_actions(db, snapshot)
+    return serialize_for_json(snapshot)
     
 @router.post("/analyze_as_list", response_model=list)
 async def analyze_email_message_as_list(
@@ -1324,11 +1371,18 @@ async def analyze_email_message(
 
         if not shopify_updated and db_order and client_email and db_order.get("customer", {}).get("email", "") == client_email:
             # Cached order_info is fresh – return immediately with attached shopify_order
-            db_order["order_actions"] = await get_order_actions(db, db_order)
-            db_order["_id"] = str(db_order["_id"])
-            db_order["user_id"] = str(db_order.get("user_id", ""))
-            db_order["company_id"] = str(db_order.get("company_id", ""))
-            order_info["shopify_order"] = db_order
+            order_info["shopify_order"] = await build_order_snapshot(db, db_order)
+            if order_info.get("confirmed"):
+                await db["messages"].update_one(
+                    {"_id": message_doc["_id"]},
+                    {"$set": {
+                        "order_info": cacheable_order_info(
+                            order_info,
+                            source="confirmed",
+                            keep_shopify_order=True,
+                        ),
+                    }},
+                )
             await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
             logger.info(
                 "Order analysis skipped; cached order_info is fresh",
@@ -1454,11 +1508,7 @@ async def analyze_email_message(
     
     if db_order:
         if client_email and db_order.get("customer", {}).get("email", "") == client_email:
-            db_order["order_actions"] = await get_order_actions(db, db_order)
-            db_order["_id"] = str(db_order["_id"])
-            db_order["user_id"] = str(db_order.get("user_id", ""))
-            db_order["company_id"] = str(db_order.get("company_id", ""))
-            order_info["shopify_order"] = db_order
+            order_info["shopify_order"] = await build_order_snapshot(db, db_order)
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {

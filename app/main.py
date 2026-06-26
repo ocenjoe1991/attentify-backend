@@ -18,6 +18,7 @@ import logging
 from datetime import datetime, timezone
 
 logger = logging.getLogger("attentify")
+ORDER_TTL_SECONDS = 365 * 24 * 60 * 60
 
 import socketio
 from socketio.exceptions import ConnectionRefusedError
@@ -176,8 +177,13 @@ async def ensure_database_indexes(db):
     await db["orders"].create_index([("company_id", 1), ("name", 1)])
     await db["orders"].create_index([("company_id", 1), ("order_id", 1)])
     await db["orders"].create_index([("company_id", 1), ("customer.email", 1)])
-    # TTL: auto-delete orders older than 6 months (180 days)
-    await db["orders"].create_index("created_at", expireAfterSeconds=15552000)
+    ttl_index_name = "created_at_1"
+    async for index in db["orders"].list_indexes():
+        if index.get("name") == ttl_index_name and index.get("expireAfterSeconds") != ORDER_TTL_SECONDS:
+            await db["orders"].drop_index(ttl_index_name)
+            break
+    # TTL: auto-delete orders older than 1 year.
+    await db["orders"].create_index("created_at", expireAfterSeconds=ORDER_TTL_SECONDS)
 
     # Messages
     await db["messages"].create_index([("company_id", 1), ("last_updated", -1)])

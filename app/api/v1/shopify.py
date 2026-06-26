@@ -40,7 +40,7 @@ SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
 SHOPIFY_REDIRECT_URI = os.getenv("SHOPIFY_REDIRECT_URI", "http://localhost:8000/api/v1/shopify/callback")
 SHOPIFY_SCOPES = os.getenv(
     "SHOPIFY_SCOPES",
-    "read_products,write_products,read_orders,write_orders,read_customers,write_customers,"
+    "read_products,write_products,read_orders,read_all_orders,write_orders,read_customers,write_customers,"
     "read_returns,write_returns,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders",
 )
 SHOPIFY_INSTALL_URL=os.getenv("SHOPIFY_INSTALL_URL")
@@ -866,7 +866,8 @@ async def shopify_callback(request: Request):
                 "company_id": ObjectId(company_id),
                 "webhook_id": webhook_ids.get("create_id") if webhook_ids else None,
                 "webhook_update_id": webhook_ids.get("update_id") if webhook_ids else None,
-            }
+            },
+            "$unset": {"last_synced_at": ""},
         },
         upsert=True
     )
@@ -1222,6 +1223,34 @@ async def shopify_orders_updated_webhook(
         # Upsert the single updated order using the same upsert_orders helper
         from app.services.shopify_service import upsert_orders
         await upsert_orders(db, x_shopify_shop_domain, [data])
+        db_order = await db["orders"].find_one({
+            "shop": x_shopify_shop_domain,
+            "order_id": data.get("id"),
+        })
+        if db_order:
+            from app.api.v1.message import build_order_snapshot
+            order_snapshot = await build_order_snapshot(db, db_order)
+            now = datetime.now(timezone.utc)
+            await db["messages"].update_many(
+                {
+                    "company_id": db_order.get("company_id"),
+                    "order_info.confirmed": True,
+                    "$or": [
+                        {"order_info.order_id": db_order.get("name")},
+                        {"matched_order_name": db_order.get("name")},
+                        {"matched_order_id": str(db_order.get("order_id", ""))},
+                    ],
+                },
+                {"$set": {
+                    "order_info.shopify_order": order_snapshot,
+                    "order_info.order_snapshot_updated_at": order_snapshot.get("updated_at"),
+                    "order_info.analyzed_at": now,
+                    "order_info.analysis_source": "shopify_webhook",
+                    "order_analysis.status": "cached",
+                    "order_analysis.source": "shopify_webhook",
+                    "order_analysis.updated_at": now,
+                }},
+            )
 
         logger.info("Order %s updated via webhook for %s", data.get("id"), x_shopify_shop_domain)
         return {"success": True}
