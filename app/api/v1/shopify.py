@@ -969,7 +969,7 @@ async def list_company_shopify_cred(
     return docs
 
 @router.delete("/{shopify_id}")
-async def delete_shopify_cred(
+async def disconnect_shopify_cred(
     shopify_id: str,
     request: Request,
     current_user: dict = Depends(get_current_user),
@@ -1009,10 +1009,26 @@ async def delete_shopify_cred(
         except requests.RequestException as e:
             logger.error("Webhook delete exception for %s: %s", shop, e)
 
-    # Delete the credential document from MongoDB
-    result = await db.shopify_cred.delete_one({"_id": ObjectId(shopify_id)})
+    # Keep the store row so users can clearly see and reconnect known stores.
+    result = await db.shopify_cred.update_one(
+        {"_id": ObjectId(shopify_id)},
+        {
+            "$set": {
+                "status": "disconnected",
+                "updated_at": datetime.now(timezone.utc),
+            },
+            "$unset": {
+                "access_token": "",
+                "webhook_id": "",
+                "webhook_update_id": "",
+                "last_synced_at": "",
+                "last_checked_scopes": "",
+                "has_read_all_orders": "",
+            },
+        },
+    )
 
-    if result.deleted_count == 0:
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Shopify credential not found")
 
     await record_audit_log(
@@ -1020,13 +1036,13 @@ async def delete_shopify_cred(
         company_id=cred["company_id"],
         actor=current_user,
         actor_role=membership.get("role", "unknown"),
-        action="Removed Shopify store",
+        action="Disconnected Shopify store",
         entity_type="shopify_cred",
         entity_id=ObjectId(shopify_id),
         details={"shop": shop},
     )
 
-    return {"detail": "Deleted successfully"}
+    return {"detail": "Disconnected successfully"}
 
 # Register Shopify Webhook
 def _register_single_webhook(shop: str, access_token: str, topic: str, address: str) -> str | None:
