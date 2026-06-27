@@ -51,6 +51,15 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 OWNER_ROLES = {"company_owner", "store_owner"}
 
 
+def normalized_shopify_scopes() -> str:
+    base_scopes = SHOPIFY_SCOPES or ""
+    scopes = [scope.strip() for scope in base_scopes.split(",") if scope.strip()]
+    for required_scope in ("read_orders", "read_all_orders"):
+        if required_scope not in scopes:
+            scopes.append(required_scope)
+    return ",".join(scopes)
+
+
 def to_float_amount(value) -> float:
     try:
         return round(float(value or 0), 2)
@@ -707,7 +716,7 @@ class ShopifyAuthHelper:
     def build_authorization_url(self, shop: str, redirect_uri: str):
         params = {
             "client_id": self.client_id,
-            "scope": SHOPIFY_SCOPES,  
+            "scope": normalized_shopify_scopes(),
             "redirect_uri": redirect_uri,
             "state": "secure_random_state",  
         }
@@ -753,13 +762,15 @@ async def shopify_auth(request: Request,
     shop = request.query_params.get("shop", "")
     if shop:
         redirect_uri = f"{BACKEND_URL}/api/v1/shopify/callback"
+        scopes = normalized_shopify_scopes()
         auth_params = {
             "client_id": SHOPIFY_API_KEY,
-            "scope": SHOPIFY_SCOPES,
+            "scope": scopes,
             "redirect_uri": redirect_uri,
             "state": state_data,
         }
         auth_url = f"https://{shop}/admin/oauth/authorize?{urlencode(auth_params)}"
+        logger.info("Starting Shopify OAuth for %s with scopes: %s", shop, scopes)
         return RedirectResponse(url=auth_url)
     
     # No shop → use SHOPIFY_INSTALL_URL + store pending record for callback recovery
@@ -768,6 +779,7 @@ async def shopify_auth(request: Request,
         "company_id": company_id,
         "created_at": datetime.now(timezone.utc)
     })
+    logger.info("Starting Shopify install URL flow for company %s", company_id)
     return RedirectResponse(url=SHOPIFY_INSTALL_URL)
 
 @router.get("/install")
@@ -863,7 +875,7 @@ async def shopify_callback(request: Request):
     webhook_ids = register_shopify_webhook(shop, access_token)
 
     await db.shopify_cred.update_one(
-        {"shop": shop, "user_id": ObjectId(user_id)},
+        {"shop": shop, "company_id": ObjectId(company_id)},
         {
             "$set": {
                 "shop": shop,
@@ -886,7 +898,7 @@ async def shopify_callback(request: Request):
         "company_id": ObjectId(company_id),
         "status": "active",
     })
-    cred = await db.shopify_cred.find_one({"shop": shop, "user_id": ObjectId(user_id)})
+    cred = await db.shopify_cred.find_one({"shop": shop, "company_id": ObjectId(company_id)})
     await record_audit_log(
         db,
         company_id=ObjectId(company_id),
@@ -963,7 +975,10 @@ async def list_company_shopify_cred(
 
     await require_company_member(db, current_user, ObjectId(company_id))
 
-    cursor = db.shopify_cred.find({"company_id": ObjectId(company_id)})
+    cursor = db.shopify_cred.find({
+        "company_id": ObjectId(company_id),
+        "status": {"$ne": "disconnected"},
+    })
     docs = []
 
     async for doc in cursor:

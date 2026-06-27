@@ -28,7 +28,7 @@ def _to_datetime(value):
 async def get_all_shopify_creds(db):
     """Fetch all Shopify store credentials from the database."""
     # Use .to_list() with a reasonable length
-    return await db.shopify_cred.find({}).to_list(length=100)
+    return await db.shopify_cred.find({"status": "connected"}).to_list(length=100)
 
 
 def fetch_access_scopes(shop, access_token):
