@@ -1,4 +1,5 @@
 import re
+import asyncio
 import urllib.parse
 import logging
 import os
@@ -121,10 +122,15 @@ async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
 
     while next_url:
         page_count += 1
-        resp = requests.get(next_url, headers=headers)
+        resp = await asyncio.to_thread(
+            requests.get,
+            next_url,
+            headers=headers,
+            timeout=30,
+        )
         if resp.status_code != 200:
             logger.warning("Shopify fetch page %d failed: HTTP %d for %s", page_count, resp.status_code, shop)
-            break
+            raise RuntimeError(f"Shopify fetch failed for {shop}: HTTP {resp.status_code}")
 
         data = resp.json()
         page_orders = data.get("orders", [])
@@ -152,6 +158,67 @@ async def fetch_orders_from_shop(shop, access_token, updated_at_min=None):
             logger.info("Shopify fetch complete: %d total orders, %d pages for %s", len(orders), page_count, shop)
 
     return orders
+
+
+async def fetch_order_pages_from_shop(shop, access_token, updated_at_min=None):
+    """Yield Shopify orders one page at a time using cursor pagination."""
+    url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders.json?limit=250&status=any"
+    if updated_at_min:
+        url += f"&updated_at_min={urllib.parse.quote(updated_at_min)}"
+    else:
+        url += "&created_at_min=" + urllib.parse.quote("2020-01-01T00:00:00Z")
+    url += "&order=created_at desc"
+    logger.info("Fetching orders from Shopify in pages: %s", url)
+
+    headers = {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json",
+    }
+    next_url = url
+    page_count = 0
+    total_count = 0
+
+    while next_url:
+        page_count += 1
+        resp = await asyncio.to_thread(
+            requests.get,
+            next_url,
+            headers=headers,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            logger.warning("Shopify fetch page %d failed: HTTP %d for %s", page_count, resp.status_code, shop)
+            raise RuntimeError(f"Shopify fetch failed for {shop}: HTTP {resp.status_code}")
+
+        page_orders = resp.json().get("orders", [])
+        total_count += len(page_orders)
+
+        link = resp.headers.get("link", "")
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+        raw_next_url = match.group(1) if match else None
+        if raw_next_url:
+            parsed = urllib.parse.urlparse(raw_next_url)
+            query = urllib.parse.parse_qs(parsed.query)
+            page_info = query.get("page_info", [None])[0]
+            next_url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders.json?limit=250&page_info={page_info}" if page_info else None
+        else:
+            next_url = None
+
+        logger.info(
+            "Shopify fetch page %d: got %d orders (total so far: %d) for %s",
+            page_count,
+            len(page_orders),
+            total_count,
+            shop,
+        )
+        yield {
+            "orders": page_orders,
+            "page": page_count,
+            "total": total_count,
+            "has_next": bool(next_url),
+        }
+
+    logger.info("Shopify fetch complete: %d total orders, %d pages for %s", total_count, page_count, shop)
 
 async def upsert_orders(db, shop, orders):
     """Insert or update orders in the database for a specific shop."""

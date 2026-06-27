@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request, HTTPException, Header, status, Backgroun
 from fastapi.responses import RedirectResponse, JSONResponse
 from urllib.parse import urlencode
 import hmac, hashlib, requests, base64
+import asyncio
 import logging
 import os
 import re
@@ -13,7 +14,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.services.shopify_service import (
     get_all_shopify_creds,
     fetch_access_scopes,
-    fetch_orders_from_shop,
+    fetch_order_pages_from_shop,
     upsert_orders,
     _to_datetime,
 )
@@ -1417,7 +1418,18 @@ async def sync_orders(
     membership = await require_company_member(db, current_user, ObjectId(company_id))
     if membership.get("role") not in OWNER_ROLES:
         raise HTTPException(status_code=403, detail="Only owners can sync Shopify orders")
-    background_tasks.add_task(sync_company_orders, ObjectId(company_id))
+    company_object_id = ObjectId(company_id)
+    connected_count = await db["shopify_cred"].count_documents({
+        "company_id": company_object_id,
+        "status": "connected",
+        "access_token": {"$exists": True, "$ne": ""},
+    })
+    if connected_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No connected Shopify stores found. Connect a store before syncing orders.",
+        )
+    background_tasks.add_task(sync_company_orders, company_object_id)
     return {"msg": "Sync started."}
 
 # Background job: fetch and upsert all orders for all stores
@@ -1432,7 +1444,7 @@ async def sync_all_stores_orders():
         if not shop or not access_token:
             continue
         try:
-            scopes = fetch_access_scopes(shop, access_token)
+            scopes = await asyncio.to_thread(fetch_access_scopes, shop, access_token)
             if "read_all_orders" not in scopes:
                 logger.warning(
                     "Shopify token for %s does not include read_all_orders; historical orders may be limited to recent orders.",
@@ -1440,8 +1452,10 @@ async def sync_all_stores_orders():
                 )
             last_synced = cred.get("last_synced_at")
             updated_at_min = last_synced.isoformat() if last_synced else None
-            orders = await fetch_orders_from_shop(shop, access_token, updated_at_min)
-            await upsert_orders(db, shop, orders)
+            total_synced = 0
+            async for page in fetch_order_pages_from_shop(shop, access_token, updated_at_min):
+                await upsert_orders(db, shop, page["orders"])
+                total_synced = page["total"]
             await db["shopify_cred"].update_one(
                 {"shop": shop},
                 {"$set": {
@@ -1450,7 +1464,7 @@ async def sync_all_stores_orders():
                     "has_read_all_orders": "read_all_orders" in scopes,
                 }}
             )
-            logger.info("Synced %d orders for shop %s (since %s)", len(orders), shop, updated_at_min or "beginning")
+            logger.info("Synced %d orders for shop %s (since %s)", total_synced, shop, updated_at_min or "beginning")
         except Exception as e:
             logger.error("Error syncing %s: %s", shop, e)
 
@@ -1460,13 +1474,14 @@ async def sync_company_orders(company_id: ObjectId):
     db = get_db()
     now = datetime.now(timezone.utc)
     cursor = db["shopify_cred"].find({"company_id": company_id, "status": "connected"})
+    synced_shops = 0
     async for cred in cursor:
         shop = cred.get("shop")
         access_token = cred.get("access_token")
         if not shop or not access_token:
             continue
         try:
-            scopes = fetch_access_scopes(shop, access_token)
+            scopes = await asyncio.to_thread(fetch_access_scopes, shop, access_token)
             if "read_all_orders" not in scopes:
                 logger.warning(
                     "Shopify token for %s does not include read_all_orders; historical orders may be limited to recent orders.",
@@ -1474,8 +1489,20 @@ async def sync_company_orders(company_id: ObjectId):
                 )
             last_synced = cred.get("last_synced_at")
             updated_at_min = last_synced.isoformat() if last_synced else None
-            orders = await fetch_orders_from_shop(shop, access_token, updated_at_min)
-            await upsert_orders(db, shop, orders)
+            total_synced = 0
+            async for page in fetch_order_pages_from_shop(shop, access_token, updated_at_min):
+                await upsert_orders(db, shop, page["orders"])
+                total_synced = page["total"]
+                await sio.emit(
+                    "shopify_sync_progress",
+                    {
+                        "company_id": str(company_id),
+                        "shop": shop,
+                        "page": page["page"],
+                        "synced_count": total_synced,
+                        "done": not page["has_next"],
+                    },
+                )
             await db["shopify_cred"].update_one(
                 {"shop": shop},
                 {"$set": {
@@ -1484,9 +1511,12 @@ async def sync_company_orders(company_id: ObjectId):
                     "has_read_all_orders": "read_all_orders" in scopes,
                 }}
             )
-            logger.info("Synced %d orders for shop %s (since %s)", len(orders), shop, updated_at_min or "beginning")
+            logger.info("Synced %d orders for shop %s (since %s)", total_synced, shop, updated_at_min or "beginning")
+            synced_shops += 1
         except Exception as e:
             logger.error("Error syncing %s: %s", shop, e)
+    if synced_shops == 0:
+        logger.warning("No connected Shopify stores with access tokens found for company %s", company_id)
     # Notify clients that sync completed for this company
     await sio.emit("shopify_sync_complete", {"company_id": str(company_id)})
 
