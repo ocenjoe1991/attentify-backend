@@ -1264,6 +1264,31 @@ async def build_order_snapshot(db: AsyncIOMotorDatabase, order: dict) -> dict:
     snapshot = dict(order or {})
     snapshot["order_actions"] = await get_order_actions(db, snapshot)
     return serialize_for_json(snapshot)
+
+
+def same_email(left: str | None, right: str | None) -> bool:
+    return bool(left and right and str(left).strip().lower() == str(right).strip().lower())
+
+
+def message_search_text(message_doc: dict) -> str:
+    parts = [
+        str(message_doc.get("subject") or ""),
+        str(message_doc.get("snippet") or ""),
+        str(message_doc.get("client") or ""),
+    ]
+    for entry in message_doc.get("messages", []) or []:
+        if isinstance(entry, dict):
+            parts.extend(
+                str(entry.get(field) or "")
+                for field in ("subject", "body", "content", "text", "message")
+            )
+        else:
+            parts.append(str(entry))
+    return "\n".join(parts)
+
+
+def mentions_order_number(message_doc: dict) -> bool:
+    return bool(re.search(r"#?[A-Za-z]{1,6}\d{3,}", message_search_text(message_doc), re.IGNORECASE))
     
 @router.post("/analyze_as_list", response_model=list)
 async def analyze_email_message_as_list(
@@ -1322,7 +1347,7 @@ async def analyze_email_message(
         client_email = email_match[0]
 
     # Requirement 1: If customer email has zero orders, skip AI entirely (no loading)
-    if client_email:
+    if client_email and not mentions_order_number(message_doc):
         order_count = await db["orders"].count_documents({
             "company_id": message_doc["company_id"],
             "customer.email": client_email,
@@ -1356,7 +1381,10 @@ async def analyze_email_message(
         # Requirement 3: Check if Shopify order was updated since last analysis
         shopify_updated = False
         order_name = order_info["order_id"] if order_info["order_id"].startswith("#") else "#" + order_info["order_id"]
-        db_order = await db["orders"].find_one({"name": order_name})
+        db_order = await db["orders"].find_one({
+            "company_id": message_doc["company_id"],
+            "name": order_name,
+        })
 
         if db_order and order_info.get("analyzed_at"):
             try:
@@ -1369,7 +1397,9 @@ async def analyze_email_message(
             except Exception:
                 pass
 
-        if not shopify_updated and db_order and client_email and db_order.get("customer", {}).get("email", "") == client_email:
+        if not shopify_updated and db_order and (
+            not client_email or same_email(db_order.get("customer", {}).get("email", ""), client_email)
+        ):
             # Cached order_info is fresh – return immediately with attached shopify_order
             order_info["shopify_order"] = await build_order_snapshot(db, db_order)
             if order_info.get("confirmed"):
@@ -1504,11 +1534,14 @@ async def analyze_email_message(
 
     order_name = order_id if order_id.startswith("#") else "#" + order_id
 
-    db_order = await db["orders"].find_one({"name": order_name})
+    db_order = await db["orders"].find_one({
+        "company_id": message_doc["company_id"],
+        "name": order_name,
+    })
     
     if db_order:
-        if client_email and db_order.get("customer", {}).get("email", "") == client_email:
-            order_info["shopify_order"] = await build_order_snapshot(db, db_order)
+        order_info["shopify_order"] = await build_order_snapshot(db, db_order)
+        if not client_email or same_email(db_order.get("customer", {}).get("email", ""), client_email):
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {
@@ -1533,7 +1566,6 @@ async def analyze_email_message(
 
         else:
             order_info["msg"] = "Email not matched"
-            order_info["shopify_order"] = {}
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {

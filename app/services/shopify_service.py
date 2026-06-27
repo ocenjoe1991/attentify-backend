@@ -236,6 +236,26 @@ async def upsert_orders(db, shop, orders):
 
     bulk_ops = []
     for order in orders:
+        customer = order.get("customer") or {}
+        shipping_address = order.get("shipping_address") or {}
+        billing_address = order.get("billing_address") or {}
+        default_address = customer.get("default_address") or shipping_address or billing_address or {}
+        customer_email = (
+            customer.get("email")
+            or order.get("email")
+            or order.get("contact_email")
+            or shipping_address.get("email")
+            or billing_address.get("email")
+        )
+        customer_phone = (
+            customer.get("phone")
+            or order.get("phone")
+            or shipping_address.get("phone")
+            or billing_address.get("phone")
+        )
+        first_name = customer.get("first_name") or shipping_address.get("first_name") or billing_address.get("first_name") or ""
+        last_name = customer.get("last_name") or shipping_address.get("last_name") or billing_address.get("last_name") or ""
+        customer_name = f"{first_name} {last_name}".strip() or order.get("customer_locale", "")
         doc = {
             "order_id": order["id"],
             "user_id": ObjectId(user_id),
@@ -245,21 +265,21 @@ async def upsert_orders(db, shop, orders):
             "shop": shop,
             "created_at": _to_datetime(order.get("created_at")),
             "customer": {
-                "id": order.get("customer", {}).get("id"),
-                "email": order.get("customer", {}).get("email"),
-                "name": f"{order.get('customer', {}).get('first_name', '')} {order.get('customer', {}).get('last_name', '')}".strip(),
-                "phone": order.get("customer", {}).get("phone"),
+                "id": customer.get("id"),
+                "email": customer_email,
+                "name": customer_name,
+                "phone": customer_phone,
                 "default_address": {
-                    "address1": order.get("customer", {}).get("default_address", {}).get("address1"),
-                    "address2": order.get("customer", {}).get("default_address", {}).get("address2"),
-                    "city": order.get("customer", {}).get("default_address", {}).get("city"),
-                    "province": order.get("customer", {}).get("default_address", {}).get("province"),
-                    "country": order.get("customer", {}).get("default_address", {}).get("country"),
-                    "zip": order.get("customer", {}).get("default_address", {}).get("zip"),
+                    "address1": default_address.get("address1"),
+                    "address2": default_address.get("address2"),
+                    "city": default_address.get("city"),
+                    "province": default_address.get("province"),
+                    "country": default_address.get("country"),
+                    "zip": default_address.get("zip"),
                 }
             },
-            "shipping_address": order.get("shipping_address", {}),
-            "billing_address": order.get("billing_address", {}),
+            "shipping_address": shipping_address,
+            "billing_address": billing_address,
             "total_shipping_price": (
                 order.get("total_shipping_price_set", {})
                     .get("shop_money", {})
