@@ -45,7 +45,6 @@ SHOPIFY_API_VERSION = os.getenv("SHOPIFY_API_VERSION", "2025-10")
 
 TICKET_STATUSES = {
     "Open",
-    "Assigned",
     "In Progress",
     "Pending",
     "Resolved",
@@ -55,6 +54,7 @@ TICKET_STATUSES = {
 }
 
 LEGACY_STATUS_MAP = {
+    "Assigned": "Open",
     "Closed": "Resolved",
     "Cancelled": "Canceled",
     "open": "Open",
@@ -64,12 +64,13 @@ LEGACY_STATUS_MAP = {
 
 ACTIVE_STATUSES = {
     "Open",
-    "Assigned",
     "In Progress",
     "Pending",
     "Escalated",
     "Awaiting Approval",
 }
+
+ACTIVE_QUERY_STATUSES = ACTIVE_STATUSES | {"Assigned"}
 
 ARCHIVED_STATUSES = {
     "Resolved",
@@ -251,7 +252,7 @@ async def get_company_messages(
     if view_mode == "inbox":
         query["trashed"] = {"$ne": True}
         query["archived"] = {"$ne": True}
-        query["status"] = {"$in": list(ACTIVE_STATUSES)}
+        query["status"] = {"$in": list(ACTIVE_QUERY_STATUSES)}
     elif view_mode == "archived":
         query["trashed"] = {"$ne": True}
         query["$and"] = query.get("$and", [])
@@ -884,8 +885,6 @@ async def update_message_field(
 
     # Perform update
     set_payload = {field: value, "last_updated": datetime.now(timezone.utc)}
-    if field == "assigned_member_id" and value and normalize_status(message.get("status", "Open")) == "Open":
-        set_payload["status"] = "Assigned"
     result = await db["messages"].update_one(
         {"_id": ObjectId(message_id)},
         {"$set": set_payload}
@@ -933,7 +932,7 @@ async def update_message_field(
             logger.info("Archive change", extra={"actor_email": current_user.get("email", ""), "message_id": str(message.get("_id")), "old": bool(message.get("archived")), "new": bool(value), "ip": client_ip})
         except Exception:
             pass
-    return {"message": f"{field} updated"}
+    return {"message": f"{field} updated", "field": field, "value": serialize_for_json(value)}
 
 def clean_json_response(response: str):
     """
