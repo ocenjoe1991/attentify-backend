@@ -501,6 +501,7 @@ async def update_message(
             order_info["shopify_order"] = await build_order_snapshot(db, db_order)
             safe_payload["matched_order_id"] = str(db_order.get("order_id", ""))
             safe_payload["matched_order_name"] = db_order.get("name", order_info.get("order_id", ""))
+            safe_payload.update(await matched_store_fields(db, message, db_order))
 
         safe_payload.pop("order_info.order_id", None)
         safe_payload.pop("order_info.confirmed", None)
@@ -1463,6 +1464,9 @@ async def find_order_for_message(db: AsyncIOMotorDatabase, message_doc: dict, or
         if scoped_order:
             return scoped_order, True
         fallback_order = await db["orders"].find_one(base_query)
+        scope_shops = message_store_scope_shops(message_doc)
+        if fallback_order and fallback_order.get("shop") in scope_shops:
+            return fallback_order, True
         return fallback_order, False
     scope_shops = message_store_scope_shops(message_doc)
     if scope_shops:
