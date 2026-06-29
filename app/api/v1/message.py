@@ -207,7 +207,7 @@ async def get_messages(db=Depends(get_database), current_user: dict = Depends(ge
 @router.get("/company_messages", response_model=dict)
 async def get_company_messages(
     company_id: str = Query(..., description="ID of the company"),
-    search: str = Query("", description="Search by message title or client name/email"),
+    search: str = Query("", description="Search by client, title, or ticket"),
     page: int = Query(1, ge=1, description="Page number"),
     size: int = Query(10, ge=1, le=100, description="Page size"),
     view_mode: str = Query("inbox", description="inbox, archived, or trashed"),
@@ -215,7 +215,7 @@ async def get_company_messages(
     status_filter: str = Query("all", description="Message status or all"),
     order_filter: str = Query("all", description="all, order, other, or needs_review"),
     store_id: str = Query("", description="Default Shopify store ID or unassigned"),
-    sort_by: str = Query("created_at", description="started_at, created_at or last_updated"),
+    sort_by: str = Query("started_at", description="title, ticket, started_at, created_at or last_updated"),
     sort_order: str = Query("desc", description="asc or desc"),
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict = Depends(get_current_user)
@@ -270,11 +270,18 @@ async def get_company_messages(
     # Apply search filter (case-insensitive)
     if search.strip():
         search_regex = {"$regex": search.strip(), "$options": "i"}
-        query["$or"] = [
+        search_or = [
             {"title": search_regex},
             {"client": search_regex},
             {"ticket": search_regex},
         ]
+        if "$or" in query:
+            existing_or = query.pop("$or")
+            query["$and"] = query.get("$and", [])
+            query["$and"].append({"$or": existing_or})
+            query["$and"].append({"$or": search_or})
+        else:
+            query["$or"] = search_or
 
     if assigned_filter == "assigned":
         query["assigned_member_id"] = {"$exists": True, "$ne": None}
@@ -328,8 +335,17 @@ async def get_company_messages(
             raise HTTPException(status_code=400, detail="Invalid status for archive")
         query["status"] = status_filter
 
-    # Support 'created_at' as alias for 'started_at' (messages use started_at as creation date)
-    sort_field = "started_at" if sort_by in ("started_at", "created_at") else "last_updated"
+    # Support 'created_at' as alias for 'started_at' (messages use started_at as ticket date)
+    sort_fields = {
+        "title": "title",
+        "ticket": "ticket",
+        "started_at": "started_at",
+        "created_at": "started_at",
+        "last_updated": "last_updated",
+    }
+    if sort_by not in sort_fields:
+        raise HTTPException(status_code=400, detail="Invalid sort field")
+    sort_field = sort_fields[sort_by]
     sort_direction = ASCENDING if sort_order == "asc" else DESCENDING
 
     # Count total documents for pagination
@@ -339,19 +355,21 @@ async def get_company_messages(
     # Pagination
     skip = (page - 1) * size
 
+    sort_value = (
+        {"$toLower": {"$ifNull": [f"${sort_field}", ""]}}
+        if sort_field in {"title", "ticket"}
+        else {
+            "$ifNull": [
+                f"${sort_field}",
+                {"$ifNull": ["$last_updated", "$started_at"]},
+            ]
+        }
+    )
+
     pipeline = [
         {"$match": query},
-        {
-            "$addFields": {
-                "_sort_date": {
-                    "$ifNull": [
-                        f"${sort_field}",
-                        {"$ifNull": ["$last_updated", "$started_at"]},
-                    ]
-                }
-            }
-        },
-        {"$sort": {"_sort_date": sort_direction, "_id": sort_direction}},
+        {"$addFields": {"_sort_value": sort_value}},
+        {"$sort": {"_sort_value": sort_direction, "_id": sort_direction}},
         {"$skip": skip},
         {"$limit": size},
     ]
