@@ -364,6 +364,8 @@ async def get_company_messages(
         doc["company_id"] = str(doc["company_id"])
         if doc.get("default_store_id"):
             doc["default_store_id"] = str(doc["default_store_id"])
+        if doc.get("order_matching_store_ids"):
+            doc["order_matching_store_ids"] = [str(store_id) for store_id in doc["order_matching_store_ids"]]
         if doc.get("gmail_account_id"):
             doc["gmail_account_id"] = str(doc["gmail_account_id"])
         doc["status"] = normalize_status(doc.get("status", "Open"))
@@ -408,6 +410,8 @@ async def get_message(
     doc["company_id"] = str(doc["company_id"])
     if doc.get("default_store_id"):
         doc["default_store_id"] = str(doc["default_store_id"])
+    if doc.get("order_matching_store_ids"):
+        doc["order_matching_store_ids"] = [str(store_id) for store_id in doc["order_matching_store_ids"]]
     if doc.get("gmail_account_id"):
         doc["gmail_account_id"] = str(doc["gmail_account_id"])
     if "assigned_member_id" in doc and doc["assigned_member_id"]:
@@ -830,7 +834,7 @@ async def update_message_field(
         raise HTTPException(status_code=400, detail="Field is required")
 
     # Optionally, prevent updates to _id or forbidden fields
-    allowed_fields = {"assigned_member_id", "status", "trashed", "archived"}
+    allowed_fields = {"assigned_member_id", "status", "trashed", "archived", "default_store_id"}
     if field not in allowed_fields:
         raise HTTPException(status_code=400, detail="Field cannot be updated here")
     if field == "assigned_member_id" and role not in OWNER_ROLES:
@@ -864,6 +868,31 @@ async def update_message_field(
             and not has_owner_approval_bypass(membership, PERMISSION_RESOLVE_WITHOUT_OWNER_APPROVAL)
         ):
             value = "Awaiting Approval"
+    if field == "default_store_id":
+        if not value:
+            set_payload = {
+                "$unset": {"default_store_id": "", "default_store_shop": "", "order_info": "", "order_match_status": ""},
+                "$set": {"last_updated": datetime.now(timezone.utc)},
+            }
+            result = await db["messages"].update_one({"_id": ObjectId(message_id)}, set_payload)
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="Message not found")
+            return {"message": "default_store_id updated", "field": field, "value": ""}
+        try:
+            value = ObjectId(value)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid default_store_id")
+        store = await db["shopify_cred"].find_one({
+            "_id": value,
+            "company_id": message["company_id"],
+            "status": {"$ne": "disconnected"},
+        })
+        if not store:
+            raise HTTPException(status_code=404, detail="Shopify store not found")
+        scope_ids = message.get("order_matching_store_ids") or []
+        if scope_ids and value not in scope_ids:
+            raise HTTPException(status_code=400, detail="Store is not in this message's matching scope")
+        field = "default_store_id"
 
     # Capture request metadata for audit tracing
     client_ip = None
@@ -885,9 +914,20 @@ async def update_message_field(
 
     # Perform update
     set_payload = {field: value, "last_updated": datetime.now(timezone.utc)}
+    if field == "default_store_id":
+        set_payload["default_store_shop"] = store.get("shop")
+        set_payload.pop("order_match_status", None)
+    update_doc = {"$set": set_payload}
+    if field == "default_store_id":
+        update_doc["$unset"] = {
+            "order_info": "",
+            "order_match_status": "",
+            "matched_order_id": "",
+            "matched_order_name": "",
+        }
     result = await db["messages"].update_one(
         {"_id": ObjectId(message_id)},
-        {"$set": set_payload}
+        update_doc
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Message not found")
@@ -1368,8 +1408,15 @@ def message_store_shop(message_doc: dict) -> str:
     return str(message_doc.get("default_store_shop") or "").strip()
 
 
+def message_store_scope_shops(message_doc: dict) -> list[str]:
+    values = message_doc.get("order_matching_store_shops") or []
+    if not values and message_store_shop(message_doc):
+        values = [message_store_shop(message_doc)]
+    return [str(value).strip() for value in values if str(value or "").strip()]
+
+
 def message_requires_store_scope(message_doc: dict) -> bool:
-    return message_doc.get("channel") == "email" and not message_store_shop(message_doc)
+    return message_doc.get("channel") == "email" and not message_store_scope_shops(message_doc)
 
 
 async def mark_message_needs_store_scope(db: AsyncIOMotorDatabase, message_doc: dict) -> dict:
@@ -1398,6 +1445,10 @@ def scoped_order_query(message_doc: dict, query: dict) -> dict:
     store_shop = message_store_shop(message_doc)
     if store_shop:
         scoped["shop"] = store_shop
+    else:
+        scope_shops = message_store_scope_shops(message_doc)
+        if scope_shops:
+            scoped["shop"] = {"$in": scope_shops}
     return scoped
 
 
@@ -1413,7 +1464,31 @@ async def find_order_for_message(db: AsyncIOMotorDatabase, message_doc: dict, or
             return scoped_order, True
         fallback_order = await db["orders"].find_one(base_query)
         return fallback_order, False
+    scope_shops = message_store_scope_shops(message_doc)
+    if scope_shops:
+        scoped_orders = await db["orders"].find({**base_query, "shop": {"$in": scope_shops}}).to_list(length=2)
+        if len(scoped_orders) == 1:
+            return scoped_orders[0], True
+        if len(scoped_orders) > 1:
+            return scoped_orders[0], False
+        fallback_order = await db["orders"].find_one(base_query)
+        return fallback_order, False
     return await db["orders"].find_one(base_query), True
+
+
+async def matched_store_fields(db: AsyncIOMotorDatabase, message_doc: dict, order_doc: dict) -> dict:
+    shop = order_doc.get("shop")
+    if not shop:
+        return {}
+    fields = {"default_store_shop": shop}
+    cred = await db["shopify_cred"].find_one({
+        "company_id": message_doc.get("company_id"),
+        "shop": shop,
+        "status": {"$ne": "disconnected"},
+    })
+    if cred:
+        fields["default_store_id"] = cred["_id"]
+    return fields
 
 
 async def refresh_confirmed_order_if_needed(
@@ -1595,6 +1670,7 @@ async def analyze_email_message(
             # Cached order_info is fresh – return immediately with attached shopify_order
             order_info["shopify_order"] = await build_order_snapshot(db, db_order)
             if order_info.get("confirmed"):
+                store_fields = await matched_store_fields(db, message_doc, db_order)
                 await db["messages"].update_one(
                     {"_id": message_doc["_id"]},
                     {"$set": {
@@ -1603,6 +1679,7 @@ async def analyze_email_message(
                             source="confirmed",
                             keep_shopify_order=True,
                         ),
+                        **store_fields,
                     }},
                 )
             await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
@@ -1731,6 +1808,7 @@ async def analyze_email_message(
     if db_order:
         order_info["shopify_order"] = await build_order_snapshot(db, db_order)
         if store_scoped_match and (not client_email or same_email(db_order.get("customer", {}).get("email", ""), client_email)):
+            store_fields = await matched_store_fields(db, message_doc, db_order)
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {
@@ -1743,6 +1821,7 @@ async def analyze_email_message(
                         "order_match_status": "matched",
                         "matched_order_id": str(db_order.get("order_id", "")),
                         "matched_order_name": db_order.get("name", ""),
+                        **store_fields,
                     }
                 },
             )

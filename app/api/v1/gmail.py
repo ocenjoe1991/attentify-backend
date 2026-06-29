@@ -48,6 +48,42 @@ GMAIL_REAUTH_REQUIRED_MESSAGE = (
 )
 
 
+def _account_store_ids(account: dict) -> list[ObjectId]:
+    values = account.get("store_ids")
+    if not values and account.get("store_id"):
+        values = [account.get("store_id")]
+    result = []
+    for value in values or []:
+        if isinstance(value, ObjectId):
+            result.append(value)
+        elif ObjectId.is_valid(str(value)):
+            result.append(ObjectId(str(value)))
+    return result
+
+
+async def _load_store_scope(db: AsyncIOMotorDatabase, company_id: ObjectId, store_ids: list[ObjectId]) -> list[dict]:
+    if not store_ids:
+        return []
+    stores = await db["shopify_cred"].find({
+        "_id": {"$in": store_ids},
+        "company_id": company_id,
+        "status": {"$ne": "disconnected"},
+    }).to_list(length=100)
+    by_id = {store["_id"]: store for store in stores}
+    return [by_id[store_id] for store_id in store_ids if store_id in by_id]
+
+
+def _message_match_conditions(account_id: ObjectId, account_email: str | None) -> list[dict]:
+    conditions = [{"gmail_account_id": account_id}]
+    if account_email:
+        email_pattern = re.escape(account_email)
+        conditions.extend([
+            {"inbox_email": account_email},
+            {"messages": {"$elemMatch": {"metadata.to": {"$regex": email_pattern, "$options": "i"}}}},
+        ])
+    return conditions
+
+
 async def mark_gmail_account_disconnected(db, account: dict, error_message: str = GMAIL_REAUTH_REQUIRED_MESSAGE):
     await db["gmail_accounts"].update_one(
         {"_id": account["_id"]},
@@ -62,6 +98,7 @@ async def mark_gmail_account_disconnected(db, account: dict, error_message: str 
     )
 
 def gmail_account_helper(account: dict) -> dict:
+    store_ids = _account_store_ids(account)
     return {
         "id": str(account["_id"]),
         "user_id": str(account["user_id"]),
@@ -78,7 +115,8 @@ def gmail_account_helper(account: dict) -> dict:
         "is_primary": account.get("is_primary", False),
         "provider": account.get("provider", "google"),
         "history_id":  account.get("history_id", ""),
-        "store": account.get("store", "")
+        "store": account.get("store", ""),
+        "store_ids": [str(store_id) for store_id in store_ids],
     }
 
 @router.post("/", response_model=GmailAccountInDB)
@@ -133,13 +171,12 @@ async def list_gmail_accounts(
         account_data = gmail_account_helper(account)
         account_data["owner_email"] = owner.get("email", "unknown")
         account_data["owner_name"] = f"{owner.get('first_name', 'unknown')} {owner.get('last_name', 'unknown')}"
-        if account.get("store_id"):
-            store = await db.shopify_cred.find_one({"_id": account["store_id"]})
-            if store:
-                account_data["store"] = {
-                    "id": str(store["_id"]),
-                    "shop": store.get("shop", "")
-                }
+        scoped_stores = await _load_store_scope(db, ObjectId(company_id), _account_store_ids(account))
+        account_data["stores"] = [
+            {"id": str(store["_id"]), "shop": store.get("shop", "")}
+            for store in scoped_stores
+        ]
+        account_data["store"] = account_data["stores"][0] if len(account_data["stores"]) == 1 else None
         accounts.append(account_data)
 
     # Fetch company stores so an inbox can be scoped to any connected store in the company.
@@ -216,37 +253,63 @@ async def update_gmail_account(
     update_query = {}
     message_update_query = None
 
-    if field == "store_id":
-        if value == "":  # Remove store_id if empty string
-            update_query = {"$unset": {field: ""}}
+    if field in {"store_id", "store_ids"}:
+        raw_values = value if isinstance(value, list) else ([value] if value else [])
+        store_ids = []
+        for item in raw_values:
+            if not item:
+                continue
+            try:
+                store_ids.append(ObjectId(item))
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid store_id format")
+
+        stores = await _load_store_scope(db, account.get("company_id"), store_ids)
+        if len(stores) != len(store_ids):
+            raise HTTPException(status_code=404, detail="One or more Shopify stores were not found")
+
+        if not store_ids:
+            update_query = {"$unset": {"store_id": "", "store_ids": ""}}
             message_update_query = {
                 "$set": {
                     "gmail_account_id": account_id,
                     "inbox_email": account.get("email"),
                 },
-                "$unset": {"default_store_id": "", "default_store_shop": ""},
+                "$unset": {
+                    "default_store_id": "",
+                    "default_store_shop": "",
+                    "order_matching_store_ids": "",
+                    "order_matching_store_shops": "",
+                },
             }
         else:
-            try:
-                value = ObjectId(value)
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid store_id format")
+            set_payload = {
+                "store_ids": store_ids,
+                "store_id": store_ids[0] if len(store_ids) == 1 else None,
+            }
+            unset_payload = {} if len(store_ids) == 1 else {"store_id": ""}
+            update_query = {"$set": {k: v for k, v in set_payload.items() if v is not None}}
+            if unset_payload:
+                update_query["$unset"] = unset_payload
 
-            store = await db["shopify_cred"].find_one({
-                "_id": value,
-                "company_id": account.get("company_id"),
-                "status": {"$ne": "disconnected"},
-            })
-            if not store:
-                raise HTTPException(status_code=404, detail="Shopify store not found")
-
-            update_query = {"$set": {field: value}}
-            message_update_query = {"$set": {
+            message_set = {
                 "gmail_account_id": account_id,
                 "inbox_email": account.get("email"),
-                "default_store_id": value,
-                "default_store_shop": store.get("shop"),
-            }}
+                "order_matching_store_ids": store_ids,
+                "order_matching_store_shops": [store.get("shop") for store in stores],
+            }
+            if len(stores) == 1:
+                message_set["default_store_id"] = stores[0]["_id"]
+                message_set["default_store_shop"] = stores[0].get("shop")
+                message_update_query = {"$set": message_set}
+            else:
+                message_update_query = {
+                    "$set": message_set,
+                    "$unset": {
+                        "default_store_id": "",
+                        "default_store_shop": "",
+                    },
+                }
     else:
         update_query = {"$set": {field: value}}
 
@@ -258,15 +321,8 @@ async def update_gmail_account(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Gmail account not found")
 
-    if field == "store_id" and message_update_query:
-        message_match_conditions = [{"gmail_account_id": account_id}]
-        account_email = account.get("email")
-        if account_email:
-            email_pattern = re.escape(account_email)
-            message_match_conditions.extend([
-                {"inbox_email": account_email},
-                {"messages": {"$elemMatch": {"metadata.to": {"$regex": email_pattern, "$options": "i"}}}},
-            ])
+    if field in {"store_id", "store_ids"} and message_update_query:
+        message_match_conditions = _message_match_conditions(account_id, account.get("email"))
         await db["messages"].update_many(
             {
                 "company_id": account.get("company_id"),
@@ -882,15 +938,20 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 }
             )
 
-            store = None
-            if account.get("store_id"):
-                store = await db["shopify_cred"].find_one({"_id": account["store_id"]})
+            scoped_stores = await _load_store_scope(
+                db,
+                account.get("company_id"),
+                _account_store_ids(account),
+            )
             message_context = {
                 "gmail_account_id": account.get("_id"),
                 "inbox_email": account.get("email"),
-                "default_store_id": account.get("store_id"),
-                "default_store_shop": store.get("shop") if store else None,
+                "order_matching_store_ids": [store["_id"] for store in scoped_stores],
+                "order_matching_store_shops": [store.get("shop") for store in scoped_stores],
             }
+            if len(scoped_stores) == 1:
+                message_context["default_store_id"] = scoped_stores[0]["_id"]
+                message_context["default_store_shop"] = scoped_stores[0].get("shop")
 
             existing_thread = await db["messages"].find_one(
                 {"user_id": user_object_id, "thread_id": thread_id, "channel": "email"}

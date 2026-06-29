@@ -297,14 +297,15 @@ async def fetch_and_save_gmail(
                 }
             )
 
-            store_id = account.get("store_id")
-            store_shop = account.get("store_shop")
             message_context = {
                 "gmail_account_id": account.get("account_id"),
                 "inbox_email": account.get("email"),
-                "default_store_id": store_id,
-                "default_store_shop": store_shop,
+                "order_matching_store_ids": account.get("store_ids"),
+                "order_matching_store_shops": account.get("store_shops"),
             }
+            if len(account.get("store_ids") or []) == 1:
+                message_context["default_store_id"] = account["store_ids"][0]
+                message_context["default_store_shop"] = (account.get("store_shops") or [""])[0]
 
             # Find existing thread (conversation) in 'messages' collection by thread_id
             existing_thread = await db["messages"].find_one({"user_id": ObjectId(user_id), "thread_id": thread_id, "channel": "email"})
@@ -423,12 +424,18 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
                 "client_secret": cred["client_secret"],
                 "expires_at": cred.get("expires_at"),
                 "history_id": cred.get("history_id"),
-                "store_id": cred.get("store_id"),
+                "store_ids": cred.get("store_ids") or ([cred.get("store_id")] if cred.get("store_id") else []),
             }
-            if cred.get("store_id"):
-                store = await db["shopify_cred"].find_one({"_id": cred["store_id"]})
-                if store:
-                    token_data["store_shop"] = store.get("shop")
+            if token_data["store_ids"]:
+                stores = await db["shopify_cred"].find({
+                    "_id": {"$in": token_data["store_ids"]},
+                    "company_id": cred.get("company_id"),
+                    "status": {"$ne": "disconnected"},
+                }).to_list(length=100)
+                by_id = {store["_id"]: store for store in stores}
+                valid_store_ids = [store_id for store_id in token_data["store_ids"] if store_id in by_id]
+                token_data["store_ids"] = valid_store_ids
+                token_data["store_shops"] = [by_id[store_id].get("shop") for store_id in valid_store_ids]
 
             account_company_id = str(cred.get("company_id") or company_id)
             result = await fetch_and_save_gmail(
