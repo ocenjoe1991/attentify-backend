@@ -1,10 +1,14 @@
 # app/routes/message.py
 
-from fastapi import APIRouter, HTTPException, Depends, Body, Query, Request
+from fastapi import APIRouter, HTTPException, Depends, Body, Query, Request, Response
 import os
 import httpx
 from app.services.gmail_service import fetch_all_gmail_accounts, get_gmail_service
 from app.services.deleted_gmail_service import record_deleted_gmail_messages
+from app.services.gmail_attachment_service import (
+    decode_gmail_attachment_data,
+    extract_gmail_attachments,
+)
 from app.db.mongodb import get_database
 from app.models.message import Message, ChatEntry 
 from typing import List
@@ -23,6 +27,11 @@ from bson import ObjectId
 import base64
 from email.utils import formatdate, format_datetime
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+import mimetypes
+from urllib.parse import quote
 from datetime import datetime, timezone
 from email.utils import parseaddr
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
@@ -76,6 +85,38 @@ ARCHIVED_STATUSES = {
     "Resolved",
     "Canceled",
 }
+
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_SIZE = 20 * 1024 * 1024
+BLOCKED_ATTACHMENT_EXTENSIONS = {
+    ".bat",
+    ".cmd",
+    ".com",
+    ".exe",
+    ".js",
+    ".msi",
+    ".ps1",
+    ".scr",
+    ".sh",
+    ".vbs",
+}
+
+
+def sanitize_attachment_filename(filename: str | None) -> str:
+    safe = os.path.basename(filename or "").strip()
+    return safe or "attachment"
+
+
+def validate_attachment(filename: str, content: bytes) -> None:
+    extension = os.path.splitext(filename)[1].lower()
+    if extension in BLOCKED_ATTACHMENT_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"Attachment type is not allowed: {filename}")
+    if len(content) > MAX_ATTACHMENT_SIZE:
+        raise HTTPException(status_code=400, detail=f"Attachment is larger than 10MB: {filename}")
+
+
+def attachment_disposition(filename: str) -> str:
+    return f"attachment; filename*=UTF-8''{quote(filename)}"
 
 def normalize_doc_dates(doc: dict) -> dict:
     if "started_at" in doc:
@@ -1911,10 +1952,68 @@ async def analyze_email_message(
 
     return order_info
 
+
+@router.get("/{id}/attachments/{gmail_message_id}/{attachment_id}", response_class=Response)
+async def download_message_attachment(
+    id: str,
+    gmail_message_id: str,
+    attachment_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    if not ObjectId.is_valid(id):
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+
+    message = await ensure_message_access(id, db, current_user, action="read")
+    matched_attachment = None
+
+    for entry in message.get("messages", []) or []:
+        for attachment in (entry.get("metadata") or {}).get("attachments") or []:
+            if (
+                attachment.get("gmail_message_id") == gmail_message_id
+                and attachment.get("attachment_id") == attachment_id
+            ):
+                matched_attachment = attachment
+                break
+        if matched_attachment:
+            break
+
+    if not matched_attachment:
+        raise HTTPException(status_code=404, detail="Attachment not found for this message.")
+
+    account_email = matched_attachment.get("account_email")
+    gmail_account = None
+    if account_email:
+        gmail_account = await db["gmail_accounts"].find_one({"email": account_email})
+    if not gmail_account and message.get("gmail_account_id"):
+        gmail_account = await db["gmail_accounts"].find_one({"_id": message.get("gmail_account_id")})
+    if not gmail_account:
+        agent_email = parseaddr(message.get("agent") or "")[1]
+        if agent_email:
+            gmail_account = await db["gmail_accounts"].find_one({"email": agent_email})
+    if not gmail_account:
+        raise HTTPException(status_code=400, detail="Gmail credentials not found for attachment download.")
+
+    service = get_gmail_service(gmail_account)
+    attachment = service.users().messages().attachments().get(
+        userId="me",
+        messageId=gmail_message_id,
+        id=attachment_id,
+    ).execute()
+
+    data = decode_gmail_attachment_data(attachment.get("data", ""))
+    filename = sanitize_attachment_filename(matched_attachment.get("filename"))
+    return Response(
+        content=data,
+        media_type=matched_attachment.get("mime_type") or "application/octet-stream",
+        headers={"Content-Disposition": attachment_disposition(filename)},
+    )
+
+
 @router.post("/{id}/reply", response_model=dict)
 async def reply_to_message(
     id: str,
-    body: dict = Body(...),  # expects: { "content": "the reply text" }
+    request: Request,
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1926,10 +2025,39 @@ async def reply_to_message(
     
     if not ObjectId.is_valid(id):
         raise HTTPException(status_code=400, detail="Invalid message ID")
-    
-    content = (body.get("content") or "").strip()
-    if not content:
-        raise HTTPException(status_code=400, detail="Reply content is required")
+
+    content_type = request.headers.get("content-type", "")
+    attachments: list[dict] = []
+
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        content = str(form.get("content") or "").strip()
+        uploaded_files = form.getlist("files")
+        total_size = 0
+        for uploaded_file in uploaded_files:
+            filename = sanitize_attachment_filename(getattr(uploaded_file, "filename", ""))
+            if not getattr(uploaded_file, "filename", ""):
+                continue
+            data = await uploaded_file.read()
+            validate_attachment(filename, data)
+            total_size += len(data)
+            if total_size > MAX_TOTAL_ATTACHMENT_SIZE:
+                raise HTTPException(status_code=400, detail="Total attachment size cannot exceed 20MB.")
+            mime_type = getattr(uploaded_file, "content_type", None) or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            attachments.append(
+                {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size": len(data),
+                    "data": data,
+                }
+            )
+    else:
+        body = await request.json()
+        content = (body.get("content") or "").strip()
+
+    if not content and not attachments:
+        raise HTTPException(status_code=400, detail="Reply content or attachment is required")
 
     message = await ensure_message_access(id, db, current_user, action="update")
     
@@ -1962,7 +2090,19 @@ async def reply_to_message(
     if original_msg_id and not original_msg_id.startswith("<"):
         original_msg_id = f"<{original_msg_id}>"
 
-    mime_msg = MIMEText(content, "html")
+    if attachments:
+        mime_msg = MIMEMultipart()
+        mime_msg.attach(MIMEText(content or "", "html"))
+        for attachment in attachments:
+            maintype, subtype = attachment["mime_type"].split("/", 1) if "/" in attachment["mime_type"] else ("application", "octet-stream")
+            part = MIMEBase(maintype, subtype)
+            part.set_payload(attachment["data"])
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment", filename=attachment["filename"])
+            mime_msg.attach(part)
+    else:
+        mime_msg = MIMEText(content, "html")
+
     mime_msg['To'] = to_addr
     mime_msg['From'] = agent_email
     mime_msg['Subject'] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
@@ -1983,6 +2123,31 @@ async def reply_to_message(
         }
     ).execute()
 
+    sent_attachments = []
+    if attachments:
+        try:
+            sent_full = service.users().messages().get(
+                userId="me",
+                id=sent.get("id"),
+                format="full",
+            ).execute()
+            sent_attachments = extract_gmail_attachments(
+                sent_full.get("payload", {}),
+                gmail_message_id=sent.get("id"),
+                account_email=agent_email,
+            )
+        except Exception:
+            sent_attachments = [
+                {
+                    "filename": item["filename"],
+                    "mime_type": item["mime_type"],
+                    "size": item["size"],
+                    "gmail_message_id": sent.get("id"),
+                    "account_email": agent_email,
+                }
+                for item in attachments
+            ]
+
     # Construct ChatEntry and save to DB
     now = datetime.now(timezone.utc).astimezone()
     reply_entry = {
@@ -1997,7 +2162,8 @@ async def reply_to_message(
             "gmail_id": sent.get("id"),
             "from": agent_email,
             "to": to_addr,
-            "date": format_datetime(now)
+            "date": format_datetime(now),
+            "attachments": sent_attachments,
         }
     }
 

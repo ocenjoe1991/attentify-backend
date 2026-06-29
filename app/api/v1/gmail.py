@@ -25,6 +25,7 @@ from app.db.mongodb import get_database
 from app.services.gmail_service import get_gmail_service
 from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
+from app.services.gmail_attachment_service import extract_gmail_attachments
 from google.oauth2 import service_account
 from email.utils import parsedate_to_datetime
 from app.models.gmail import (
@@ -934,7 +935,12 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     "from": sender,
                     "to": to,
                     "subject": subject,
-                    "date": date
+                    "date": date,
+                    "attachments": extract_gmail_attachments(
+                        payload,
+                        gmail_message_id=gmail_id,
+                        account_email=account.get("email"),
+                    ),
                 }
             )
 

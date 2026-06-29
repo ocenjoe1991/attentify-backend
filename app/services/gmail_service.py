@@ -10,6 +10,7 @@ from googleapiclient.errors import HttpError
 from app.models.message import Message, ChatEntry 
 from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
+from app.services.gmail_attachment_service import extract_gmail_attachments
 from bson import ObjectId
 import logging
 import requests
@@ -293,7 +294,12 @@ async def fetch_and_save_gmail(
                     "from": sender,
                     "to": to,
                     "subject": subject,
-                    "date": date
+                    "date": date,
+                    "attachments": extract_gmail_attachments(
+                        payload,
+                        gmail_message_id=gmail_id,
+                        account_email=account.get("email"),
+                    ),
                 }
             )
 
