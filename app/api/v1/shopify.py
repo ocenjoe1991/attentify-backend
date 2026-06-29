@@ -1092,6 +1092,29 @@ def _register_single_webhook(shop: str, access_token: str, topic: str, address: 
         webhook_id = response.json().get("webhook", {}).get("id")
         logger.info("Webhook '%s' registered for %s (ID: %s)", topic, shop, webhook_id)
         return webhook_id
+    if response.status_code == 422 and "already been taken" in response.text:
+        try:
+            list_response = requests.get(
+                webhook_url,
+                headers=headers,
+                params={"topic": topic, "address": address},
+                timeout=20,
+            )
+            if list_response.status_code == 200:
+                for webhook in list_response.json().get("webhooks", []):
+                    if webhook.get("topic") == topic and webhook.get("address") == address:
+                        webhook_id = webhook.get("id")
+                        logger.info(
+                            "Webhook '%s' already exists for %s (ID: %s)",
+                            topic,
+                            shop,
+                            webhook_id,
+                        )
+                        return webhook_id
+        except requests.RequestException as e:
+            logger.warning("Failed to look up existing webhook for %s (%s): %s", shop, topic, e)
+        logger.warning("Webhook '%s' already exists for %s but its ID could not be resolved.", topic, shop)
+        return None
     else:
         logger.error("Webhook registration failed for %s (%s): %s %s", shop, topic, response.status_code, response.text)
         return None

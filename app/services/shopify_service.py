@@ -62,6 +62,41 @@ def fetch_access_scopes(shop, access_token):
     logger.info("Shopify access scopes for %s: %s", shop, ",".join(scopes) or "(none)")
     return scopes
 
+
+async def fetch_order_updated_at_from_shop(shop, access_token, order_id):
+    """Fetch only the updated_at field for one Shopify order."""
+    url = (
+        f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders/{int(order_id)}.json"
+        "?fields=id,updated_at"
+    )
+    headers = {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json",
+    }
+    resp = await asyncio.to_thread(requests.get, url, headers=headers, timeout=20)
+    if resp.status_code != 200:
+        logger.warning(
+            "Shopify single-order updated_at check failed for %s/%s: HTTP %d",
+            shop,
+            order_id,
+            resp.status_code,
+        )
+        return None
+    return _to_datetime((resp.json().get("order") or {}).get("updated_at"))
+
+
+async def fetch_order_from_shop(shop, access_token, order_id):
+    """Fetch one full Shopify order."""
+    url = f"https://{shop}/admin/api/{SHOPIFY_API_VERSION}/orders/{int(order_id)}.json"
+    headers = {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json",
+    }
+    resp = await asyncio.to_thread(requests.get, url, headers=headers, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Shopify single-order fetch failed for {shop}/{order_id}: HTTP {resp.status_code}")
+    return resp.json().get("order")
+
 # Fetch full orders from a shopify store
 def fetch_orders_from_shop1(shop, access_token):
     """Fetch all orders from a Shopify store using the access token."""
