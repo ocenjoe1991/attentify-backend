@@ -436,6 +436,15 @@ async def precheck_message_orders(
     if not client_email or mentions_order_number(message_doc):
         return {"checked": False, "no_orders": False}
 
+    if message_requires_store_scope(message_doc):
+        order_info = await mark_message_needs_store_scope(db, message_doc)
+        return {
+            "checked": True,
+            "no_orders": False,
+            "store_required": True,
+            "order_info": serialize_for_json(order_info),
+        }
+
     order_count = await db["orders"].count_documents(scoped_order_query(message_doc, {
         "company_id": message_doc["company_id"],
         "customer.email": {"$regex": f"^{re.escape(client_email)}$", "$options": "i"},
@@ -1360,6 +1369,31 @@ def message_store_shop(message_doc: dict) -> str:
     return str(message_doc.get("default_store_shop") or "").strip()
 
 
+def message_requires_store_scope(message_doc: dict) -> bool:
+    return message_doc.get("channel") == "email" and not message_store_shop(message_doc)
+
+
+async def mark_message_needs_store_scope(db: AsyncIOMotorDatabase, message_doc: dict) -> dict:
+    order_info = {
+        "order_id": "",
+        "type": "",
+        "status": 0,
+        "msg": "Select an order matching scope for this Gmail account",
+        "store_required": True,
+    }
+    await db["messages"].update_one(
+        {"_id": message_doc["_id"]},
+        {
+            "$set": {
+                "order_info": cacheable_order_info(order_info, source="store_required"),
+                "order_match_status": "possible",
+            }
+        },
+    )
+    await update_message_analysis_state(db, message_doc["_id"], state="success", source="store_required")
+    return order_info
+
+
 def scoped_order_query(message_doc: dict, query: dict) -> dict:
     scoped = dict(query)
     store_shop = message_store_shop(message_doc)
@@ -1488,6 +1522,12 @@ async def analyze_email_message(
     email_match = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', client_str)
     if email_match:
         client_email = email_match[0]
+
+    if message_requires_store_scope(message_doc):
+        logger.info("[ANALYZE] message_id=%s needs order matching scope", message_id)
+        order_info = await mark_message_needs_store_scope(db, message_doc)
+        order_info["shopify_order"] = {}
+        return order_info
 
     # Requirement 1: If customer email has zero orders, skip AI entirely (no loading)
     if client_email and not mentions_order_number(message_doc):

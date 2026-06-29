@@ -25,11 +25,13 @@ def load_env_file(path: Path) -> None:
 
 
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="Assign all company messages to a Shopify store.")
+    parser = argparse.ArgumentParser(description="Assign email messages to a Shopify store.")
     parser.add_argument("--shop", default="punkcasesnz.myshopify.com")
     parser.add_argument("--company-id", default="")
+    parser.add_argument("--channel", default="email", help="Message channel to assign. Use 'all' for every channel.")
     parser.add_argument("--env-file", default="../../attentify-backend.env")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--cleanup-other-channels", action="store_true")
     parser.add_argument(
         "--invalidate-order-cache",
         action="store_true",
@@ -64,6 +66,8 @@ async def main() -> None:
     store = stores[0]
     company_id = store.get("company_id")
     message_query = {"company_id": company_id}
+    if args.channel != "all":
+        message_query["channel"] = args.channel
     total = await db["messages"].count_documents(message_query)
     already_assigned = await db["messages"].count_documents({
         **message_query,
@@ -73,8 +77,19 @@ async def main() -> None:
 
     print(f"Store: {store['shop']} ({store['_id']})")
     print(f"Company: {company_id}")
-    print(f"Messages in company: {total}")
+    print(f"Messages matched by query: {total}")
     print(f"Already assigned: {already_assigned}")
+    if args.cleanup_other_channels:
+        cleanup_query = {
+            "company_id": company_id,
+            "channel": {"$ne": args.channel},
+            "$or": [
+                {"default_store_id": {"$exists": True}},
+                {"default_store_shop": {"$exists": True}},
+            ],
+        }
+        cleanup_total = await db["messages"].count_documents(cleanup_query)
+        print(f"Other-channel messages with store fields: {cleanup_total}")
 
     if not args.apply:
         print("Dry run only. Re-run with --apply to update messages.")
@@ -97,6 +112,13 @@ async def main() -> None:
     result = await db["messages"].update_many(message_query, update_doc)
     print(f"Matched messages: {result.matched_count}")
     print(f"Modified messages: {result.modified_count}")
+
+    if args.cleanup_other_channels:
+        cleanup_result = await db["messages"].update_many(
+            cleanup_query,
+            {"$unset": {"default_store_id": "", "default_store_shop": ""}},
+        )
+        print(f"Cleaned other-channel messages: {cleanup_result.modified_count}")
     client.close()
 
 
