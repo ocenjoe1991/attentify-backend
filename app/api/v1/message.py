@@ -213,6 +213,7 @@ async def get_company_messages(
     assigned_filter: str = Query("all", description="all, assigned, or unassigned"),
     status_filter: str = Query("all", description="Message status or all"),
     order_filter: str = Query("all", description="all, order, other, or needs_review"),
+    store_id: str = Query("", description="Default Shopify store ID or unassigned"),
     sort_by: str = Query("created_at", description="started_at, created_at or last_updated"),
     sort_order: str = Query("desc", description="asc or desc"),
     db: AsyncIOMotorDatabase = Depends(get_database),
@@ -301,6 +302,21 @@ async def get_company_messages(
     elif order_filter != "all":
         raise HTTPException(status_code=400, detail="Invalid order filter")
 
+    if store_id:
+        if store_id == "unassigned":
+            query["$and"] = query.get("$and", [])
+            query["$and"].append({
+                "$or": [
+                    {"default_store_id": {"$exists": False}},
+                    {"default_store_id": None},
+                    {"default_store_id": ""},
+                ]
+            })
+        elif ObjectId.is_valid(store_id):
+            query["default_store_id"] = ObjectId(store_id)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid store filter")
+
     if status_filter != "all":
         status_filter = normalize_status(status_filter)
         if status_filter not in TICKET_STATUSES:
@@ -345,6 +361,10 @@ async def get_company_messages(
         doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
         doc["company_id"] = str(doc["company_id"])
+        if doc.get("default_store_id"):
+            doc["default_store_id"] = str(doc["default_store_id"])
+        if doc.get("gmail_account_id"):
+            doc["gmail_account_id"] = str(doc["gmail_account_id"])
         doc["status"] = normalize_status(doc.get("status", "Open"))
         doc["order_match_status"] = doc.get("order_match_status", "unknown")
         doc.pop("_sort_date", None)
@@ -385,6 +405,10 @@ async def get_message(
     doc["_id"] = str(doc["_id"])
     doc["user_id"] = str(doc["user_id"])
     doc["company_id"] = str(doc["company_id"])
+    if doc.get("default_store_id"):
+        doc["default_store_id"] = str(doc["default_store_id"])
+    if doc.get("gmail_account_id"):
+        doc["gmail_account_id"] = str(doc["gmail_account_id"])
     if "assigned_member_id" in doc and doc["assigned_member_id"]:
         doc["assigned_member_id"] = str(doc["assigned_member_id"])
     doc["status"] = normalize_status(doc.get("status", "Open"))
@@ -412,10 +436,10 @@ async def precheck_message_orders(
     if not client_email or mentions_order_number(message_doc):
         return {"checked": False, "no_orders": False}
 
-    order_count = await db["orders"].count_documents({
+    order_count = await db["orders"].count_documents(scoped_order_query(message_doc, {
         "company_id": message_doc["company_id"],
         "customer.email": {"$regex": f"^{re.escape(client_email)}$", "$options": "i"},
-    })
+    }))
     if order_count > 0:
         return {"checked": True, "no_orders": False, "order_count": order_count}
 
@@ -458,10 +482,7 @@ async def update_message(
         order_info["confirmed"] = True
         order_name = str(order_info.get("order_id", ""))
         order_name = order_name if order_name.startswith("#") else f"#{order_name}"
-        db_order = await db["orders"].find_one({
-            "company_id": message["company_id"],
-            "name": order_name,
-        })
+        db_order, _ = await find_order_for_message(db, message, order_name)
         if db_order:
             order_info["shopify_order"] = await build_order_snapshot(db, db_order)
             safe_payload["matched_order_id"] = str(db_order.get("order_id", ""))
@@ -1335,6 +1356,33 @@ def mentions_order_number(message_doc: dict) -> bool:
     return bool(re.search(r"#?[A-Za-z]{1,6}\d{3,}", message_search_text(message_doc), re.IGNORECASE))
 
 
+def message_store_shop(message_doc: dict) -> str:
+    return str(message_doc.get("default_store_shop") or "").strip()
+
+
+def scoped_order_query(message_doc: dict, query: dict) -> dict:
+    scoped = dict(query)
+    store_shop = message_store_shop(message_doc)
+    if store_shop:
+        scoped["shop"] = store_shop
+    return scoped
+
+
+async def find_order_for_message(db: AsyncIOMotorDatabase, message_doc: dict, order_name: str) -> tuple[dict | None, bool]:
+    base_query = {
+        "company_id": message_doc["company_id"],
+        "name": order_name,
+    }
+    store_shop = message_store_shop(message_doc)
+    if store_shop:
+        scoped_order = await db["orders"].find_one({**base_query, "shop": store_shop})
+        if scoped_order:
+            return scoped_order, True
+        fallback_order = await db["orders"].find_one(base_query)
+        return fallback_order, False
+    return await db["orders"].find_one(base_query), True
+
+
 async def refresh_confirmed_order_if_needed(
     db: AsyncIOMotorDatabase,
     message_doc: dict,
@@ -1443,10 +1491,10 @@ async def analyze_email_message(
 
     # Requirement 1: If customer email has zero orders, skip AI entirely (no loading)
     if client_email and not mentions_order_number(message_doc):
-        order_count = await db["orders"].count_documents({
+        order_count = await db["orders"].count_documents(scoped_order_query(message_doc, {
             "company_id": message_doc["company_id"],
             "customer.email": {"$regex": f"^{re.escape(client_email)}$", "$options": "i"},
-        })
+        }))
         if order_count == 0:
             logger.info("[ANALYZE] message_id=%s customer has no orders, skipping AI", message_id)
             order_info = {
@@ -1476,10 +1524,7 @@ async def analyze_email_message(
         # Requirement 3: Check if Shopify order was updated since last analysis
         shopify_updated = False
         order_name = order_info["order_id"] if order_info["order_id"].startswith("#") else "#" + order_info["order_id"]
-        db_order = await db["orders"].find_one({
-            "company_id": message_doc["company_id"],
-            "name": order_name,
-        })
+        db_order, store_scoped_match = await find_order_for_message(db, message_doc, order_name)
 
         if db_order and order_info.get("analyzed_at"):
             try:
@@ -1505,7 +1550,7 @@ async def analyze_email_message(
             except Exception as exc:
                 logger.warning("[ANALYZE] confirmed order refresh failed for %s: %s", message_id, exc)
 
-        if not shopify_updated and db_order and (
+        if not shopify_updated and db_order and store_scoped_match and (
             not client_email or same_email(db_order.get("customer", {}).get("email", ""), client_email)
         ):
             # Cached order_info is fresh – return immediately with attached shopify_order
@@ -1642,14 +1687,11 @@ async def analyze_email_message(
 
     order_name = order_id if order_id.startswith("#") else "#" + order_id
 
-    db_order = await db["orders"].find_one({
-        "company_id": message_doc["company_id"],
-        "name": order_name,
-    })
+    db_order, store_scoped_match = await find_order_for_message(db, message_doc, order_name)
     
     if db_order:
         order_info["shopify_order"] = await build_order_snapshot(db, db_order)
-        if not client_email or same_email(db_order.get("customer", {}).get("email", ""), client_email):
+        if store_scoped_match and (not client_email or same_email(db_order.get("customer", {}).get("email", ""), client_email)):
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {
@@ -1677,7 +1719,7 @@ async def analyze_email_message(
             )
 
         else:
-            order_info["msg"] = "Email not matched"
+            order_info["msg"] = "Store not matched" if not store_scoped_match else "Email not matched"
             await db["messages"].update_one(
                 {"_id": message_doc["_id"]},
                 {

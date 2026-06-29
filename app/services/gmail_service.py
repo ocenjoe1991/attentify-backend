@@ -297,6 +297,15 @@ async def fetch_and_save_gmail(
                 }
             )
 
+            store_id = account.get("store_id")
+            store_shop = account.get("store_shop")
+            message_context = {
+                "gmail_account_id": account.get("account_id"),
+                "inbox_email": account.get("email"),
+                "default_store_id": store_id,
+                "default_store_shop": store_shop,
+            }
+
             # Find existing thread (conversation) in 'messages' collection by thread_id
             existing_thread = await db["messages"].find_one({"user_id": ObjectId(user_id), "thread_id": thread_id, "channel": "email"})
 
@@ -333,15 +342,16 @@ async def fetch_and_save_gmail(
                 started_at, last_updated = _message_timestamp_bounds(next_messages)
                 await db["messages"].update_one(
                     {"_id": existing_thread["_id"]},
-                    {
-                        "$push": {"messages": chat_entry.dict()},
-                        "$set": {
-                            "started_at": started_at or existing_thread.get("started_at", timestamp),
-                            "last_updated": last_updated or timestamp,
-                            "title": subject,
-                            "participants": list(set(existing_thread.get("participants", []) + [sender, to]))
+                        {
+                            "$push": {"messages": chat_entry.dict()},
+                            "$set": {
+                                "started_at": started_at or existing_thread.get("started_at", timestamp),
+                                "last_updated": last_updated or timestamp,
+                                "title": subject,
+                                "participants": list(set(existing_thread.get("participants", []) + [sender, to])),
+                                **{k: v for k, v in message_context.items() if v},
+                            }
                         }
-                    }
                 )
             else:
                 message_doc = {
@@ -361,6 +371,7 @@ async def fetch_and_save_gmail(
                     "tags": [],
                     "resolved_by_ai": False
                 }
+                message_doc.update({k: v for k, v in message_context.items() if v})
                 await db["messages"].insert_one(message_doc)
                 # Trigger AI analysis in background for new email messages
                 asyncio.create_task(_auto_analyze_message(db, message_doc["_id"]))
@@ -412,7 +423,12 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
                 "client_secret": cred["client_secret"],
                 "expires_at": cred.get("expires_at"),
                 "history_id": cred.get("history_id"),
+                "store_id": cred.get("store_id"),
             }
+            if cred.get("store_id"):
+                store = await db["shopify_cred"].find_one({"_id": cred["store_id"]})
+                if store:
+                    token_data["store_shop"] = store.get("shop")
 
             account_company_id = str(cred.get("company_id") or company_id)
             result = await fetch_and_save_gmail(

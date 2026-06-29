@@ -20,6 +20,7 @@ import asyncio
 import json
 import base64
 import urllib.parse
+import re
 from app.db.mongodb import get_database
 from app.services.gmail_service import get_gmail_service
 from app.services.deleted_gmail_service import is_deleted_gmail_message
@@ -141,8 +142,11 @@ async def list_gmail_accounts(
                 }
         accounts.append(account_data)
 
-    # Fetch stores properly
-    stores_cursor = db.shopify_cred.find({"user_id": current_user["_id"]})
+    # Fetch company stores so an inbox can be scoped to any connected store in the company.
+    stores_cursor = db.shopify_cred.find({
+        "company_id": ObjectId(company_id),
+        "status": {"$ne": "disconnected"},
+    })
     stores = []
 
     async for store in stores_cursor:
@@ -199,28 +203,77 @@ async def update_gmail_account(
 
     if field == "_id":
         raise HTTPException(status_code=400, detail="Cannot update _id field")
+
+    try:
+        account_id = ObjectId(id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid Gmail account id")
+
+    account = await db["gmail_accounts"].find_one({"_id": account_id})
+    if not account:
+        raise HTTPException(status_code=404, detail="Gmail account not found")
     
     update_query = {}
+    message_update_query = None
 
     if field == "store_id":
         if value == "":  # Remove store_id if empty string
             update_query = {"$unset": {field: ""}}
+            message_update_query = {
+                "$set": {
+                    "gmail_account_id": account_id,
+                    "inbox_email": account.get("email"),
+                },
+                "$unset": {"default_store_id": "", "default_store_shop": ""},
+            }
         else:
             try:
                 value = ObjectId(value)
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid store_id format")
+
+            store = await db["shopify_cred"].find_one({
+                "_id": value,
+                "company_id": account.get("company_id"),
+                "status": {"$ne": "disconnected"},
+            })
+            if not store:
+                raise HTTPException(status_code=404, detail="Shopify store not found")
+
             update_query = {"$set": {field: value}}
+            message_update_query = {"$set": {
+                "gmail_account_id": account_id,
+                "inbox_email": account.get("email"),
+                "default_store_id": value,
+                "default_store_shop": store.get("shop"),
+            }}
     else:
         update_query = {"$set": {field: value}}
 
     result = await db["gmail_accounts"].update_one(
-        {"_id": ObjectId(id)},
+        {"_id": account_id},
         update_query
     )
 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Gmail account not found")
+
+    if field == "store_id" and message_update_query:
+        message_match_conditions = [{"gmail_account_id": account_id}]
+        account_email = account.get("email")
+        if account_email:
+            email_pattern = re.escape(account_email)
+            message_match_conditions.extend([
+                {"inbox_email": account_email},
+                {"messages": {"$elemMatch": {"metadata.to": {"$regex": email_pattern, "$options": "i"}}}},
+            ])
+        await db["messages"].update_many(
+            {
+                "company_id": account.get("company_id"),
+                "$or": message_match_conditions,
+            },
+            message_update_query,
+        )
 
     return {"message": f"{field} updated"}
 
@@ -829,6 +882,16 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 }
             )
 
+            store = None
+            if account.get("store_id"):
+                store = await db["shopify_cred"].find_one({"_id": account["store_id"]})
+            message_context = {
+                "gmail_account_id": account.get("_id"),
+                "inbox_email": account.get("email"),
+                "default_store_id": account.get("store_id"),
+                "default_store_shop": store.get("shop") if store else None,
+            }
+
             existing_thread = await db["messages"].find_one(
                 {"user_id": user_object_id, "thread_id": thread_id, "channel": "email"}
             )
@@ -850,7 +913,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                         "$set": {
                             "last_updated": timestamp,
                             "title": subject,
-                            "participants": participants
+                            "participants": participants,
+                            **{k: v for k, v in message_context.items() if v},
                         }
                     }
                 )
@@ -885,6 +949,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     "tags": [],
                     "resolved_by_ai": False
                 }
+                message_doc.update({k: v for k, v in message_context.items() if v})
                 await db["messages"].insert_one(message_doc)
 
             await sio.emit(
