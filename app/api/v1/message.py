@@ -438,6 +438,24 @@ async def get_company_messages(
             assigned_ids.add(str(aid))
             doc["_assigned_member_id"] = str(aid)  # temp field for later lookup
 
+        first_attachment = None
+        for entry in doc.get("messages", []) or []:
+            for attachment in (entry.get("metadata") or {}).get("attachments") or []:
+                if attachment.get("gmail_message_id") and attachment.get("attachment_id"):
+                    first_attachment = {
+                        "filename": attachment.get("filename"),
+                        "mime_type": attachment.get("mime_type"),
+                        "size": attachment.get("size"),
+                        "gmail_message_id": attachment.get("gmail_message_id"),
+                        "attachment_id": attachment.get("attachment_id"),
+                    }
+                    break
+            if first_attachment:
+                break
+        doc["has_attachments"] = bool(first_attachment)
+        if first_attachment:
+            doc["first_attachment"] = first_attachment
+
         doc.pop("assigned_member_id", None)
         doc.pop("messages", None)
         doc.pop("comments", None)
