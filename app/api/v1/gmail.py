@@ -22,7 +22,7 @@ import base64
 import urllib.parse
 import re
 from app.db.mongodb import get_database
-from app.services.gmail_service import get_gmail_service
+from app.services.gmail_service import fetch_and_save_gmail, get_gmail_service
 from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
 from app.services.gmail_attachment_service import extract_gmail_attachments
@@ -679,6 +679,8 @@ async def google_oauth_callback(
         "token_issued_at": datetime.now(timezone.utc),
         "provider": "google",
         "history_id": history_id,
+        "watch_expiration": watch_response.get("expiration"),
+        "last_watch_renewed_at": datetime.now(timezone.utc),
         "subscription": subscription_path,
     }
 
@@ -767,6 +769,31 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
     last_history_id = account.get("history_id")
     if not last_history_id:
         logger.info("No stored historyId for %s. Setting Gmail baseline to %s.", email_address, history_id)
+        await fetch_and_save_gmail(
+            {
+                "account_id": account["_id"],
+                "email": account["email"],
+                "access_token": account["access_token"],
+                "refresh_token": account["refresh_token"],
+                "client_id": account["client_id"],
+                "client_secret": account["client_secret"],
+                "expires_at": account.get("expires_at"),
+                "history_id": account.get("history_id"),
+                "store_ids": _account_store_ids(account),
+                "store_shops": [
+                    store.get("shop")
+                    for store in await _load_store_scope(
+                        db,
+                        company_object_id,
+                        _account_store_ids(account),
+                    )
+                ],
+            },
+            db,
+            str(user_object_id),
+            str(company_object_id),
+            include_unread_backfill=True,
+        )
         await db["gmail_accounts"].update_one(
             {"_id": account["_id"]},
             {"$set": {"history_id": history_id, "status": "connected"}},
@@ -801,9 +828,34 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             status_code = getattr(getattr(e, "resp", None), "status", None)
             if status_code in (400, 404):
                 logger.warning(
-                    "Gmail historyId expired for %s. Resetting baseline to %s.",
+                    "Gmail historyId expired for %s. Recovering unread messages and resetting baseline to %s.",
                     email_address,
                     history_id,
+                )
+                await fetch_and_save_gmail(
+                    {
+                        "account_id": account["_id"],
+                        "email": account["email"],
+                        "access_token": account["access_token"],
+                        "refresh_token": account["refresh_token"],
+                        "client_id": account["client_id"],
+                        "client_secret": account["client_secret"],
+                        "expires_at": account.get("expires_at"),
+                        "history_id": account.get("history_id"),
+                        "store_ids": _account_store_ids(account),
+                        "store_shops": [
+                            store.get("shop")
+                            for store in await _load_store_scope(
+                                db,
+                                company_object_id,
+                                _account_store_ids(account),
+                            )
+                        ],
+                    },
+                    db,
+                    str(user_object_id),
+                    str(company_object_id),
+                    include_unread_backfill=True,
                 )
                 await db["gmail_accounts"].update_one(
                     {"_id": account["_id"]},
