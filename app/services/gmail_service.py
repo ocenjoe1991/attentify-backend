@@ -21,6 +21,78 @@ def _gmail_header(headers: list[dict], name: str) -> str:
         "",
     )
 
+
+def _parse_expires_at(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        expires_at = value
+    else:
+        expires_at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if expires_at.tzinfo is None:
+        return expires_at.replace(tzinfo=timezone.utc)
+    return expires_at.astimezone(timezone.utc)
+
+
+async def _save_refreshed_token(db, account: dict, creds: Credentials) -> None:
+    update_data = {
+        "access_token": creds.token,
+        "status": "connected",
+    }
+    if creds.expiry:
+        expires_at = creds.expiry
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+        update_data["expires_at"] = expires_at
+
+    await db["gmail_accounts"].update_one(
+        {"_id": account["account_id"]},
+        {"$set": update_data, "$unset": {"last_error": ""}},
+    )
+
+
+async def _refresh_gmail_token(db, account: dict, creds: Credentials):
+    try:
+        creds.refresh(Request())
+        await _save_refreshed_token(db, account, creds)
+        return None
+    except Exception as e:
+        error_text = str(e)
+        logging.error(f"Failed to refresh token for {account['email']}: {e}")
+        if "invalid_grant" in error_text:
+            await db["gmail_accounts"].update_one(
+                {"_id": account["account_id"]},
+                {
+                    "$set": {
+                        "status": "disconnected",
+                        "last_error": "Google refresh token is invalid or revoked. Reconnect this Gmail account.",
+                        "last_error_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+            return {
+                "email": account["email"],
+                "status": "failed",
+                "reason": "invalid_grant",
+                "message": "Google refresh token is invalid or revoked. Reconnect this Gmail account.",
+            }
+        return {
+            "email": account["email"],
+            "status": "failed",
+            "reason": "token_refresh_failed",
+            "message": f"Token refresh failed for {account['email']}",
+        }
+
+
+def _fetch_token_info(access_token: str) -> dict:
+    return requests.get(
+        f"https://www.googleapis.com/oauth2/v1/tokeninfo?access_token={access_token}",
+        timeout=10,
+    ).json()
+
+
 def _message_timestamp_bounds(messages):
     timestamps = []
     for item in messages:
@@ -56,59 +128,36 @@ async def fetch_and_save_gmail(
         scopes=["https://www.googleapis.com/auth/gmail.readonly"],
     )
 
-    # Token expiration check
-    expires_at = account.get("expires_at")
-    
-    token_expired = False
-    if expires_at:
-        try:
-            expires_at_dt = (
-                datetime.fromisoformat(expires_at)
-                if isinstance(expires_at, str) else expires_at
-            )
-            if expires_at_dt.tzinfo:
-                expires_at_dt = expires_at_dt.astimezone(timezone.utc).replace(tzinfo=None)
-            token_expired = datetime.now(timezone.utc) >= expires_at_dt
-        except Exception as e:
-            logging.warning(f"Could not parse expires_at: {expires_at} ({e})")
-            token_expired = creds.expired
-    else:
-        token_expired = creds.expired
+    try:
+        expires_at = _parse_expires_at(account.get("expires_at"))
+        if expires_at:
+            creds.expiry = expires_at.replace(tzinfo=None)
+            token_expired = datetime.now(timezone.utc) >= expires_at
+        else:
+            token_expired = True
+    except Exception as e:
+        logging.warning(f"Could not parse expires_at: {account.get('expires_at')} ({e})")
+        token_expired = True
 
     if token_expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-        except Exception as e:
-            error_text = str(e)
-            logging.error(f"Failed to refresh token for {account['email']}: {e}")
-            if "invalid_grant" in error_text:
-                await db["gmail_accounts"].update_one(
-                    {"_id": account["account_id"]},
-                    {
-                        "$set": {
-                            "status": "disconnected",
-                            "last_error": "Google refresh token is invalid or revoked. Reconnect this Gmail account.",
-                            "last_error_at": datetime.now(timezone.utc),
-                        }
-                    },
-                )
-                return {
-                    "email": account["email"],
-                    "status": "failed",
-                    "reason": "invalid_grant",
-                    "message": "Google refresh token is invalid or revoked. Reconnect this Gmail account.",
-                }
+        refresh_error = await _refresh_gmail_token(db, account, creds)
+        if refresh_error:
+            return refresh_error
+
+    try:
+        token_info = _fetch_token_info(creds.token)
+        if token_info.get("error") and creds.refresh_token:
+            refresh_error = await _refresh_gmail_token(db, account, creds)
+            if refresh_error:
+                return refresh_error
+            token_info = _fetch_token_info(creds.token)
+        if token_info.get("error"):
             return {
                 "email": account["email"],
                 "status": "failed",
-                "reason": "token_refresh_failed",
-                "message": f"Token refresh failed for {account['email']}",
+                "reason": "tokeninfo_failed",
+                "message": f"Google token check failed for {account['email']}: {token_info.get('error_description') or token_info.get('error')}",
             }
-
-    try:
-        token_info = requests.get(
-            f"https://www.googleapis.com/oauth2/v1/tokeninfo?access_token={creds.token}"
-        ).json()
         if "https://www.googleapis.com/auth/gmail.readonly" not in token_info.get("scope", ""):
             await db["gmail_accounts"].update_one(
                 {"_id": account["account_id"]},
