@@ -15,6 +15,12 @@ from bson import ObjectId
 import logging
 import requests
 
+def _gmail_header(headers: list[dict], name: str) -> str:
+    return next(
+        (h.get("value", "") for h in headers if h.get("name", "").lower() == name.lower()),
+        "",
+    )
+
 def _message_timestamp_bounds(messages):
     timestamps = []
     for item in messages:
@@ -235,10 +241,13 @@ async def fetch_and_save_gmail(
             payload = full_msg.get("payload", {})
             headers = payload.get("headers", [])
 
-            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
-            sender = next((h["value"] for h in headers if h["name"] == "From"), "")
-            to = next((h["value"] for h in headers if h["name"] == "To"), "")
-            date = next((h["value"] for h in headers if h["name"] == "Date"), "")
+            subject = _gmail_header(headers, "Subject")
+            sender = _gmail_header(headers, "From")
+            to = _gmail_header(headers, "To")
+            date = _gmail_header(headers, "Date")
+            rfc_message_id = _gmail_header(headers, "Message-ID")
+            in_reply_to = _gmail_header(headers, "In-Reply-To")
+            references = _gmail_header(headers, "References")
 
             try:
                 timestamp = parsedate_to_datetime(date)
@@ -295,6 +304,9 @@ async def fetch_and_save_gmail(
                     "to": to,
                     "subject": subject,
                     "date": date,
+                    "rfc_message_id": rfc_message_id,
+                    "in_reply_to": in_reply_to,
+                    "references": references,
                     "attachments": extract_gmail_attachments(
                         payload,
                         gmail_message_id=gmail_id,

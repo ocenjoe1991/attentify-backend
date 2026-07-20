@@ -49,6 +49,13 @@ GMAIL_REAUTH_REQUIRED_MESSAGE = (
 )
 
 
+def _gmail_header(headers: list[dict], name: str) -> str:
+    return next(
+        (h.get("value", "") for h in headers if h.get("name", "").lower() == name.lower()),
+        "",
+    )
+
+
 def _account_store_ids(account: dict) -> list[ObjectId]:
     values = account.get("store_ids")
     if not values and account.get("store_id"):
@@ -877,10 +884,13 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             payload = full_msg.get("payload", {}) or {}
             headers = payload.get("headers", [])
 
-            subject = next((h["value"] for h in headers if h["name"] == "Subject"), "")
-            sender = next((h["value"] for h in headers if h["name"] == "From"), "")
-            to = next((h["value"] for h in headers if h["name"] == "To"), "")
-            date = next((h["value"] for h in headers if h["name"] == "Date"), "")
+            subject = _gmail_header(headers, "Subject")
+            sender = _gmail_header(headers, "From")
+            to = _gmail_header(headers, "To")
+            date = _gmail_header(headers, "Date")
+            rfc_message_id = _gmail_header(headers, "Message-ID")
+            in_reply_to = _gmail_header(headers, "In-Reply-To")
+            references = _gmail_header(headers, "References")
 
             try:
                 timestamp = parsedate_to_datetime(date)
@@ -936,6 +946,9 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     "to": to,
                     "subject": subject,
                     "date": date,
+                    "rfc_message_id": rfc_message_id,
+                    "in_reply_to": in_reply_to,
+                    "references": references,
                     "attachments": extract_gmail_attachments(
                         payload,
                         gmail_message_id=gmail_id,

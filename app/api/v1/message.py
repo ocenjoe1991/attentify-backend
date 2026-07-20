@@ -62,6 +62,31 @@ TICKET_STATUSES = {
     "Canceled",
 }
 
+
+def _gmail_header(headers: list[dict], name: str) -> str:
+    return next(
+        (h.get("value", "") for h in headers if h.get("name", "").lower() == name.lower()),
+        "",
+    )
+
+
+def _normalize_rfc_message_id(value: str | None) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("<") and value.endswith(">"):
+        return value
+    if "@" not in value:
+        return ""
+    return f"<{value}>"
+
+
+def _build_references(existing_references: str | None, message_id: str) -> str:
+    parts = (existing_references or "").strip()
+    if message_id and message_id not in parts:
+        parts = f"{parts} {message_id}".strip()
+    return parts
+
 LEGACY_STATUS_MAP = {
     "Assigned": "Open",
     "Closed": "Resolved",
@@ -2102,11 +2127,37 @@ async def reply_to_message(
 
     thread_id = message.get("thread_id")
     subject = client_message.get("title", "No Subject")
-    original_msg_id = client_message.get("metadata", {}).get("gmail_id")
+    client_metadata = client_message.get("metadata", {})
+    original_gmail_id = client_metadata.get("gmail_id")
+    original_msg_id = _normalize_rfc_message_id(
+        client_metadata.get("rfc_message_id") or client_metadata.get("message_id")
+    )
+    references = _build_references(client_metadata.get("references"), original_msg_id)
     to_addr = message.get("client")  # recipient (client)
 
-    if original_msg_id and not original_msg_id.startswith("<"):
-        original_msg_id = f"<{original_msg_id}>"
+    # Send via Gmail API
+    service = get_gmail_service(user_creds)
+    if not original_msg_id and original_gmail_id:
+        try:
+            original_full = service.users().messages().get(
+                userId="me",
+                id=original_gmail_id,
+                format="metadata",
+                metadataHeaders=["Message-ID", "References"],
+            ).execute()
+            original_headers = (original_full.get("payload") or {}).get("headers", [])
+            original_msg_id = _normalize_rfc_message_id(
+                _gmail_header(original_headers, "Message-ID")
+            )
+            references = _build_references(
+                _gmail_header(original_headers, "References"),
+                original_msg_id,
+            )
+        except Exception:
+            logger.warning(
+                "Could not load RFC Message-ID for Gmail reply threading",
+                exc_info=True,
+            )
 
     if attachments:
         mime_msg = MIMEMultipart()
@@ -2126,13 +2177,11 @@ async def reply_to_message(
     mime_msg['Subject'] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
     if original_msg_id:
         mime_msg['In-Reply-To'] = original_msg_id
-        mime_msg['References'] = original_msg_id
+    if references:
+        mime_msg['References'] = references
     mime_msg['Date'] = formatdate(localtime=True)
 
     raw_message = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
-    
-    # Send via Gmail API
-    service = get_gmail_service(user_creds)
     sent = service.users().messages().send(
         userId="me",
         body={
@@ -2178,9 +2227,12 @@ async def reply_to_message(
         "channel": "email",
         "metadata": {
             "gmail_id": sent.get("id"),
+            "thread_id": sent.get("threadId"),
             "from": agent_email,
             "to": to_addr,
             "date": format_datetime(now),
+            "in_reply_to": original_msg_id,
+            "references": references,
             "attachments": sent_attachments,
         }
     }
