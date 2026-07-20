@@ -15,6 +15,8 @@ from bson import ObjectId
 import logging
 import requests
 
+GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+
 def _gmail_header(headers: list[dict], name: str) -> str:
     return next(
         (h.get("value", "") for h in headers if h.get("name", "").lower() == name.lower()),
@@ -93,6 +95,19 @@ def _fetch_token_info(access_token: str) -> dict:
     ).json()
 
 
+def _stored_scopes(account: dict) -> set[str]:
+    scopes = set()
+    scope_value = account.get("scope")
+    if isinstance(scope_value, str):
+        scopes.update(scope_value.split())
+    scopes_value = account.get("scopes")
+    if isinstance(scopes_value, str):
+        scopes.update(scopes_value.split())
+    elif isinstance(scopes_value, list):
+        scopes.update(str(scope) for scope in scopes_value)
+    return scopes
+
+
 def _message_timestamp_bounds(messages):
     timestamps = []
     for item in messages:
@@ -158,30 +173,44 @@ async def fetch_and_save_gmail(
                 "reason": "tokeninfo_failed",
                 "message": f"Google token check failed for {account['email']}: {token_info.get('error_description') or token_info.get('error')}",
             }
-        if "https://www.googleapis.com/auth/gmail.readonly" not in token_info.get("scope", ""):
-            await db["gmail_accounts"].update_one(
-                {"_id": account["account_id"]},
-                {
-                    "$set": {
-                        "status": "disconnected",
-                        "last_error": (
-                            "Gmail read permission is missing. Reconnect this Gmail "
-                            "account and approve Gmail read/send access."
-                        ),
-                        "last_error_at": datetime.now(timezone.utc),
+        tokeninfo_scopes = set((token_info.get("scope") or "").split())
+        if GMAIL_READONLY_SCOPE not in tokeninfo_scopes:
+            if GMAIL_READONLY_SCOPE in _stored_scopes(account):
+                logging.warning(
+                    "Tokeninfo scope for %s does not include gmail.readonly, but stored OAuth scope does. "
+                    "Continuing and letting Gmail API validate access. tokeninfo_scope=%s",
+                    account["email"],
+                    token_info.get("scope", ""),
+                )
+            else:
+                logging.warning(
+                    "Stored OAuth scope for %s does not include gmail.readonly. stored_scope=%s stored_scopes=%s tokeninfo_scope=%s",
+                    account["email"],
+                    account.get("scope", ""),
+                    account.get("scopes", ""),
+                    token_info.get("scope", ""),
+                )
+                await db["gmail_accounts"].update_one(
+                    {"_id": account["account_id"]},
+                    {
+                        "$set": {
+                            "last_error": (
+                                "Gmail read permission is missing. Reconnect this Gmail "
+                                "account and approve Gmail read/send access."
+                            ),
+                            "last_error_at": datetime.now(timezone.utc),
+                        },
                     },
-                    "$unset": {"watch_expiration": ""},
-                },
-            )
-            return {
-                "email": account["email"],
-                "status": "failed",
-                "reason": "insufficient_permissions",
-                "message": (
-                    f"Insufficient permissions: 'gmail.readonly' not in token scopes for {account['email']}. "
-                    "Reconnect this Gmail account and approve Gmail read/send access."
-                ),
-            }
+                )
+                return {
+                    "email": account["email"],
+                    "status": "failed",
+                    "reason": "insufficient_permissions",
+                    "message": (
+                        f"Insufficient permissions: 'gmail.readonly' not in token scopes for {account['email']}. "
+                        "Reconnect this Gmail account and approve Gmail read/send access."
+                    ),
+                }
     except Exception as e:
         logging.warning(f"Token scope check failed: {e}")
 
@@ -508,6 +537,8 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
                 "client_secret": cred["client_secret"],
                 "expires_at": cred.get("expires_at"),
                 "history_id": cred.get("history_id"),
+                "scope": cred.get("scope"),
+                "scopes": cred.get("scopes"),
                 "store_ids": cred.get("store_ids") or ([cred.get("store_id")] if cred.get("store_id") else []),
             }
             if token_data["store_ids"]:

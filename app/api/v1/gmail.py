@@ -779,6 +779,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 "client_secret": account["client_secret"],
                 "expires_at": account.get("expires_at"),
                 "history_id": account.get("history_id"),
+                "scope": account.get("scope"),
+                "scopes": account.get("scopes"),
                 "store_ids": _account_store_ids(account),
                 "store_shops": [
                     store.get("shop")
@@ -842,6 +844,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                         "client_secret": account["client_secret"],
                         "expires_at": account.get("expires_at"),
                         "history_id": account.get("history_id"),
+                        "scope": account.get("scope"),
+                        "scopes": account.get("scopes"),
                         "store_ids": _account_store_ids(account),
                         "store_shops": [
                             store.get("shop")
