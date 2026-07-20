@@ -25,7 +25,7 @@ from app.services.shopify_service import (
 import json
 from bson import ObjectId
 import base64
-from email.utils import formatdate, format_datetime
+from email.utils import formatdate, format_datetime, make_msgid
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -2258,6 +2258,8 @@ async def reply_to_message(
     mime_msg['To'] = to_addr
     mime_msg['From'] = agent_email
     mime_msg['Subject'] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    agent_domain = agent_email.split("@", 1)[1] if "@" in agent_email else None
+    mime_msg['Message-ID'] = make_msgid(domain=agent_domain)
     if original_msg_id:
         mime_msg['In-Reply-To'] = original_msg_id
     if references:
