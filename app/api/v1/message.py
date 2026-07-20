@@ -45,6 +45,8 @@ from app.core.permissions import (
 )
 from app.core.audit import record_audit_log
 from app.utils.datetime_utils import to_utc_iso
+from google.auth.exceptions import RefreshError
+from googleapiclient.errors import HttpError
 
 from math import ceil
 
@@ -2136,7 +2138,18 @@ async def reply_to_message(
     to_addr = message.get("client")  # recipient (client)
 
     # Send via Gmail API
-    service = get_gmail_service(user_creds)
+    try:
+        service = get_gmail_service(user_creds)
+    except RefreshError:
+        logger.warning("Gmail credentials need reconnect for %s while sending reply", agent_email, exc_info=True)
+        raise HTTPException(
+            status_code=400,
+            detail="Gmail credentials need reconnect. Please reconnect this Gmail account.",
+        )
+    except Exception:
+        logger.error("Failed to initialize Gmail service for %s while sending reply", agent_email, exc_info=True)
+        raise HTTPException(status_code=502, detail="Failed to connect to Gmail. Please try again.")
+
     if not original_msg_id and original_gmail_id:
         try:
             original_full = service.users().messages().get(
@@ -2153,11 +2166,13 @@ async def reply_to_message(
                 _gmail_header(original_headers, "References"),
                 original_msg_id,
             )
-        except Exception:
+        except HttpError:
             logger.warning(
                 "Could not load RFC Message-ID for Gmail reply threading",
                 exc_info=True,
             )
+        except Exception:
+            logger.warning("Could not load original Gmail headers for reply threading", exc_info=True)
 
     if attachments:
         mime_msg = MIMEMultipart()
@@ -2182,13 +2197,26 @@ async def reply_to_message(
     mime_msg['Date'] = formatdate(localtime=True)
 
     raw_message = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
-    sent = service.users().messages().send(
-        userId="me",
-        body={
-            'raw': raw_message,
-            'threadId': thread_id
-        }
-    ).execute()
+    try:
+        sent = service.users().messages().send(
+            userId="me",
+            body={
+                'raw': raw_message,
+                'threadId': thread_id
+            }
+        ).execute()
+    except HttpError as e:
+        status = getattr(getattr(e, "resp", None), "status", None) or 502
+        logger.error("Gmail send failed for %s with status %s", agent_email, status, exc_info=True)
+        if status in (401, 403):
+            raise HTTPException(
+                status_code=400,
+                detail="Gmail send permission failed. Please reconnect this Gmail account and approve Gmail read/send access.",
+            )
+        raise HTTPException(status_code=502, detail="Gmail send failed. Please try again.")
+    except Exception:
+        logger.error("Unexpected Gmail send failure for %s", agent_email, exc_info=True)
+        raise HTTPException(status_code=502, detail="Gmail send failed. Please try again.")
 
     sent_attachments = []
     if attachments:
