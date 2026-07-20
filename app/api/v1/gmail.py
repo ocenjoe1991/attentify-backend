@@ -1052,6 +1052,9 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                             "last_updated": timestamp,
                             "title": subject,
                             "participants": participants,
+                            "status": "Open",
+                            "archived": False,
+                            "trashed": False,
                             **{k: v for k, v in message_context.items() if v},
                         }
                     }

@@ -449,6 +449,9 @@ async def fetch_and_save_gmail(
                                 "started_at": started_at or existing_thread.get("started_at", timestamp),
                                 "last_updated": last_updated or timestamp,
                                 "title": subject or existing_thread.get("title", ""),
+                                "status": "Open",
+                                "archived": False,
+                                "trashed": False,
                             }
                         },
                     )
@@ -465,6 +468,9 @@ async def fetch_and_save_gmail(
                                 "last_updated": last_updated or timestamp,
                                 "title": subject,
                                 "participants": list(set(existing_thread.get("participants", []) + [sender, to])),
+                                "status": "Open",
+                                "archived": False,
+                                "trashed": False,
                                 **{k: v for k, v in message_context.items() if v},
                             }
                         }
