@@ -1,6 +1,7 @@
 #app/main.py
-from fastapi import FastAPI, Depends, Response
+from fastapi import FastAPI, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
 import os
@@ -262,6 +263,14 @@ async def lifespan(app: FastAPI):
     mongo_client.close()
 
 app = FastAPI(title="Attentify APP", lifespan=lifespan)
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Check backend logs for details."},
+    )
 
 # Mount Socket.IO app inside FastAPI
 socket_app = socketio.ASGIApp(sio, other_asgi_app=app)

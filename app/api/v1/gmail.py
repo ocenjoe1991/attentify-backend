@@ -943,6 +943,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             subject = _gmail_header(headers, "Subject")
             sender = _gmail_header(headers, "From")
             to = _gmail_header(headers, "To")
+            reply_to = _gmail_header(headers, "Reply-To")
             date = _gmail_header(headers, "Date")
             rfc_message_id = _gmail_header(headers, "Message-ID")
             in_reply_to = _gmail_header(headers, "In-Reply-To")
@@ -1000,6 +1001,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     "gmail_id": gmail_id,
                     "from": sender,
                     "to": to,
+                    "reply_to": reply_to,
                     "subject": subject,
                     "date": date,
                     "rfc_message_id": rfc_message_id,

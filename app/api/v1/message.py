@@ -89,6 +89,20 @@ def _build_references(existing_references: str | None, message_id: str) -> str:
         parts = f"{parts} {message_id}".strip()
     return parts
 
+
+def _reply_recipient(client_message: dict, fallback_client: str | None) -> str:
+    metadata = client_message.get("metadata") or {}
+    candidates = [
+        metadata.get("reply_to"),
+        metadata.get("from"),
+        fallback_client,
+    ]
+    for candidate in candidates:
+        _, email_addr = parseaddr(candidate or "")
+        if email_addr:
+            return email_addr
+    return fallback_client or ""
+
 LEGACY_STATUS_MAP = {
     "Assigned": "Open",
     "Closed": "Resolved",
@@ -2077,6 +2091,7 @@ async def reply_to_message(
     if content_type.startswith("multipart/form-data"):
         form = await request.form()
         content = str(form.get("content") or "").strip()
+        client_request_id = str(form.get("client_request_id") or "").strip()
         uploaded_files = form.getlist("files")
         total_size = 0
         for uploaded_file in uploaded_files:
@@ -2100,11 +2115,28 @@ async def reply_to_message(
     else:
         body = await request.json()
         content = (body.get("content") or "").strip()
+        client_request_id = str(body.get("client_request_id") or "").strip()
 
     if not content and not attachments:
         raise HTTPException(status_code=400, detail="Reply content or attachment is required")
 
     message = await ensure_message_access(id, db, current_user, action="update")
+    if client_request_id:
+        duplicate_message = next(
+            (
+                item
+                for item in message.get("messages", [])
+                if (item.get("metadata") or {}).get("client_request_id") == client_request_id
+            ),
+            None,
+        )
+        if duplicate_message:
+            logger.info(
+                "Duplicate email reply request ignored for message=%s request_id=%s",
+                id,
+                client_request_id,
+            )
+            return serialize_for_json(message)
     
     # Find latest client message for threading
     client_message = None
@@ -2135,7 +2167,9 @@ async def reply_to_message(
         client_metadata.get("rfc_message_id") or client_metadata.get("message_id")
     )
     references = _build_references(client_metadata.get("references"), original_msg_id)
-    to_addr = message.get("client")  # recipient (client)
+    to_addr = _reply_recipient(client_message, message.get("client"))
+    if not to_addr:
+        raise HTTPException(status_code=400, detail="No recipient email found for this reply.")
 
     # Send via Gmail API
     try:
@@ -2156,7 +2190,7 @@ async def reply_to_message(
                 userId="me",
                 id=original_gmail_id,
                 format="metadata",
-                metadataHeaders=["Message-ID", "References"],
+                metadataHeaders=["Message-ID", "References", "Reply-To", "From"],
             ).execute()
             original_headers = (original_full.get("payload") or {}).get("headers", [])
             original_msg_id = _normalize_rfc_message_id(
@@ -2165,6 +2199,17 @@ async def reply_to_message(
             references = _build_references(
                 _gmail_header(original_headers, "References"),
                 original_msg_id,
+            )
+            to_addr = _reply_recipient(
+                {
+                    **client_message,
+                    "metadata": {
+                        **client_metadata,
+                        "reply_to": client_metadata.get("reply_to") or _gmail_header(original_headers, "Reply-To"),
+                        "from": client_metadata.get("from") or _gmail_header(original_headers, "From"),
+                    },
+                },
+                message.get("client"),
             )
         except HttpError:
             logger.warning(
@@ -2258,9 +2303,11 @@ async def reply_to_message(
             "thread_id": sent.get("threadId"),
             "from": agent_email,
             "to": to_addr,
+            "reply_to_used": client_metadata.get("reply_to", ""),
             "date": format_datetime(now),
             "in_reply_to": original_msg_id,
             "references": references,
+            "client_request_id": client_request_id,
             "attachments": sent_attachments,
         }
     }
@@ -2275,8 +2322,4 @@ async def reply_to_message(
 
     updated_message = await db["messages"].find_one({"_id": ObjectId(id)})
 
-    if '_id' in updated_message:
-        updated_message['_id'] = str(updated_message['_id'])
-        updated_message['user_id'] = str(updated_message['user_id'])
-        updated_message['company_id'] = str(updated_message['company_id'])
-    return updated_message
+    return serialize_for_json(updated_message)
