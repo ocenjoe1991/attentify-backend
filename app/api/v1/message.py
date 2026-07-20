@@ -103,6 +103,29 @@ def _reply_recipient(client_message: dict, fallback_client: str | None) -> str:
             return email_addr
     return fallback_client or ""
 
+
+def _html_to_plain_text(html: str) -> str:
+    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", html or "")
+    text = re.sub(r"(?i)</\s*p\s*>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = (
+        text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+    )
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _reply_body_part(html: str) -> MIMEMultipart:
+    alternative = MIMEMultipart("alternative")
+    plain_text = _html_to_plain_text(html)
+    alternative.attach(MIMEText(plain_text or " ", "plain", "utf-8"))
+    alternative.attach(MIMEText(html or "", "html", "utf-8"))
+    return alternative
+
 LEGACY_STATUS_MAP = {
     "Assigned": "Open",
     "Closed": "Resolved",
@@ -2220,8 +2243,8 @@ async def reply_to_message(
             logger.warning("Could not load original Gmail headers for reply threading", exc_info=True)
 
     if attachments:
-        mime_msg = MIMEMultipart()
-        mime_msg.attach(MIMEText(content or "", "html"))
+        mime_msg = MIMEMultipart("mixed")
+        mime_msg.attach(_reply_body_part(content or ""))
         for attachment in attachments:
             maintype, subtype = attachment["mime_type"].split("/", 1) if "/" in attachment["mime_type"] else ("application", "octet-stream")
             part = MIMEBase(maintype, subtype)
@@ -2230,7 +2253,7 @@ async def reply_to_message(
             part.add_header("Content-Disposition", "attachment", filename=attachment["filename"])
             mime_msg.attach(part)
     else:
-        mime_msg = MIMEText(content, "html")
+        mime_msg = _reply_body_part(content)
 
     mime_msg['To'] = to_addr
     mime_msg['From'] = agent_email
