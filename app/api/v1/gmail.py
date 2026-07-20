@@ -959,6 +959,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     timestamp = timestamp.astimezone(timezone.utc)
             except Exception:
                 timestamp = datetime.now(timezone.utc)
+            received_at = datetime.now(timezone.utc)
 
             text_body, html_body = "", ""
 
@@ -1049,7 +1050,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     {
                         "$push": {"messages": chat_entry.dict()},
                         "$set": {
-                            "last_updated": timestamp,
+                            "last_updated": received_at,
                             "title": subject,
                             "participants": participants,
                             "status": "Open",
@@ -1084,7 +1085,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     "client": sender,
                     "agent": to,
                     "messages": [chat_entry.dict()],
-                    "last_updated": timestamp,
+                    "last_updated": received_at,
                     "started_at": timestamp,
                     "ai_summary": None,
                     "tags": [],

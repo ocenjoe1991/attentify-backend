@@ -355,6 +355,8 @@ async def fetch_and_save_gmail(
                     timestamp = timestamp.astimezone(timezone.utc)
             except Exception:
                 timestamp = datetime.now(timezone.utc)
+            received_at = datetime.now(timezone.utc)
+            list_updated_at = timestamp if force_full_sync else received_at
 
             # Extract plain text and HTML body
             text_body, html_body = "", ""
@@ -465,7 +467,7 @@ async def fetch_and_save_gmail(
                             "$push": {"messages": chat_entry.dict()},
                             "$set": {
                                 "started_at": started_at or existing_thread.get("started_at", timestamp),
-                                "last_updated": last_updated or timestamp,
+                                "last_updated": list_updated_at,
                                 "title": subject,
                                 "participants": list(set(existing_thread.get("participants", []) + [sender, to])),
                                 "status": "Open",
@@ -487,7 +489,7 @@ async def fetch_and_save_gmail(
                     "client": sender,
                     "agent": to,
                     "messages": [chat_entry.dict()],
-                    "last_updated": timestamp,
+                    "last_updated": list_updated_at,
                     "started_at": timestamp,
                     "ai_summary": None,
                     "tags": [],
