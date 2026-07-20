@@ -3,6 +3,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Body, Query, Request, Response
 import os
 import httpx
+import hashlib
 from app.services.gmail_service import fetch_all_gmail_accounts, get_gmail_service
 from app.services.deleted_gmail_service import record_deleted_gmail_messages
 from app.services.gmail_attachment_service import (
@@ -125,6 +126,38 @@ def _reply_body_part(html: str) -> MIMEMultipart:
     alternative.attach(MIMEText(plain_text or " ", "plain", "utf-8"))
     alternative.attach(MIMEText(html or "", "html", "utf-8"))
     return alternative
+
+
+def _attachment_key(filename: str, size: int) -> str:
+    return f"{filename.strip().lower()}:{int(size or 0)}"
+
+
+def _sent_attachment_keys(message: dict) -> tuple[set[str], set[str]]:
+    hashes: set[str] = set()
+    keys: set[str] = set()
+    for entry in message.get("messages", []):
+        if entry.get("sender") == message.get("client"):
+            continue
+        for attachment in (entry.get("metadata") or {}).get("attachments") or []:
+            if attachment.get("content_hash"):
+                hashes.add(attachment["content_hash"])
+            if attachment.get("filename"):
+                keys.add(_attachment_key(attachment.get("filename", ""), attachment.get("size", 0)))
+    return hashes, keys
+
+
+def _dedupe_reply_attachments(message: dict, attachments: list[dict]) -> tuple[list[dict], list[dict]]:
+    sent_hashes, sent_keys = _sent_attachment_keys(message)
+    next_attachments = []
+    skipped = []
+    for attachment in attachments:
+        content_hash = attachment.get("content_hash")
+        key = _attachment_key(attachment.get("filename", ""), attachment.get("size", 0))
+        if (content_hash and content_hash in sent_hashes) or key in sent_keys:
+            skipped.append(attachment)
+            continue
+        next_attachments.append(attachment)
+    return next_attachments, skipped
 
 LEGACY_STATUS_MAP = {
     "Assigned": "Open",
@@ -2132,6 +2165,7 @@ async def reply_to_message(
                     "filename": filename,
                     "mime_type": mime_type,
                     "size": len(data),
+                    "content_hash": hashlib.sha256(data).hexdigest(),
                     "data": data,
                 }
             )
@@ -2160,6 +2194,19 @@ async def reply_to_message(
                 client_request_id,
             )
             return serialize_for_json(message)
+
+    attachments, skipped_attachments = _dedupe_reply_attachments(message, attachments)
+    if skipped_attachments:
+        logger.info(
+            "Skipped %d duplicate email reply attachment(s) for message=%s",
+            len(skipped_attachments),
+            id,
+        )
+    if not content and not attachments:
+        raise HTTPException(
+            status_code=400,
+            detail="This attachment was already sent. Add a reply message to send without the duplicate attachment.",
+        )
     
     # Find latest client message for threading
     client_message = None
@@ -2299,12 +2346,23 @@ async def reply_to_message(
                 gmail_message_id=sent.get("id"),
                 account_email=agent_email,
             )
+            by_key = {
+                _attachment_key(item["filename"], item["size"]): item.get("content_hash")
+                for item in attachments
+            }
+            for sent_attachment in sent_attachments:
+                content_hash = by_key.get(
+                    _attachment_key(sent_attachment.get("filename", ""), sent_attachment.get("size", 0))
+                )
+                if content_hash:
+                    sent_attachment["content_hash"] = content_hash
         except Exception:
             sent_attachments = [
                 {
                     "filename": item["filename"],
                     "mime_type": item["mime_type"],
                     "size": item["size"],
+                    "content_hash": item.get("content_hash"),
                     "gmail_message_id": sent.get("id"),
                     "account_email": agent_email,
                 }
