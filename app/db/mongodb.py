@@ -13,10 +13,10 @@ def set_database(db: AsyncIOMotorDatabase) -> None:
 def get_db() -> AsyncIOMotorDatabase:
     """Return the database instance for background tasks (no request context)."""
     if _db is None:
-        raise RuntimeError("Database not initialized – call set_database() during startup")
+        raise RuntimeError("Database not initialized. Call set_database() during startup")
     return _db
 
 
 async def get_database(request: Request) -> AsyncIOMotorDatabase:
-    """FastAPI dependency – returns database instance from request.app.state."""
+    """FastAPI dependency: returns database instance from request.app.state."""
     return request.app.state.db

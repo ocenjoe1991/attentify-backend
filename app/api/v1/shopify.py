@@ -774,7 +774,7 @@ async def shopify_auth(request: Request,
         logger.info("Starting Shopify OAuth for %s with scopes: %s", shop, scopes)
         return RedirectResponse(url=auth_url)
     
-    # No shop → use SHOPIFY_INSTALL_URL + store pending record for callback recovery
+    # No shop: use SHOPIFY_INSTALL_URL and store a pending record for callback recovery
     await db["shopify_pending"].insert_one({
         "user_id": user_id,
         "company_id": company_id,
@@ -1261,7 +1261,7 @@ async def shopify_orders_updated_webhook(
     x_shopify_hmac_sha256: str = Header(...),
     x_shopify_shop_domain: str = Header(...)
 ):
-    """Handle orders/updated webhook from Shopify – upsert the changed order."""
+    """Handle orders/updated webhook from Shopify and upsert the changed order."""
     try:
         raw_body = await request.body()
 
@@ -1457,7 +1457,7 @@ async def sync_orders(
 
 # Background job: fetch and upsert all orders for all stores
 async def sync_all_stores_orders():
-    """Background incremental sync – only fetches orders updated since last_synced_at."""
+    """Background incremental sync: only fetches orders updated since last_synced_at."""
     db = get_db()
     creds = await get_all_shopify_creds(db)
     now = datetime.now(timezone.utc)
@@ -1493,7 +1493,7 @@ async def sync_all_stores_orders():
 
 
 async def sync_company_orders(company_id: ObjectId):
-    """Incremental sync – only fetches orders updated since last_synced_at."""
+    """Incremental sync: only fetches orders updated since last_synced_at."""
     db = get_db()
     now = datetime.now(timezone.utc)
     cursor = db["shopify_cred"].find({"company_id": company_id, "status": "connected"})

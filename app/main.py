@@ -203,25 +203,25 @@ async def ensure_database_indexes(db):
     )
     await db["processed_gmail_messages"].create_index([("claimed_at", -1)])
 
-    # Memberships — frequently queried by user+status and company+role
+    # Memberships: frequently queried by user+status and company+role
     await db["memberships"].create_index([("user_id", 1), ("status", 1)])
     await db["memberships"].create_index([("company_id", 1), ("role", 1), ("status", 1)])
 
-    # Users — lookup by email (login)
+    # Users: lookup by email (login)
     await db["users"].create_index([("email", 1)], unique=True)
 
-    # Gmail accounts — lookup by company
+    # Gmail accounts: lookup by company
     await db["gmail_accounts"].create_index([("company_id", 1)])
     await db["gmail_accounts"].create_index([("email", 1)])
 
-    # Shopify credentials — lookup by company and shop
+    # Shopify credentials: lookup by company and shop
     await db["shopify_cred"].create_index([("company_id", 1)])
     await db["shopify_cred"].create_index([("shop", 1)])
 
-    # Shopify pending auth tokens — auto-clean after 15 minutes
+    # Shopify pending auth tokens: auto-clean after 15 minutes
     await db["shopify_pending"].create_index("created_at", expireAfterSeconds=900)
 
-    # Audit logs — lookup by company + date
+    # Audit logs: lookup by company + date
     await db["audit_logs"].create_index([("company_id", 1), ("created_at", -1)])
 
 
@@ -232,7 +232,7 @@ async def migrate_order_dates(db):
         [{"$set": {"created_at": {"$toDate": "$created_at"}}}],
     )
     if result.modified_count:
-        logger.info("Migrated %d orders: created_at string → Date", result.modified_count)
+        logger.info("Migrated %d orders: created_at string to Date", result.modified_count)
 
 
 @asynccontextmanager

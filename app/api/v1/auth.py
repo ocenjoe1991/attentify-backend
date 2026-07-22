@@ -527,7 +527,7 @@ async def reset_password(
     return {"message": "Password reset successful"}
 
 
-# /api/v1/auth/set-password — for Google OAuth users to set their first password
+# /api/v1/auth/set-password: for Google OAuth users to set their first password
 class SetPasswordRequest(BaseModel):
     password: str
 

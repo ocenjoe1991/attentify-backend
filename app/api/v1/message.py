@@ -1845,7 +1845,7 @@ async def analyze_email_message(
         if not shopify_updated and db_order and store_scoped_match and (
             not client_email or same_email(db_order.get("customer", {}).get("email", ""), client_email)
         ):
-            # Cached order_info is fresh – return immediately with attached shopify_order
+            # Cached order_info is fresh: return immediately with attached shopify_order
             order_info["shopify_order"] = await build_order_snapshot(db, db_order)
             if order_info.get("confirmed"):
                 store_fields = await matched_store_fields(db, message_doc, db_order)
@@ -1872,12 +1872,12 @@ async def analyze_email_message(
             )
             return order_info
 
-        # Cached but shopify was updated or email mismatch – fall through to re-attach shopify_order
+        # Cached but Shopify was updated or email mismatch: fall through to re-attach shopify_order
         if not shopify_updated:
             await update_message_analysis_state(db, message_doc["_id"], state="cached", source="order_info")
         # else: fall through to re-process the shopify_order attachment below
     else:
-        # No valid order_info — run AI analysis
+        # No valid order_info: run AI analysis
         logger.info(
             "Order analysis started",
             extra={

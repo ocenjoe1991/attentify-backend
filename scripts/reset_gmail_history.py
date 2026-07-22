@@ -30,7 +30,7 @@ async def reset_gmail_history():
             {"$set": {"history_id": ""}}
         )
         
-        print(f"✓ Reset {result.modified_count} Gmail account history IDs")
+        print(f"Reset {result.modified_count} Gmail account history IDs")
         print("  Next Gmail sync will fetch all emails with correct UTC timestamps")
         
         # Show updated accounts
@@ -40,7 +40,7 @@ async def reset_gmail_history():
             print(f"  - {acc.get('email', 'unknown')}")
             
     except Exception as e:
-        print(f"✗ Error resetting history IDs: {e}")
+        print(f"Error resetting history IDs: {e}")
         raise
     finally:
         client.close()
@@ -57,6 +57,6 @@ if __name__ == "__main__":
     response = input("Continue? (y/n): ").strip().lower()
     if response == "y":
         asyncio.run(reset_gmail_history())
-        print("\n✓ Complete. Emails will resync on next fetch.")
+        print("\nComplete. Emails will resync on next fetch.")
     else:
         print("Cancelled.")

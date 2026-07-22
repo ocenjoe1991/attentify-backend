@@ -12,7 +12,7 @@ SECRET_KEY = settings.SECRET_KEY
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
 
-# OAuth2 token scheme — auto_error=False so we can fall back to cookies
+# OAuth2 token scheme: auto_error=False so we can fall back to cookies
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
