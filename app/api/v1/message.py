@@ -46,6 +46,7 @@ from app.core.permissions import (
 )
 from app.core.audit import record_audit_log
 from app.utils.datetime_utils import to_utc_iso
+from app.main import sio
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
 
@@ -2399,6 +2400,15 @@ async def reply_to_message(
             "$push": {"messages": reply_entry},
             "$set": {"last_updated": reply_entry["timestamp"]}
         }
+    )
+    await sio.emit(
+        "gmail_update",
+        {
+            "user_id": str(message.get("user_id", "")),
+            "company_id": str(message.get("company_id", "")),
+            "email": agent_email,
+            "message": f"Reply sent from {agent_email}",
+        },
     )
 
     updated_message = await db["messages"].find_one({"_id": ObjectId(id)})
