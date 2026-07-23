@@ -105,6 +105,19 @@ async def mark_gmail_account_disconnected(db, account: dict, error_message: str 
         },
     )
 
+
+async def emit_gmail_update(user_id, company_id, email_address: str) -> None:
+    await sio.emit(
+        "gmail_update",
+        {
+            "user_id": str(user_id),
+            "company_id": str(company_id),
+            "email": email_address,
+            "message": f"New messages pushed for {email_address}",
+        },
+    )
+
+
 def gmail_account_helper(account: dict) -> dict:
     store_ids = _account_store_ids(account)
     return {
@@ -769,7 +782,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
     last_history_id = account.get("history_id")
     if not last_history_id:
         logger.info("No stored historyId for %s. Setting Gmail baseline to %s.", email_address, history_id)
-        await fetch_and_save_gmail(
+        sync_result = await fetch_and_save_gmail(
             {
                 "account_id": account["_id"],
                 "email": account["email"],
@@ -800,6 +813,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             {"_id": account["_id"]},
             {"$set": {"history_id": history_id, "status": "connected"}},
         )
+        if (sync_result or {}).get("stored_count") or (sync_result or {}).get("updated_count"):
+            await emit_gmail_update(user_id, company_id, email_address)
         return Response(status_code=200)
     else:
         try:
@@ -834,7 +849,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     email_address,
                     history_id,
                 )
-                await fetch_and_save_gmail(
+                sync_result = await fetch_and_save_gmail(
                     {
                         "account_id": account["_id"],
                         "email": account["email"],
@@ -865,6 +880,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     {"_id": account["_id"]},
                     {"$set": {"history_id": history_id, "status": "connected"}},
                 )
+                if (sync_result or {}).get("stored_count") or (sync_result or {}).get("updated_count"):
+                    await emit_gmail_update(user_id, company_id, email_address)
                 return Response(status_code=200)
             logger.error("Failed fetching Gmail history for %s", email_address, exc_info=True)
             return Response(status_code=500)
@@ -1051,7 +1068,6 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                         "$push": {"messages": chat_entry.dict()},
                         "$set": {
                             "last_updated": received_at,
-                            "title": subject,
                             "participants": participants,
                             "status": "Open",
                             "archived": False,
@@ -1094,15 +1110,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 message_doc.update({k: v for k, v in message_context.items() if v})
                 await db["messages"].insert_one(message_doc)
 
-            await sio.emit(
-                "gmail_update",
-                {
-                    "user_id": str(user_id),
-                    "company_id": str(company_id),
-                    "email": email_address,
-                    "message": f"New messages pushed for {email_address}"
-                }
-            )
+            await emit_gmail_update(user_id, company_id, email_address)
                 
     await db["gmail_accounts"].update_one(
         {"_id": account["_id"]},

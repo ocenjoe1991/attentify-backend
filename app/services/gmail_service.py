@@ -450,7 +450,7 @@ async def fetch_and_save_gmail(
                                 f"messages.{duplicate_index}": chat_entry.dict(),
                                 "started_at": started_at or existing_thread.get("started_at", timestamp),
                                 "last_updated": last_updated or timestamp,
-                                "title": subject or existing_thread.get("title", ""),
+                                "title": existing_thread.get("title", subject or ""),
                                 "status": "Open",
                                 "archived": False,
                                 "trashed": False,
@@ -468,7 +468,6 @@ async def fetch_and_save_gmail(
                             "$set": {
                                 "started_at": started_at or existing_thread.get("started_at", timestamp),
                                 "last_updated": list_updated_at,
-                                "title": subject,
                                 "participants": list(set(existing_thread.get("participants", []) + [sender, to])),
                                 "status": "Open",
                                 "archived": False,
