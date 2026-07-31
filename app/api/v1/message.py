@@ -106,6 +106,20 @@ def _reply_recipient(client_message: dict, fallback_client: str | None) -> str:
     return fallback_client or ""
 
 
+def apply_current_user_read_state(doc: dict, user_id: ObjectId) -> None:
+    if "read_by" not in doc:
+        # Tickets created before read tracking was added remain read on rollout.
+        doc["is_read_by_current_user"] = True
+    else:
+        read_by = doc.get("read_by") or []
+        doc["is_read_by_current_user"] = any(
+            str(entry.get("user_id")) == str(user_id)
+            for entry in read_by
+            if isinstance(entry, dict)
+        )
+    doc.pop("read_by", None)
+
+
 def _html_to_plain_text(html: str) -> str:
     text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", html or "")
     text = re.sub(r"(?i)</\s*p\s*>", "\n\n", text)
@@ -328,6 +342,7 @@ async def get_messages(db=Depends(get_database), current_user: dict = Depends(ge
 
     result = []
     for doc in messages:
+        apply_current_user_read_state(doc, current_user["_id"])
         doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
         doc["company_id"] = str(doc["company_id"])
@@ -516,6 +531,7 @@ async def get_company_messages(
     messages = []
     assigned_ids = set()
     async for doc in db["messages"].aggregate(pipeline):
+        apply_current_user_read_state(doc, current_user["_id"])
         doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
         doc["company_id"] = str(doc["company_id"])
@@ -578,6 +594,7 @@ async def get_message(
     current_user: dict = Depends(get_current_user),
 ):
     doc = await ensure_message_access(id, db, current_user, action="read")
+    apply_current_user_read_state(doc, current_user["_id"])
 
     # Convert ObjectIds to strings
     doc["_id"] = str(doc["_id"])
@@ -601,6 +618,27 @@ async def get_message(
     doc["comments"] = comments
 
     return doc
+
+
+@router.post("/{id}/read", response_model=dict)
+async def mark_message_read(
+    id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict = Depends(get_current_user),
+):
+    doc = await ensure_message_access(id, db, current_user, action="read")
+    read_at = datetime.now(timezone.utc)
+
+    await db["messages"].update_one(
+        {"_id": doc["_id"], "read_by.user_id": {"$ne": current_user["_id"]}},
+        {"$push": {"read_by": {"user_id": current_user["_id"], "read_at": read_at}}},
+    )
+
+    return {
+        "id": str(doc["_id"]),
+        "is_read_by_current_user": True,
+        "read_at": to_utc_iso(read_at),
+    }
 
 
 @router.get("/{id}/order-precheck", response_model=dict)
