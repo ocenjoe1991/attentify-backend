@@ -135,6 +135,40 @@ def _html_to_plain_text(html: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def _message_entry_timestamp(entry: dict) -> datetime:
+    value = entry.get("timestamp")
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def latest_customer_message_preview(doc: dict, limit: int = 180) -> str:
+    entries = doc.get("messages") or []
+    if not entries:
+        return ""
+
+    client_email = parseaddr(doc.get("client") or "")[1].lower()
+    customer_entries = [
+        entry
+        for entry in entries
+        if client_email and parseaddr(entry.get("sender") or "")[1].lower() == client_email
+    ]
+    latest_entry = max(customer_entries or entries, key=_message_entry_timestamp)
+    content = latest_entry.get("content") or ""
+    if latest_entry.get("message_type") == "html":
+        content = _html_to_plain_text(content)
+
+    preview = re.sub(r"\s+", " ", content).strip()
+    if len(preview) > limit:
+        return f"{preview[:limit - 3].rstrip()}..."
+    return preview
+
+
 def _reply_body_part(html: str) -> MIMEMultipart:
     alternative = MIMEMultipart("alternative")
     plain_text = _html_to_plain_text(html)
@@ -569,6 +603,7 @@ async def get_company_messages(
         doc["has_attachments"] = bool(first_attachment)
         if first_attachment:
             doc["first_attachment"] = first_attachment
+        doc["latest_message_preview"] = latest_customer_message_preview(doc)
 
         doc.pop("assigned_member_id", None)
         doc.pop("messages", None)
