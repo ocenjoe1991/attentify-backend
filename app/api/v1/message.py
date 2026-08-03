@@ -31,6 +31,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
+from html import unescape
+from html.parser import HTMLParser
 import mimetypes
 from urllib.parse import quote
 from datetime import datetime, timezone
@@ -120,19 +122,48 @@ def apply_current_user_read_state(doc: dict, user_id: ObjectId) -> None:
     doc.pop("read_by", None)
 
 
+class _EmailTextExtractor(HTMLParser):
+    _ignored_tags = {"head", "style", "script", "noscript", "template", "svg"}
+    _block_tags = {"address", "article", "br", "div", "footer", "header", "li", "p", "section", "table", "td", "th", "tr"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        tag = tag.lower()
+        if tag in self._ignored_tags:
+            self.ignored_depth += 1
+        elif not self.ignored_depth and tag in self._block_tags:
+            self.parts.append(" ")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        if not self.ignored_depth and tag.lower() in self._block_tags:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._ignored_tags and self.ignored_depth:
+            self.ignored_depth -= 1
+        elif not self.ignored_depth and tag in self._block_tags:
+            self.parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        if not self.ignored_depth:
+            self.parts.append(data)
+
+
 def _html_to_plain_text(html: str) -> str:
-    text = re.sub(r"(?i)<\s*br\s*/?\s*>", "\n", html or "")
-    text = re.sub(r"(?i)</\s*p\s*>", "\n\n", text)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = (
-        text.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", '"')
-        .replace("&#39;", "'")
-    )
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    extractor = _EmailTextExtractor()
+    try:
+        extractor.feed(unescape(html or ""))
+        extractor.close()
+        text = "".join(extractor.parts)
+    except Exception:
+        text = re.sub(r"(?is)<(style|script|head|noscript|template|svg)\b.*?</\1>", " ", html or "")
+        text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", unescape(text)).strip()
 
 
 def _message_entry_timestamp(entry: dict) -> datetime:
