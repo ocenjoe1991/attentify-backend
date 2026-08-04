@@ -636,6 +636,8 @@ async def get_company_messages(
     messages = []
     assigned_ids = set()
     async for doc in db["messages"].aggregate(pipeline):
+        # Build the per-user preview before the response serializer removes read_by.
+        doc["latest_message_preview"] = latest_message_preview_for_user(doc, current_user["_id"])
         apply_current_user_read_state(doc, current_user["_id"])
         doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
@@ -674,7 +676,6 @@ async def get_company_messages(
         doc["has_attachments"] = bool(first_attachment)
         if first_attachment:
             doc["first_attachment"] = first_attachment
-        doc["latest_message_preview"] = latest_message_preview_for_user(doc, current_user["_id"])
 
         doc.pop("assigned_member_id", None)
         doc.pop("messages", None)
