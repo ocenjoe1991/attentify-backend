@@ -167,7 +167,7 @@ def _latest_reply_content(content: str, message_type: str | None) -> str:
         # Gmail commonly wraps quoted earlier messages in these containers.
         content = re.sub(r"(?is)<blockquote\b.*?</blockquote\s*>", " ", content or "")
         content = re.sub(
-            r'(?is)<(?:div|span|p)\b[^>]*\bclass=["\'][^"\']*\bgmail_quote\b[^"\']*["\'][^>]*>.*?</(?:div|span|p)\s*>",
+            r'''(?is)<(?:div|span|p)\b[^>]*\bclass=["'][^"']*\bgmail_quote\b[^"']*["'][^>]*>.*?</(?:div|span|p)\s*>''',
             " ",
             content,
         )
