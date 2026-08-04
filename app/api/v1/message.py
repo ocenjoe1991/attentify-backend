@@ -161,6 +161,29 @@ def _html_to_plain_text(html: str) -> str:
     return re.sub(r"\s+", " ", unescape(text)).strip()
 
 
+def _latest_reply_content(content: str, message_type: str | None) -> str:
+    """Keep only the newly written part of a reply for an inbox preview."""
+    if message_type == "html":
+        # Gmail commonly wraps quoted earlier messages in these containers.
+        content = re.sub(r"(?is)<blockquote\b.*?</blockquote\s*>", " ", content or "")
+        content = re.sub(
+            r'(?is)<(?:div|span|p)\b[^>]*\bclass=["\'][^"\']*\bgmail_quote\b[^"\']*["\'][^>]*>.*?</(?:div|span|p)\s*>",
+            " ",
+            content,
+        )
+        content = _html_to_plain_text(content)
+
+    # Plain-text replies normally place the previous conversation after one of
+    # these separators. The first match marks the end of the new message.
+    reply_boundary = re.search(
+        r"(?im)^\s*(?:On .+wrote:|From:\s|-----Original Message-----|_{3,})",
+        content or "",
+    )
+    if reply_boundary:
+        content = content[:reply_boundary.start()]
+    return content
+
+
 def _message_entry_timestamp(entry: dict) -> datetime:
     value = entry.get("timestamp")
     if isinstance(value, datetime):
@@ -222,9 +245,7 @@ def unviewed_customer_entries(doc: dict, user_id: ObjectId) -> list[dict]:
 def message_preview(entry: dict | None, limit: int = 180) -> str:
     if not entry:
         return ""
-    content = entry.get("content") or ""
-    if entry.get("message_type") == "html":
-        content = _html_to_plain_text(content)
+    content = _latest_reply_content(entry.get("content") or "", entry.get("message_type"))
 
     preview = re.sub(r"\s+", " ", content).strip()
     if len(preview) > limit:
