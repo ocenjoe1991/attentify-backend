@@ -253,12 +253,26 @@ def message_preview(entry: dict | None, limit: int = 180) -> str:
     return preview
 
 
-def latest_message_preview_for_user(doc: dict, user_id: ObjectId) -> str:
+def latest_message_preview_entry_for_user(doc: dict, user_id: ObjectId) -> dict | None:
     unviewed_entries = unviewed_customer_entries(doc, user_id)
     if unviewed_entries:
-        return message_preview(unviewed_entries[-1])
+        return unviewed_entries[-1]
     entries = customer_message_entries(doc)
-    return message_preview(entries[-1] if entries else None)
+    return entries[-1] if entries else None
+
+
+def latest_message_preview_details(doc: dict, user_id: ObjectId) -> dict:
+    entry = latest_message_preview_entry_for_user(doc, user_id)
+    metadata = (entry or {}).get("metadata") or {}
+    return {
+        "latest_message_preview": message_preview(entry),
+        "latest_message_preview_from": metadata.get("from") or (entry or {}).get("sender") or "",
+        "latest_message_preview_at": to_utc_iso((entry or {}).get("timestamp")),
+    }
+
+
+def latest_message_preview_for_user(doc: dict, user_id: ObjectId) -> str:
+    return latest_message_preview_details(doc, user_id)["latest_message_preview"]
 
 
 def _reply_body_part(html: str) -> MIMEMultipart:
@@ -658,7 +672,7 @@ async def get_company_messages(
     assigned_ids = set()
     async for doc in db["messages"].aggregate(pipeline):
         # Build the per-user preview before the response serializer removes read_by.
-        doc["latest_message_preview"] = latest_message_preview_for_user(doc, current_user["_id"])
+        doc.update(latest_message_preview_details(doc, current_user["_id"]))
         apply_current_user_read_state(doc, current_user["_id"])
         doc["_id"] = str(doc["_id"])
         doc["user_id"] = str(doc["user_id"])
@@ -810,7 +824,7 @@ async def mark_message_read(
     return {
         "id": str(doc["_id"]),
         "is_read_by_current_user": not unviewed_customer_entries(doc, current_user["_id"]),
-        "latest_message_preview": latest_message_preview_for_user(doc, current_user["_id"]),
+        **latest_message_preview_details(doc, current_user["_id"]),
         "read_at": to_utc_iso(read_at),
     }
 
