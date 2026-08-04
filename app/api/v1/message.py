@@ -113,12 +113,7 @@ def apply_current_user_read_state(doc: dict, user_id: ObjectId) -> None:
         # Tickets created before read tracking was added remain read on rollout.
         doc["is_read_by_current_user"] = True
     else:
-        read_by = doc.get("read_by") or []
-        doc["is_read_by_current_user"] = any(
-            str(entry.get("user_id")) == str(user_id)
-            for entry in read_by
-            if isinstance(entry, dict)
-        )
+        doc["is_read_by_current_user"] = not unviewed_customer_entries(doc, user_id)
     doc.pop("read_by", None)
 
 
@@ -178,26 +173,71 @@ def _message_entry_timestamp(entry: dict) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def latest_customer_message_preview(doc: dict, limit: int = 180) -> str:
-    entries = doc.get("messages") or []
-    if not entries:
-        return ""
-
+def customer_message_entries(doc: dict) -> list[dict]:
     client_email = parseaddr(doc.get("client") or "")[1].lower()
-    customer_entries = [
-        entry
-        for entry in entries
-        if client_email and parseaddr(entry.get("sender") or "")[1].lower() == client_email
-    ]
-    latest_entry = max(customer_entries or entries, key=_message_entry_timestamp)
-    content = latest_entry.get("content") or ""
-    if latest_entry.get("message_type") == "html":
+    entries = doc.get("messages") or []
+    if not client_email:
+        return sorted(entries, key=_message_entry_timestamp)
+
+    customer_entries = []
+    for entry in entries:
+        sender = (entry.get("metadata") or {}).get("from") or entry.get("sender") or ""
+        if parseaddr(sender)[1].lower() == client_email:
+            customer_entries.append(entry)
+    return sorted(customer_entries, key=_message_entry_timestamp)
+
+
+def current_user_read_entry(doc: dict, user_id: ObjectId) -> dict | None:
+    return next(
+        (
+            entry
+            for entry in doc.get("read_by") or []
+            if isinstance(entry, dict) and str(entry.get("user_id")) == str(user_id)
+        ),
+        None,
+    )
+
+
+def unviewed_customer_entries(doc: dict, user_id: ObjectId) -> list[dict]:
+    entries = customer_message_entries(doc)
+    if not entries or "read_by" not in doc:
+        return []
+
+    read_entry = current_user_read_entry(doc, user_id)
+    if not read_entry:
+        return entries
+
+    last_viewed_id = read_entry.get("last_viewed_gmail_id")
+    # Legacy read records did not have an individual email cursor.
+    if not last_viewed_id:
+        return []
+
+    for index, entry in enumerate(entries):
+        gmail_id = (entry.get("metadata") or {}).get("gmail_id")
+        if gmail_id == last_viewed_id:
+            return entries[index + 1:]
+    return []
+
+
+def message_preview(entry: dict | None, limit: int = 180) -> str:
+    if not entry:
+        return ""
+    content = entry.get("content") or ""
+    if entry.get("message_type") == "html":
         content = _html_to_plain_text(content)
 
     preview = re.sub(r"\s+", " ", content).strip()
     if len(preview) > limit:
         return f"{preview[:limit - 3].rstrip()}..."
     return preview
+
+
+def latest_message_preview_for_user(doc: dict, user_id: ObjectId) -> str:
+    unviewed_entries = unviewed_customer_entries(doc, user_id)
+    if unviewed_entries:
+        return message_preview(unviewed_entries[-1])
+    entries = customer_message_entries(doc)
+    return message_preview(entries[-1] if entries else None)
 
 
 def _reply_body_part(html: str) -> MIMEMultipart:
@@ -634,7 +674,7 @@ async def get_company_messages(
         doc["has_attachments"] = bool(first_attachment)
         if first_attachment:
             doc["first_attachment"] = first_attachment
-        doc["latest_message_preview"] = latest_customer_message_preview(doc)
+        doc["latest_message_preview"] = latest_message_preview_for_user(doc, current_user["_id"])
 
         doc.pop("assigned_member_id", None)
         doc.pop("messages", None)
@@ -689,20 +729,66 @@ async def get_message(
 @router.post("/{id}/read", response_model=dict)
 async def mark_message_read(
     id: str,
+    payload: dict = Body(...),
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict = Depends(get_current_user),
 ):
     doc = await ensure_message_access(id, db, current_user, action="read")
-    read_at = datetime.now(timezone.utc)
+    gmail_message_id = str(payload.get("gmail_message_id") or "").strip()
+    if not gmail_message_id:
+        raise HTTPException(status_code=400, detail="gmail_message_id is required")
 
-    await db["messages"].update_one(
-        {"_id": doc["_id"], "read_by.user_id": {"$ne": current_user["_id"]}},
-        {"$push": {"read_by": {"user_id": current_user["_id"], "read_at": read_at}}},
+    customer_entries = customer_message_entries(doc)
+    target_index = next(
+        (
+            index
+            for index, entry in enumerate(customer_entries)
+            if (entry.get("metadata") or {}).get("gmail_id") == gmail_message_id
+        ),
+        None,
     )
+    if target_index is None:
+        raise HTTPException(status_code=400, detail="Message is not a customer email in this ticket")
+
+    existing_read_entry = current_user_read_entry(doc, current_user["_id"])
+    existing_index = -1
+    if existing_read_entry and existing_read_entry.get("last_viewed_gmail_id"):
+        existing_index = next(
+            (
+                index
+                for index, entry in enumerate(customer_entries)
+                if (entry.get("metadata") or {}).get("gmail_id") == existing_read_entry["last_viewed_gmail_id"]
+            ),
+            -1,
+        )
+
+    read_at = datetime.now(timezone.utc)
+    if target_index > existing_index:
+        read_state = {
+            "user_id": current_user["_id"],
+            "last_viewed_gmail_id": gmail_message_id,
+            "read_at": read_at,
+        }
+        if existing_read_entry:
+            await db["messages"].update_one(
+                {"_id": doc["_id"], "read_by.user_id": current_user["_id"]},
+                {"$set": {"read_by.$": read_state}},
+            )
+        else:
+            await db["messages"].update_one(
+                {"_id": doc["_id"], "read_by.user_id": {"$ne": current_user["_id"]}},
+                {"$push": {"read_by": read_state}},
+            )
+        doc["read_by"] = [
+            entry
+            for entry in doc.get("read_by") or []
+            if not (isinstance(entry, dict) and str(entry.get("user_id")) == str(current_user["_id"]))
+        ] + [read_state]
 
     return {
         "id": str(doc["_id"]),
-        "is_read_by_current_user": True,
+        "is_read_by_current_user": not unviewed_customer_entries(doc, current_user["_id"]),
+        "latest_message_preview": latest_message_preview_for_user(doc, current_user["_id"]),
         "read_at": to_utc_iso(read_at),
     }
 

@@ -1048,8 +1048,6 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 message_context["default_store_id"] = scoped_stores[0]["_id"]
                 message_context["default_store_shop"] = scoped_stores[0].get("shop")
 
-            is_inbound_message = "INBOX" in full_msg.get("labelIds", [])
-
             existing_thread = await db["messages"].find_one(
                 {"user_id": user_object_id, "thread_id": thread_id, "channel": "email"}
             )
@@ -1074,7 +1072,6 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                             "status": "Open",
                             "archived": False,
                             "trashed": False,
-                            **({"read_by": []} if is_inbound_message else {}),
                             **{k: v for k, v in message_context.items() if v},
                         }
                     }

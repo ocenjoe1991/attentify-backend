@@ -424,8 +424,6 @@ async def fetch_and_save_gmail(
                 message_context["default_store_id"] = account["store_ids"][0]
                 message_context["default_store_shop"] = (account.get("store_shops") or [""])[0]
 
-            is_inbound_message = "INBOX" in full_msg.get("labelIds", [])
-
             # Find existing thread (conversation) in 'messages' collection by thread_id
             existing_thread = await db["messages"].find_one({"user_id": ObjectId(user_id), "thread_id": thread_id, "channel": "email"})
 
@@ -474,7 +472,6 @@ async def fetch_and_save_gmail(
                                 "status": "Open",
                                 "archived": False,
                                 "trashed": False,
-                                **({"read_by": []} if is_inbound_message else {}),
                                 **{k: v for k, v in message_context.items() if v},
                             }
                         }
