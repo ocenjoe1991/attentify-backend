@@ -235,7 +235,7 @@ def message_preview(entry: dict | None, limit: int = 180) -> str:
 def latest_message_preview_entry_for_user(doc: dict, user_id: ObjectId) -> dict | None:
     unviewed_entries = unviewed_customer_entries(doc, user_id)
     if unviewed_entries:
-        return unviewed_entries[-1]
+        return unviewed_entries[0]
     entries = customer_message_entries(doc)
     return entries[-1] if entries else None
 
