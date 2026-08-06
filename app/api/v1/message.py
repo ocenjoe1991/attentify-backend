@@ -219,12 +219,24 @@ def unviewed_customer_entries(doc: dict, user_id: ObjectId) -> list[dict]:
     return []
 
 
+def _preview_content(content: str, message_type: str | None) -> str:
+    if message_type == "html":
+        # Gmail commonly puts quoted history in blockquotes. This affects only
+        # the Inbox snippet; the original message remains unchanged for detail view.
+        content = re.sub(r"(?is)<blockquote\b.*?</blockquote\s*>", " ", content or "")
+        content = _html_to_plain_text(content)
+
+    quote_boundary = re.search(
+        r"(?is)\s+(?:On\s+(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\b.{0,180}?\bwrote:|-----Original Message-----|From:\s+\S+)",
+        content or "",
+    )
+    return content[:quote_boundary.start()] if quote_boundary else content
+
+
 def message_preview(entry: dict | None, limit: int = 180) -> str:
     if not entry:
         return ""
-    content = entry.get("content") or ""
-    if entry.get("message_type") == "html":
-        content = _html_to_plain_text(content)
+    content = _preview_content(entry.get("content") or "", entry.get("message_type"))
 
     preview = re.sub(r"\s+", " ", content).strip()
     if len(preview) > limit:
