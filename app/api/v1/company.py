@@ -9,6 +9,7 @@ from typing import List
 from app.core.security import create_access_token
 from app.core.permissions import (
     ROLE_ADMIN,
+    ROLE_AGENT,
     ROLE_COMPANY_OWNER,
     ROLE_PERMISSIONS,
     normalize_custom_permissions,
@@ -467,6 +468,8 @@ async def get_company_dashboard(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     base_message_query = {"company_id": company_object_id}
+    if membership and membership.get("role") == ROLE_AGENT:
+        base_message_query["assigned_member_id"] = current_user["_id"]
     open_statuses = ["Open", "Assigned", "In Progress", "Pending", "Escalated", "Awaiting Approval"]
     needs_review_filter = {
         "$or": [

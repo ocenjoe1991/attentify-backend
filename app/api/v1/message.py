@@ -520,17 +520,8 @@ async def get_company_messages(
     # Base query depending on role
     query = {"company_id": ObjectId(company_id)}
     if role == "agent":
-        # Agents can see tickets assigned to them AND unassigned tickets
-        query["$or"] = [
-            {"assigned_member_id": current_user["_id"]},
-            {
-                "$or": [
-                    {"assigned_member_id": {"$exists": False}},
-                    {"assigned_member_id": None},
-                    {"assigned_member_id": ""},
-                ]
-            },
-        ]
+        # Agents may access only tickets explicitly assigned to themselves.
+        query["assigned_member_id"] = current_user["_id"]
     elif role not in ["company_owner", "store_owner", "agent", "readonly"]:
         query["user_id"] = current_user["_id"]
 
@@ -569,7 +560,8 @@ async def get_company_messages(
             query["$or"] = search_or
 
     if assigned_filter == "assigned":
-        query["assigned_member_id"] = {"$exists": True, "$ne": None}
+        if role != "agent":
+            query["assigned_member_id"] = {"$exists": True, "$ne": None}
     elif assigned_filter == "unassigned":
         query["$and"] = query.get("$and", [])
         query["$and"].append({
@@ -950,12 +942,8 @@ async def ensure_message_access(
         raise HTTPException(status_code=403, detail="Read-only users cannot modify messages")
     if role == "agent":
         assigned = message.get("assigned_member_id")
-        is_assigned_to_agent = assigned and str(assigned) == str(current_user["_id"])
-        is_unassigned = not assigned or assigned is None or assigned == ""
-        if not is_assigned_to_agent and not is_unassigned:
-            raise HTTPException(status_code=403, detail="Message is assigned to another agent")
-        if not is_assigned_to_agent and is_unassigned and action != "read":
-            raise HTTPException(status_code=403, detail="Only read access is allowed for unassigned messages")
+        if not assigned or str(assigned) != str(current_user["_id"]):
+            raise HTTPException(status_code=403, detail="Message is not assigned to this agent")
     if role not in ["company_owner", "store_owner", "agent", "readonly"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
