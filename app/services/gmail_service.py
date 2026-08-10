@@ -477,6 +477,15 @@ async def fetch_and_save_gmail(
                         }
                 )
             else:
+                today_start = datetime.now(timezone.utc).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                ticket_count = await db["messages"].count_documents({
+                    "company_id": ObjectId(company_id),
+                    "started_at": {"$gte": today_start},
+                })
+                ticket_number = f"CA-{today_start.strftime('%Y-%m-%d')}-{ticket_count + 1:04d}"
+
                 message_doc = {
                     "user_id": ObjectId(user_id),
                     "company_id": ObjectId(company_id),
@@ -485,6 +494,7 @@ async def fetch_and_save_gmail(
                     "channel": "email",
                     "status": "Open",
                     "title": subject,
+                    "ticket": ticket_number,
                     "client": sender,
                     "agent": to,
                     "messages": [chat_entry.dict()],
