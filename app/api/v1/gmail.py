@@ -22,7 +22,12 @@ import base64
 import urllib.parse
 import re
 from app.db.mongodb import get_database
-from app.services.gmail_service import fetch_and_save_gmail, get_gmail_service
+from app.services.gmail_service import (
+    fetch_and_save_gmail,
+    get_gmail_service,
+    next_ticket_number,
+    should_generate_ticket_number,
+)
 from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
 from app.services.gmail_attachment_service import extract_gmail_attachments
@@ -1077,17 +1082,13 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     }
                 )
             else:
-                shopify_order_match = re.search(r"#([A-Z]{2}\d+)", subject or content or "")
-                shopify_order = shopify_order_match.group(1) if shopify_order_match else None
-
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                count_today = await db["messages"].count_documents({
-                    "company_id": company_object_id,
-                    "started_at": {"$gte": datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)}
-                })
-                ticket_number = f"CA-{today}-{count_today + 1:04d}"
-
-                logger.info(f"Creating new ticket {ticket_number} for order {shopify_order}")
+                ticket_number = (
+                    await next_ticket_number(db, company_object_id)
+                    if should_generate_ticket_number(subject, content)
+                    else ""
+                )
+                if ticket_number:
+                    logger.info("Creating ticket %s", ticket_number)
 
                 message_doc = {
                     "user_id": user_object_id,
@@ -1097,7 +1098,6 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     "channel": "email",
                     "status": "Open",
                     "title": subject,
-                    "ticket": ticket_number,
                     "client": sender,
                     "agent": to,
                     "messages": [chat_entry.dict()],
@@ -1108,6 +1108,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     "tags": [],
                     "resolved_by_ai": False
                 }
+                if ticket_number:
+                    message_doc["ticket"] = ticket_number
                 message_doc.update({k: v for k, v in message_context.items() if v})
                 await db["messages"].insert_one(message_doc)
 

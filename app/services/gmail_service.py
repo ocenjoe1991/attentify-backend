@@ -1,7 +1,9 @@
 import base64
 import asyncio
+import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from html import unescape
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -16,6 +18,34 @@ import logging
 import requests
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+ORDER_MENTION_PATTERN = re.compile(r"\border\b", re.IGNORECASE)
+ORDER_REFERENCE_PATTERN = re.compile(
+    r"(?<![\w#])#(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{3,}\b"
+)
+
+
+def should_generate_ticket_number(subject: str, content: str) -> bool:
+    text = unescape(re.sub(r"<[^>]+>", " ", f"{subject or ''} {content or ''}"))
+    return bool(ORDER_MENTION_PATTERN.search(text) or ORDER_REFERENCE_PATTERN.search(text))
+
+
+async def next_ticket_number(db, company_id) -> str:
+    company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
+    now = datetime.now(timezone.utc)
+    prefix = f"CA-{now.strftime('%Y-%m-%d')}-"
+    max_sequence = 0
+
+    cursor = db["messages"].find(
+        {"company_id": company_object_id, "ticket": {"$regex": f"^{re.escape(prefix)}"}},
+        {"ticket": 1},
+    )
+    async for message in cursor:
+        try:
+            max_sequence = max(max_sequence, int(str(message["ticket"]).removeprefix(prefix)))
+        except (KeyError, ValueError):
+            continue
+
+    return f"{prefix}{max_sequence + 1:04d}"
 
 def _gmail_header(headers: list[dict], name: str) -> str:
     return next(
@@ -477,14 +507,11 @@ async def fetch_and_save_gmail(
                         }
                 )
             else:
-                today_start = datetime.now(timezone.utc).replace(
-                    hour=0, minute=0, second=0, microsecond=0
+                ticket_number = (
+                    await next_ticket_number(db, company_id)
+                    if should_generate_ticket_number(subject, content)
+                    else ""
                 )
-                ticket_count = await db["messages"].count_documents({
-                    "company_id": ObjectId(company_id),
-                    "started_at": {"$gte": today_start},
-                })
-                ticket_number = f"CA-{today_start.strftime('%Y-%m-%d')}-{ticket_count + 1:04d}"
 
                 message_doc = {
                     "user_id": ObjectId(user_id),
@@ -494,7 +521,6 @@ async def fetch_and_save_gmail(
                     "channel": "email",
                     "status": "Open",
                     "title": subject,
-                    "ticket": ticket_number,
                     "client": sender,
                     "agent": to,
                     "messages": [chat_entry.dict()],
@@ -505,6 +531,8 @@ async def fetch_and_save_gmail(
                     "tags": [],
                     "resolved_by_ai": False
                 }
+                if ticket_number:
+                    message_doc["ticket"] = ticket_number
                 message_doc.update({k: v for k, v in message_context.items() if v})
                 await db["messages"].insert_one(message_doc)
                 # Trigger AI analysis in background for new email messages
