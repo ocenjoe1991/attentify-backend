@@ -4,6 +4,7 @@ import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
+from html.parser import HTMLParser
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -24,8 +25,46 @@ ORDER_REFERENCE_PATTERN = re.compile(
 )
 
 
+class _VisibleEmailTextExtractor(HTMLParser):
+    _ignored_tags = {"head", "style", "script", "noscript", "template", "svg"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if self.ignored_depth:
+            self.ignored_depth += 1
+            return
+        if tag.lower() in self._ignored_tags:
+            self.ignored_depth = 1
+            return
+        attributes = {name.lower(): (value or "").lower() for name, value in attrs}
+        if attributes.get("aria-hidden") == "true" or "display:none" in attributes.get("style", "").replace(" ", ""):
+            self.ignored_depth = 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.ignored_depth:
+            self.ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.ignored_depth:
+            self.parts.append(data)
+
+
+def _visible_email_text(content: str) -> str:
+    extractor = _VisibleEmailTextExtractor()
+    try:
+        extractor.feed(content or "")
+        extractor.close()
+        return re.sub(r"\s+", " ", "".join(extractor.parts)).strip()
+    except Exception:
+        return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", content or "")).strip()
+
+
 def should_generate_ticket_number(subject: str, content: str) -> bool:
-    text = unescape(re.sub(r"<[^>]+>", " ", f"{subject or ''} {content or ''}"))
+    text = f"{unescape(subject or '')} {_visible_email_text(content)}"
     return bool(ORDER_MENTION_PATTERN.search(text) or ORDER_REFERENCE_PATTERN.search(text))
 
 
