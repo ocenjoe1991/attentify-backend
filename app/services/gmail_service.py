@@ -23,6 +23,9 @@ ORDER_MENTION_PATTERN = re.compile(r"\border\b", re.IGNORECASE)
 ORDER_REFERENCE_PATTERN = re.compile(
     r"(?<![\w#])#(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{3,}\b"
 )
+UNHASHED_ORDER_REFERENCE_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])(?:[A-Z]{2,6}\d{3,}[A-Z0-9-]*|\d{3,}[A-Z]{2,6}[A-Z0-9-]*)\b"
+)
 
 
 class _VisibleEmailTextExtractor(HTMLParser):
@@ -65,7 +68,11 @@ def _visible_email_text(content: str) -> str:
 
 def should_generate_ticket_number(subject: str, content: str) -> bool:
     text = f"{unescape(subject or '')} {_visible_email_text(content)}"
-    return bool(ORDER_MENTION_PATTERN.search(text) or ORDER_REFERENCE_PATTERN.search(text))
+    return bool(
+        ORDER_MENTION_PATTERN.search(text)
+        or ORDER_REFERENCE_PATTERN.search(text)
+        or UNHASHED_ORDER_REFERENCE_PATTERN.search(text)
+    )
 
 
 async def next_ticket_number(db, company_id) -> str:
