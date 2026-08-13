@@ -174,10 +174,11 @@ def _html_to_plain_text(html: str) -> str:
 def _message_entry_timestamp(entry: dict) -> datetime:
     value = entry.get("timestamp")
     if isinstance(value, datetime):
-        return value
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
     if isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
         except ValueError:
             pass
     return datetime.min.replace(tzinfo=timezone.utc)
