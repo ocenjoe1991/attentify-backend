@@ -548,6 +548,7 @@ async def fetch_and_save_gmail(
                                 "status": "Open",
                                 "archived": False,
                                 "trashed": False,
+                                "read_by": existing_thread.get("read_by", []),
                                 **{k: v for k, v in message_context.items() if v},
                             }
                         }

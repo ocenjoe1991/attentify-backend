@@ -108,8 +108,18 @@ def _reply_recipient(client_message: dict, fallback_client: str | None) -> str:
     return fallback_client or ""
 
 
+READ_TRACKING_ROLLOUT_AT = datetime(2026, 7, 31, 17, 42, 41, tzinfo=timezone.utc)
+
+
+def has_read_tracking(doc: dict) -> bool:
+    if "read_by" in doc:
+        return True
+    started_at = _message_entry_timestamp({"timestamp": doc.get("started_at")})
+    return started_at >= READ_TRACKING_ROLLOUT_AT
+
+
 def apply_current_user_read_state(doc: dict, user_id: ObjectId) -> None:
-    if "read_by" not in doc:
+    if not has_read_tracking(doc):
         # Tickets created before read tracking was added remain read on rollout.
         doc["is_read_by_current_user"] = True
     else:
@@ -200,7 +210,7 @@ def current_user_read_entry(doc: dict, user_id: ObjectId) -> dict | None:
 
 def unviewed_customer_entries(doc: dict, user_id: ObjectId) -> list[dict]:
     entries = customer_message_entries(doc)
-    if not entries or "read_by" not in doc:
+    if not entries or not has_read_tracking(doc):
         return []
 
     read_entry = current_user_read_entry(doc, user_id)

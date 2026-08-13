@@ -1077,6 +1077,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                             "status": "Open",
                             "archived": False,
                             "trashed": False,
+                            "read_by": existing_thread.get("read_by", []),
                             **{k: v for k, v in message_context.items() if v},
                         }
                     }
