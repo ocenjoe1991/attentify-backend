@@ -1085,7 +1085,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             else:
                 ticket_number = (
                     await next_ticket_number(db, company_object_id)
-                    if should_generate_ticket_number(subject, content)
+                    if await should_generate_ticket_number(db, company_object_id, subject, content)
                     else ""
                 )
                 if ticket_number:

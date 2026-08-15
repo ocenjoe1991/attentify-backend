@@ -66,13 +66,39 @@ def _visible_email_text(content: str) -> str:
         return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", content or "")).strip()
 
 
-def should_generate_ticket_number(subject: str, content: str) -> bool:
+def _order_reference_values(text: str) -> set[str]:
+    """Return normalized order-like references found in visible email text."""
+    matches = [
+        *ORDER_REFERENCE_PATTERN.findall(text),
+        *UNHASHED_ORDER_REFERENCE_PATTERN.findall(text),
+    ]
+    return {
+        match.lstrip("#").upper()
+        for match in matches
+        if match.lstrip("#")
+    }
+
+
+async def should_generate_ticket_number(db, company_id, subject: str, content: str) -> bool:
+    """Generate tickets for order requests, or for verified order references only."""
     text = f"{unescape(subject or '')} {_visible_email_text(content)}"
-    return bool(
-        ORDER_MENTION_PATTERN.search(text)
-        or ORDER_REFERENCE_PATTERN.search(text)
-        or UNHASHED_ORDER_REFERENCE_PATTERN.search(text)
+    if ORDER_MENTION_PATTERN.search(text):
+        return True
+
+    order_references = _order_reference_values(text)
+    if not order_references:
+        return False
+
+    company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
+    matching_references = [
+        {"name": {"$regex": f"^#?{re.escape(reference)}$", "$options": "i"}}
+        for reference in order_references
+    ]
+    matching_order = await db["orders"].find_one(
+        {"company_id": company_object_id, "$or": matching_references},
+        {"_id": 1},
     )
+    return matching_order is not None
 
 
 async def next_ticket_number(db, company_id) -> str:
@@ -556,7 +582,7 @@ async def fetch_and_save_gmail(
             else:
                 ticket_number = (
                     await next_ticket_number(db, company_id)
-                    if should_generate_ticket_number(subject, content)
+                    if await should_generate_ticket_number(db, company_id, subject, content)
                     else ""
                 )
 
