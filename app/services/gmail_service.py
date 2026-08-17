@@ -19,6 +19,8 @@ import logging
 import requests
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
+TICKET_GENERATION_POLICY = "verified-order-reference-v1"
+ticket_logger = logging.getLogger("gmail.ticketing")
 ORDER_MENTION_PATTERN = re.compile(r"\border\b", re.IGNORECASE)
 ORDER_REFERENCE_PATTERN = re.compile(
     r"(?<![\w#])#(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{3,}\b"
@@ -83,10 +85,20 @@ async def should_generate_ticket_number(db, company_id, subject: str, content: s
     """Generate tickets for order requests, or for verified order references only."""
     text = f"{unescape(subject or '')} {_visible_email_text(content)}"
     if ORDER_MENTION_PATTERN.search(text):
+        ticket_logger.info(
+            "Ticket decision policy=%s company_id=%s eligible=true reason=order_keyword",
+            TICKET_GENERATION_POLICY,
+            company_id,
+        )
         return True
 
     order_references = _order_reference_values(text)
     if not order_references:
+        ticket_logger.info(
+            "Ticket decision policy=%s company_id=%s eligible=false reason=no_order_keyword_or_reference",
+            TICKET_GENERATION_POLICY,
+            company_id,
+        )
         return False
 
     company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
@@ -98,7 +110,16 @@ async def should_generate_ticket_number(db, company_id, subject: str, content: s
         {"company_id": company_object_id, "$or": matching_references},
         {"_id": 1},
     )
-    return matching_order is not None
+    eligible = matching_order is not None
+    ticket_logger.info(
+        "Ticket decision policy=%s company_id=%s eligible=%s reason=%s reference_count=%d",
+        TICKET_GENERATION_POLICY,
+        company_id,
+        str(eligible).lower(),
+        "verified_order_reference" if eligible else "unmatched_order_reference",
+        len(order_references),
+    )
+    return eligible
 
 
 async def next_ticket_number(db, company_id) -> str:
@@ -580,11 +601,10 @@ async def fetch_and_save_gmail(
                         }
                 )
             else:
-                ticket_number = (
-                    await next_ticket_number(db, company_id)
-                    if await should_generate_ticket_number(db, company_id, subject, content)
-                    else ""
+                ticket_eligible = await should_generate_ticket_number(
+                    db, company_id, subject, content
                 )
+                ticket_number = await next_ticket_number(db, company_id) if ticket_eligible else ""
 
                 message_doc = {
                     "user_id": ObjectId(user_id),
@@ -602,7 +622,9 @@ async def fetch_and_save_gmail(
                     "started_at": timestamp,
                     "ai_summary": None,
                     "tags": [],
-                    "resolved_by_ai": False
+                    "resolved_by_ai": False,
+                    "ticket_generation_policy": TICKET_GENERATION_POLICY,
+                    "ticket_generation_eligible": ticket_eligible,
                 }
                 if ticket_number:
                     message_doc["ticket"] = ticket_number

@@ -27,6 +27,7 @@ from app.services.gmail_service import (
     get_gmail_service,
     next_ticket_number,
     should_generate_ticket_number,
+    TICKET_GENERATION_POLICY,
 )
 from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
@@ -1083,11 +1084,10 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     }
                 )
             else:
-                ticket_number = (
-                    await next_ticket_number(db, company_object_id)
-                    if await should_generate_ticket_number(db, company_object_id, subject, content)
-                    else ""
+                ticket_eligible = await should_generate_ticket_number(
+                    db, company_object_id, subject, content
                 )
+                ticket_number = await next_ticket_number(db, company_object_id) if ticket_eligible else ""
                 if ticket_number:
                     logger.info("Creating ticket %s", ticket_number)
 
@@ -1107,7 +1107,9 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     "started_at": timestamp,
                     "ai_summary": None,
                     "tags": [],
-                    "resolved_by_ai": False
+                    "resolved_by_ai": False,
+                    "ticket_generation_policy": TICKET_GENERATION_POLICY,
+                    "ticket_generation_eligible": ticket_eligible,
                 }
                 if ticket_number:
                     message_doc["ticket"] = ticket_number
