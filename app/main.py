@@ -12,9 +12,8 @@ from app.db.mongodb import get_database, set_database
 from google.oauth2.credentials import Credentials
 from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
-from app.core.config import settings
+from app.core.config import service_account_info, settings
 import asyncio
-import json
 import logging
 from datetime import datetime, timezone
 
@@ -64,9 +63,9 @@ def set_gmail_watch(cred):
     return gmail.users().watch(userId="me", body=watch_request).execute()
 
 def ensure_pubsub_subscription():
-    service_account_info = json.loads(settings.SERVICE_ACCOUNT_JSON)
+    account_info = service_account_info()
     credentials = service_account.Credentials.from_service_account_info(
-        service_account_info,
+        account_info,
         scopes=["https://www.googleapis.com/auth/pubsub"],
     )
 

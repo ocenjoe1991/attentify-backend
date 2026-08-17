@@ -1,3 +1,5 @@
+import json
+
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -22,3 +24,15 @@ class Settings(BaseSettings):
         extra = "allow"
 
 settings = Settings()
+
+
+def service_account_info() -> dict:
+    """Parse Render's escaped service-account JSON safely."""
+    value = settings.SERVICE_ACCOUNT_JSON
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        # Render environment exports can preserve a backslash immediately before
+        # a physical private-key line break, which is invalid JSON.
+        normalized = value.replace("\\\r\n", "\\n").replace("\\\n", "\\n")
+        return json.loads(normalized)

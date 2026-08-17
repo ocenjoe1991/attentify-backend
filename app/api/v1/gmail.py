@@ -15,7 +15,7 @@ from google.auth.exceptions import RefreshError
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.cloud import pubsub_v1
-from app.core.config import settings
+from app.core.config import service_account_info, settings
 import asyncio
 import json
 import base64
@@ -439,9 +439,9 @@ def has_required_gmail_scopes(scope_value: str) -> bool:
 
 
 def get_pubsub_credentials():
-    service_account_info = json.loads(settings.SERVICE_ACCOUNT_JSON)
+    account_info = service_account_info()
     return service_account.Credentials.from_service_account_info(
-        service_account_info,
+        account_info,
         scopes=["https://www.googleapis.com/auth/pubsub"],
     )
 
