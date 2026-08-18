@@ -467,7 +467,12 @@ async def get_company_dashboard(
     if current_user.get("role") != ROLE_ADMIN and not membership:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
-    base_message_query = {"company_id": company_object_id}
+    # Dashboard ticket metrics must only count records that still have a ticket
+    # after ticket-policy reconciliation.
+    base_message_query = {
+        "company_id": company_object_id,
+        "ticket": {"$type": "string", "$ne": ""},
+    }
     if membership and membership.get("role") == ROLE_AGENT:
         base_message_query["assigned_member_id"] = current_user["_id"]
     open_statuses = ["Open", "Assigned", "In Progress", "Pending", "Escalated", "Awaiting Approval"]
