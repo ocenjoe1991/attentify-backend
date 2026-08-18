@@ -1,5 +1,6 @@
 import base64
 import asyncio
+import os
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -19,6 +20,7 @@ import requests
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 TICKET_GENERATION_POLICY = "verified-order-reference-v1"
+TICKET_GENERATION_RUNTIME = os.getenv("RENDER_GIT_COMMIT", "local")[:12]
 ticket_logger = logging.getLogger("gmail.ticketing")
 ORDER_MENTION_PATTERN = re.compile(r"\border\b", re.IGNORECASE)
 ORDER_REFERENCE_PATTERN = re.compile(
@@ -566,6 +568,13 @@ async def fetch_and_save_gmail(
                 ticket_eligible = await should_generate_ticket_number(
                     db, company_id, subject, content
                 )
+                ticket_logger.info(
+                    "Ticket ingest source=manual_gmail_sync runtime=%s gmail_id=%s thread_id=%s eligible=%s",
+                    TICKET_GENERATION_RUNTIME,
+                    gmail_id,
+                    thread_id,
+                    ticket_eligible,
+                )
                 ticket_number = await next_ticket_number(db, company_id) if ticket_eligible else ""
 
                 message_doc = {
@@ -587,6 +596,8 @@ async def fetch_and_save_gmail(
                     "resolved_by_ai": False,
                     "ticket_generation_policy": TICKET_GENERATION_POLICY,
                     "ticket_generation_eligible": ticket_eligible,
+                    "ticket_generation_source": "manual_gmail_sync",
+                    "ticket_generation_runtime": TICKET_GENERATION_RUNTIME,
                 }
                 if ticket_number:
                     message_doc["ticket"] = ticket_number
