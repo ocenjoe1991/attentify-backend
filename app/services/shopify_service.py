@@ -342,7 +342,11 @@ async def upsert_orders(db, shop, orders):
         }
         bulk_ops.append(
             UpdateOne(
-                {"order_id": doc["order_id"], "shop": shop},
+                {
+                    "company_id": doc["company_id"],
+                    "order_id": doc["order_id"],
+                    "shop": shop,
+                },
                 {"$set": doc},
                 upsert=True
             )

@@ -176,6 +176,10 @@ async def ensure_database_indexes(db):
     await db["orders"].create_index([("company_id", 1), ("shop", 1), ("created_at", -1)])
     await db["orders"].create_index([("company_id", 1), ("name", 1)])
     await db["orders"].create_index([("company_id", 1), ("order_id", 1)])
+    await db["orders"].create_index(
+        [("company_id", 1), ("shop", 1), ("order_id", 1)],
+        unique=True,
+    )
     await db["orders"].create_index([("company_id", 1), ("customer.email", 1)])
     ttl_index_name = "created_at_1"
     async for index in db["orders"].list_indexes():
