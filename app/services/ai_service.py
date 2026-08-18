@@ -1,6 +1,9 @@
 import os
 import re
 import logging
+import asyncio
+import time
+import requests
 from langchain_core.prompts import PromptTemplate
 from typing import List, Dict, Any
 
@@ -9,9 +12,62 @@ _logger = logging.getLogger("attentify.ai")
 # Try Gemini first, fall back to Groq (both have free tiers)
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
+GROQ_MODEL_PRIORITY = (
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.6-27b",
+    "groq/compound",
+    "groq/compound-mini",
+)
+GROQ_MODEL_CACHE_SECONDS = 24 * 60 * 60
+_groq_model_cache: tuple[float, list[str]] | None = None
 
 if not GOOGLE_API_KEY and not GROQ_API_KEY:
     raise RuntimeError("Either GOOGLE_API_KEY or GROQ_API_KEY must be set")
+
+
+def _groq_chat_model_ids(models: list[dict]) -> list[str]:
+    active_ids = {
+        str(model.get("id", ""))
+        for model in models
+        if model.get("active", True) and model.get("id")
+    }
+    preferred = [model_id for model_id in GROQ_MODEL_PRIORITY if model_id in active_ids]
+    excluded_markers = ("whisper", "audio", "tts", "orpheus", "guard", "safeguard")
+    alternatives = sorted(
+        model_id
+        for model_id in active_ids
+        if model_id not in GROQ_MODEL_PRIORITY
+        and not any(marker in model_id.lower() for marker in excluded_markers)
+    )
+    return preferred + alternatives
+
+
+async def available_groq_chat_models() -> list[str]:
+    """Return active Groq chat models, caching the account model list briefly."""
+    global _groq_model_cache
+
+    if _groq_model_cache and time.monotonic() - _groq_model_cache[0] < GROQ_MODEL_CACHE_SECONDS:
+        return _groq_model_cache[1]
+
+    def fetch_models() -> list[dict]:
+        response = requests.get(
+            GROQ_MODELS_URL,
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json().get("data", [])
+
+    try:
+        model_ids = _groq_chat_model_ids(await asyncio.to_thread(fetch_models))
+        _groq_model_cache = (time.monotonic(), model_ids)
+        _logger.info("Groq active chat models discovered: %s", ", ".join(model_ids))
+        return model_ids
+    except Exception as error:
+        _logger.warning("Unable to list Groq models: %s", str(error)[:160])
+        return list(GROQ_MODEL_PRIORITY)
 
 
 async def invoke_with_fallback(prompt):
@@ -37,15 +93,23 @@ async def invoke_with_fallback(prompt):
                 # Non-429 error, try next Gemini model
                 continue
 
-    # ---- Groq (free, fast, reliable) ----
+    # ---- Groq ----
     if GROQ_API_KEY:
         from langchain_groq import ChatGroq
-        _logger.info("Using Groq (llama-3.1-8b-instant)")
-        llm = ChatGroq(
-            model="llama-3.1-8b-instant", api_key=GROQ_API_KEY,
-            temperature=0, max_tokens=256, timeout=60, max_retries=2,
-        )
-        return await llm.ainvoke(prompt)
+        model_ids = await available_groq_chat_models()
+        groq_errors = []
+        for model_id in model_ids:
+            try:
+                _logger.info("Using Groq (%s)", model_id)
+                llm = ChatGroq(
+                    model=model_id, api_key=GROQ_API_KEY,
+                    temperature=0, max_tokens=256, timeout=60, max_retries=0,
+                )
+                return await llm.ainvoke(prompt)
+            except Exception as error:
+                groq_errors.append(f"{model_id}: {str(error)[:160]}")
+                _logger.warning("Groq %s failed: %s", model_id, str(error)[:160])
+        raise RuntimeError("All available Groq models failed: " + " | ".join(groq_errors))
 
     raise RuntimeError("All AI models failed. Check API keys.")
 
