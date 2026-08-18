@@ -179,6 +179,7 @@ async def ensure_database_indexes(db):
     await db["orders"].create_index(
         [("company_id", 1), ("shop", 1), ("order_id", 1)],
         unique=True,
+        name="company_shop_order_unique",
     )
     await db["orders"].create_index([("company_id", 1), ("customer.email", 1)])
     ttl_index_name = "created_at_1"
@@ -195,6 +196,12 @@ async def ensure_database_indexes(db):
     await db["messages"].create_index([("company_id", 1), ("status", 1), ("last_updated", -1)])
     await db["messages"].create_index([("company_id", 1), ("order_match_status", 1), ("last_updated", -1)])
     await db["messages"].create_index([("thread_id", 1), ("channel", 1)])
+    await db["messages"].create_index(
+        [("company_id", 1), ("user_id", 1), ("thread_id", 1), ("channel", 1)],
+        unique=True,
+        name="gmail_thread_unique",
+        partialFilterExpression={"channel": "email", "thread_id": {"$type": "string"}},
+    )
     await db["deleted_gmail_messages"].create_index(
         [("company_id", 1), ("user_id", 1), ("gmail_id", 1)],
         unique=True,
