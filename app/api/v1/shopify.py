@@ -1343,31 +1343,24 @@ async def get_orders(
     filter_query = {}
     if search.strip():
         search_value = search.strip()
-        order_reference = re.fullmatch(r"#?([A-Za-z]{1,6}\d{3,}[A-Za-z0-9-]*)", search_value)
-        if order_reference:
-            # Order-number searches must not return loosely related text matches.
-            filter_query["name"] = {
-                "$regex": f"^#?{re.escape(order_reference.group(1))}$",
-                "$options": "i",
-            }
-        else:
-            search_regex = {"$regex": re.escape(search_value), "$options": "i"}
-            search_or = [
-                {"name": search_regex},
-                {"customer.email": search_regex},
-                {"customer.name": search_regex},
-                {"email": search_regex},
-                {"contact_email": search_regex},
-                {"customerEmail": search_regex},
-                {"shop": search_regex},
-            ]
-            if search_value.lstrip("#").isdigit():
-                numeric_value = int(search_value.lstrip("#"))
-                search_or.extend([
-                    {"order_id": numeric_value},
-                    {"order_number": numeric_value},
-                ])
-            filter_query["$or"] = search_or
+        search_regex = {"$regex": re.escape(search_value), "$options": "i"}
+        search_or = [
+            {"name": search_regex},
+            {"customer.email": search_regex},
+            {"customer.name": search_regex},
+            {"email": search_regex},
+            {"contact_email": search_regex},
+            {"customerEmail": search_regex},
+            {"shop": search_regex},
+        ]
+        numeric_search = search_value.lstrip("#")
+        if numeric_search.isdigit():
+            numeric_value = int(numeric_search)
+            search_or.extend([
+                {"order_id": numeric_value},
+                {"order_number": numeric_value},
+            ])
+        filter_query["$or"] = search_or
     if shop:
         filter_query["shop"] = shop
     if company_id:

@@ -12,6 +12,7 @@ class ChatEntry(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     channel: Optional[Literal["chat", "sms", "email", "voice"]] = None
     message_type: Optional[Literal["text", "html", "file", "voice", "system"]] = "text"
+    search_text: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = {}
 
 class Comment(BaseModel):

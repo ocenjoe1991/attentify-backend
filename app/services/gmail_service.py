@@ -3,8 +3,6 @@ import asyncio
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from html import unescape
-from html.parser import HTMLParser
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -14,6 +12,7 @@ from app.models.message import Message, ChatEntry
 from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
 from app.services.gmail_attachment_service import extract_gmail_attachments
+from app.utils.message_text import visible_email_text
 from bson import ObjectId
 import logging
 import requests
@@ -28,44 +27,6 @@ ORDER_REFERENCE_PATTERN = re.compile(
 UNHASHED_ORDER_REFERENCE_PATTERN = re.compile(
     r"(?<![A-Za-z0-9])(?:[A-Z]{2,6}\d{3,}[A-Z0-9-]*|\d{3,}[A-Z]{2,6}[A-Z0-9-]*)\b"
 )
-
-
-class _VisibleEmailTextExtractor(HTMLParser):
-    _ignored_tags = {"head", "style", "script", "noscript", "template", "svg"}
-
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self.ignored_depth = 0
-
-    def handle_starttag(self, tag: str, attrs) -> None:
-        if self.ignored_depth:
-            self.ignored_depth += 1
-            return
-        if tag.lower() in self._ignored_tags:
-            self.ignored_depth = 1
-            return
-        attributes = {name.lower(): (value or "").lower() for name, value in attrs}
-        if attributes.get("aria-hidden") == "true" or "display:none" in attributes.get("style", "").replace(" ", ""):
-            self.ignored_depth = 1
-
-    def handle_endtag(self, tag: str) -> None:
-        if self.ignored_depth:
-            self.ignored_depth -= 1
-
-    def handle_data(self, data: str) -> None:
-        if not self.ignored_depth:
-            self.parts.append(data)
-
-
-def _visible_email_text(content: str) -> str:
-    extractor = _VisibleEmailTextExtractor()
-    try:
-        extractor.feed(content or "")
-        extractor.close()
-        return re.sub(r"\s+", " ", "".join(extractor.parts)).strip()
-    except Exception:
-        return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", content or "")).strip()
 
 
 def _order_reference_values(text: str) -> set[str]:
@@ -83,7 +44,7 @@ def _order_reference_values(text: str) -> set[str]:
 
 async def should_generate_ticket_number(db, company_id, subject: str, content: str) -> bool:
     """Generate tickets for order requests, or for verified order references only."""
-    text = f"{unescape(subject or '')} {_visible_email_text(content)}"
+    text = f"{visible_email_text(subject, is_html=False)} {visible_email_text(content, is_html=True)}"
     if ORDER_MENTION_PATTERN.search(text):
         ticket_logger.info(
             "Ticket decision policy=%s company_id=%s eligible=true reason=order_keyword",
@@ -519,6 +480,7 @@ async def fetch_and_save_gmail(
                 timestamp=timestamp,
                 channel="email",
                 message_type="html" if html_body else "text",
+                search_text=visible_email_text(content, is_html=bool(html_body)),
                 metadata={
                     "gmail_id": gmail_id,
                     "from": sender,

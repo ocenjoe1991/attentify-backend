@@ -48,6 +48,7 @@ from app.core.permissions import (
 )
 from app.core.audit import record_audit_log
 from app.utils.datetime_utils import to_utc_iso
+from app.utils.message_text import visible_email_text
 from app.main import sio
 from google.auth.exceptions import RefreshError
 from googleapiclient.errors import HttpError
@@ -169,6 +170,37 @@ def _html_to_plain_text(html: str) -> str:
         text = re.sub(r"(?is)<(style|script|head|noscript|template|svg)\b.*?</\1>", " ", html or "")
         text = re.sub(r"<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", unescape(text)).strip()
+
+
+def _entry_search_text(entry: dict) -> str:
+    return visible_email_text(
+        str(entry.get("content") or ""),
+        is_html=entry.get("message_type") == "html",
+    )
+
+
+async def _backfill_message_search_text(db: AsyncIOMotorDatabase, company_object_id: ObjectId) -> None:
+    """Populate the visible-text search field for email entries created before it existed."""
+    cursor = db["messages"].find(
+        {
+            "company_id": company_object_id,
+            "messages": {"$elemMatch": {"search_text": {"$exists": False}}},
+        },
+        {"messages": 1},
+    )
+    async for document in cursor:
+        existing_entries = document.get("messages") or []
+        normalized_entries = [
+            {**entry, "search_text": _entry_search_text(entry)}
+            if isinstance(entry, dict) and "search_text" not in entry
+            else entry
+            for entry in existing_entries
+        ]
+        # Do not overwrite an email reply that arrived while this legacy record is being normalized.
+        await db["messages"].update_one(
+            {"_id": document["_id"], "messages": existing_entries},
+            {"$set": {"messages": normalized_entries}},
+        )
 
 
 def _message_entry_timestamp(entry: dict) -> datetime:
@@ -556,11 +588,13 @@ async def get_company_messages(
 
     # Apply search filter (case-insensitive)
     if search.strip():
-        search_regex = {"$regex": search.strip(), "$options": "i"}
+        await _backfill_message_search_text(db, ObjectId(company_id))
+        search_regex = {"$regex": re.escape(search.strip()), "$options": "i"}
         search_or = [
             {"title": search_regex},
             {"client": search_regex},
             {"ticket": search_regex},
+            {"messages.search_text": search_regex},
         ]
         if "$or" in query:
             existing_or = query.pop("$or")
@@ -2595,6 +2629,7 @@ async def reply_to_message(
         "title": subject if subject.lower().startswith("re:") else f"Re: {subject}",
         "timestamp": datetime.now(timezone.utc),
         "message_type": "html",
+        "search_text": visible_email_text(content, is_html=True),
         "channel": "email",
         "metadata": {
             "gmail_id": sent.get("id"),

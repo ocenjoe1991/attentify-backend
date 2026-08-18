@@ -41,6 +41,7 @@ from app.models.gmail import (
 )
 
 from app.models.message import Message, ChatEntry 
+from app.utils.message_text import visible_email_text
 from app.utils.logger import logger
 from app.main import sio
 from app.utils.datetime_utils import to_utc_iso
@@ -1021,6 +1022,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 timestamp=timestamp,
                 channel="email",
                 message_type="html",
+                search_text=visible_email_text(content, is_html=bool(html_body)),
                 metadata={
                     "gmail_id": gmail_id,
                     "from": sender,
