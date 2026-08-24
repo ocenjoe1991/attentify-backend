@@ -13,6 +13,7 @@ from app.models.message import Message, ChatEntry
 from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
 from app.services.gmail_attachment_service import extract_gmail_attachments
+from app.services.shopify_service import sync_company_orders_incremental
 from app.utils.message_text import visible_email_text
 from bson import ObjectId
 import logging
@@ -640,7 +641,23 @@ async def fetch_and_save_gmail(
         }
     
 async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
-    cursor = db["gmail_accounts"].find({"user_id": ObjectId(user_id)})
+    company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
+    order_sync_result = await sync_company_orders_incremental(
+        db,
+        company_object_id,
+        source="manual",
+    )
+    if order_sync_result.get("errors"):
+        logging.warning(
+            "Shopify order sync completed with errors before manual Gmail sync for company %s: %s",
+            company_object_id,
+            order_sync_result["errors"],
+        )
+
+    cursor = db["gmail_accounts"].find({
+        "user_id": ObjectId(user_id),
+        "company_id": company_object_id,
+    })
     results = []
     async for cred in cursor:
         try:
@@ -685,7 +702,10 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
                 "message": f"Error: {str(e)}",
             })
 
-    return results
+    return {
+        "order_sync": order_sync_result,
+        "gmail_sync": results,
+    }
 
 def get_gmail_service(user_credentials: dict):
     """

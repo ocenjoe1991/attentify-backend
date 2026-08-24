@@ -33,6 +33,7 @@ from app.services.gmail_service import (
 from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
 from app.services.gmail_attachment_service import extract_gmail_attachments
+from app.services.shopify_service import sync_company_orders_incremental
 from google.oauth2 import service_account
 from email.utils import parsedate_to_datetime
 from app.models.gmail import (
@@ -772,6 +773,18 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
     company_id = account["company_id"]
     user_object_id = user_id if isinstance(user_id, ObjectId) else ObjectId(user_id)
     company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
+
+    order_sync_result = await sync_company_orders_incremental(
+        db,
+        company_object_id,
+        source="pubsub",
+    )
+    if order_sync_result.get("errors"):
+        logger.warning(
+            "Shopify order sync completed with errors before Gmail Pub/Sub processing for %s; continuing Gmail processing: %s",
+            email_address,
+            order_sync_result["errors"],
+        )
 
     try:
         service = get_gmail_service(account)

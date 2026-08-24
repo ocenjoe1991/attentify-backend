@@ -440,7 +440,8 @@ async def fetch_all(body: dict, db=Depends(get_database), current_user: dict = D
         raise HTTPException(status_code=400, detail="Invalid company ID")
     
     result = await fetch_all_gmail_accounts(db, user_id=str(current_user["_id"]), company_id= company_id)
-    failures = [item for item in result if item.get("status") == "failed"]
+    gmail_results = result.get("gmail_sync", []) if isinstance(result, dict) else result
+    failures = [item for item in gmail_results if item.get("status") == "failed"]
     if failures:
         raise HTTPException(status_code=424, detail=failures)
     return {"result": result}

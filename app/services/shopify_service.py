@@ -353,3 +353,68 @@ async def upsert_orders(db, shop, orders):
         )
     if bulk_ops:
         await db.orders.bulk_write(bulk_ops)
+
+
+async def sync_company_orders_incremental(db, company_id, *, source: str = "manual") -> dict:
+    """Sync connected Shopify stores before workflows that depend on fresh order data."""
+    company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
+    now = datetime.now(timezone.utc)
+    cursor = db["shopify_cred"].find({
+        "company_id": company_object_id,
+        "status": "connected",
+        "access_token": {"$exists": True, "$ne": ""},
+    })
+    synced_shops = 0
+    total_synced = 0
+    errors = []
+
+    async for cred in cursor:
+        shop = cred.get("shop")
+        access_token = cred.get("access_token")
+        if not shop or not access_token:
+            continue
+
+        try:
+            scopes = await asyncio.to_thread(fetch_access_scopes, shop, access_token)
+            if "read_all_orders" not in scopes:
+                logger.warning(
+                    "Shopify token for %s does not include read_all_orders; historical orders may be limited to recent orders.",
+                    shop,
+                )
+
+            last_synced = cred.get("last_synced_at")
+            updated_at_min = last_synced.isoformat() if last_synced else None
+            shop_synced = 0
+            async for page in fetch_order_pages_from_shop(shop, access_token, updated_at_min):
+                await upsert_orders(db, shop, page["orders"])
+                shop_synced = page["total"]
+
+            await db["shopify_cred"].update_one(
+                {"_id": cred["_id"]},
+                {"$set": {
+                    "last_synced_at": now,
+                    "last_checked_scopes": scopes,
+                    "has_read_all_orders": "read_all_orders" in scopes,
+                }},
+            )
+            synced_shops += 1
+            total_synced += shop_synced
+            logger.info(
+                "Synced %d orders for shop %s before %s Gmail sync (since %s)",
+                shop_synced,
+                shop,
+                source,
+                updated_at_min or "beginning",
+            )
+        except Exception as exc:
+            logger.error("Error syncing %s before %s Gmail sync: %s", shop, source, exc)
+            errors.append({"shop": shop, "error": str(exc)})
+
+    if synced_shops == 0:
+        logger.warning("No connected Shopify stores with access tokens found for company %s", company_object_id)
+
+    return {
+        "synced_shops": synced_shops,
+        "synced_orders": total_synced,
+        "errors": errors,
+    }
