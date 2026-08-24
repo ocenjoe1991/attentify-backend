@@ -1248,6 +1248,19 @@ async def shopify_orders_create_webhook(
         if not await db.orders.find_one({"order_id": order_document["order_id"]}):
             logger.info("Order %s not found in %s, inserting new document", order_document['order_id'], order_document['shop'])
             await db.orders.insert_one(order_document)
+            if company_id:
+                try:
+                    from app.api.v1.message import rematch_recent_order_tickets
+                    result = await rematch_recent_order_tickets(
+                        db,
+                        company_id,
+                        days=30,
+                        limit=100,
+                        source="shopify_order_created",
+                    )
+                    logger.info("Recent ticket order rematch after Shopify order create: %s", result)
+                except Exception:
+                    logger.exception("Recent ticket order rematch failed after Shopify order create for company %s", company_id)
 
         return {"success": True}
     except Exception as e:
@@ -1538,6 +1551,19 @@ async def sync_company_orders(company_id: ObjectId):
             logger.error("Error syncing %s: %s", shop, e)
     if synced_shops == 0:
         logger.warning("No connected Shopify stores with access tokens found for company %s", company_id)
+    else:
+        try:
+            from app.api.v1.message import rematch_recent_order_tickets
+            result = await rematch_recent_order_tickets(
+                db,
+                company_id,
+                days=30,
+                limit=100,
+                source="shopify_sync_complete",
+            )
+            logger.info("Recent ticket order rematch after Shopify sync: %s", result)
+        except Exception:
+            logger.exception("Recent ticket order rematch failed after Shopify sync for company %s", company_id)
     # Notify clients that sync completed for this company
     await sio.emit("shopify_sync_complete", {"company_id": str(company_id)})
 

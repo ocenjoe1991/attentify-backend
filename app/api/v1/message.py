@@ -35,7 +35,7 @@ from html import unescape
 from html.parser import HTMLParser
 import mimetypes
 from urllib.parse import quote
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parseaddr
 from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from app.core.security import get_current_user
@@ -1831,6 +1831,33 @@ def mentions_order_number(message_doc: dict) -> bool:
     return bool(re.search(r"#?[A-Za-z]{1,6}\d{3,}", message_search_text(message_doc), re.IGNORECASE))
 
 
+def order_references_from_message(message_doc: dict) -> list[str]:
+    references = []
+    order_info = message_doc.get("order_info") or {}
+    for value in [
+        order_info.get("order_id"),
+        message_doc.get("matched_order_name"),
+    ]:
+        if value:
+            references.append(str(value))
+
+    for match in re.findall(r"(?<![\w#])#?[A-Za-z]{1,6}\d{3,}[A-Za-z0-9-]*\b", message_search_text(message_doc), re.IGNORECASE):
+        references.append(match)
+
+    normalized = []
+    seen = set()
+    for reference in references:
+        value = str(reference).strip()
+        if not value:
+            continue
+        value = value if value.startswith("#") else f"#{value}"
+        key = value.upper()
+        if key not in seen:
+            seen.add(key)
+            normalized.append(value)
+    return normalized
+
+
 def message_store_shop(message_doc: dict) -> str:
     return str(message_doc.get("default_store_shop") or "").strip()
 
@@ -1919,6 +1946,128 @@ async def matched_store_fields(db: AsyncIOMotorDatabase, message_doc: dict, orde
     if cred:
         fields["default_store_id"] = cred["_id"]
     return fields
+
+
+async def rematch_message_order_from_db(
+    db: AsyncIOMotorDatabase,
+    message_doc: dict,
+    *,
+    source: str = "shopify_sync_rematch",
+) -> str:
+    if message_requires_store_scope(message_doc):
+        return "skipped_store_scope"
+
+    client_email = ""
+    client_str = message_doc.get("client") or ""
+    email_match = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', client_str)
+    if email_match:
+        client_email = email_match[0]
+
+    for order_name in order_references_from_message(message_doc):
+        db_order, store_scoped_match = await find_order_for_message(db, message_doc, order_name)
+        if not db_order:
+            continue
+
+        order_info = dict(message_doc.get("order_info") or {})
+        order_info["order_id"] = db_order.get("name") or order_name
+        order_info.setdefault("type", "")
+        order_info.setdefault("status", 1)
+        order_info["shopify_order"] = await build_order_snapshot(db, db_order)
+
+        if store_scoped_match and (not client_email or same_email(db_order.get("customer", {}).get("email", ""), client_email)):
+            store_fields = await matched_store_fields(db, message_doc, db_order)
+            await db["messages"].update_one(
+                {"_id": message_doc["_id"]},
+                {"$set": {
+                    "order_info": cacheable_order_info(
+                        order_info,
+                        source=source,
+                        keep_shopify_order=bool(order_info.get("confirmed")),
+                    ),
+                    "order_match_status": "matched",
+                    "matched_order_id": str(db_order.get("order_id", "")),
+                    "matched_order_name": db_order.get("name", ""),
+                    **store_fields,
+                }},
+            )
+            await update_message_analysis_state(db, message_doc["_id"], state="success", source=source)
+            return "matched"
+
+        order_info["msg"] = "Store not matched" if not store_scoped_match else "Email not matched"
+        await db["messages"].update_one(
+            {"_id": message_doc["_id"]},
+            {"$set": {
+                "order_info": cacheable_order_info(
+                    order_info,
+                    source=source,
+                    keep_shopify_order=bool(order_info.get("confirmed")),
+                ),
+                "order_match_status": "possible",
+                "matched_order_id": str(db_order.get("order_id", "")),
+                "matched_order_name": db_order.get("name", ""),
+            }},
+        )
+        await update_message_analysis_state(db, message_doc["_id"], state="success", source=f"{source}_possible")
+        return "possible"
+
+    return "unmatched"
+
+
+async def rematch_recent_order_tickets(
+    db: AsyncIOMotorDatabase,
+    company_id,
+    *,
+    days: int = 30,
+    limit: int = 100,
+    source: str = "shopify_sync_rematch",
+) -> dict:
+    company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    query = {
+        "company_id": company_object_id,
+        "channel": "email",
+        "status": {"$nin": ["Resolved", "Canceled"]},
+        "$and": [
+            {
+                "$or": [
+                    {"order_match_status": {"$exists": False}},
+                    {"order_match_status": {"$in": ["unmatched", "unknown", "possible", "not_order"]}},
+                ],
+            },
+            {
+                "$or": [
+                    {"last_updated": {"$gte": cutoff}},
+                    {"started_at": {"$gte": cutoff}},
+                ],
+            },
+        ],
+    }
+    cursor = db["messages"].find(query).sort("last_updated", DESCENDING).limit(limit)
+    result = {"checked": 0, "matched": 0, "possible": 0, "unmatched": 0, "skipped": 0, "errors": 0}
+
+    async for message_doc in cursor:
+        result["checked"] += 1
+        try:
+            state = await rematch_message_order_from_db(db, message_doc, source=source)
+            if state == "matched":
+                result["matched"] += 1
+            elif state == "possible":
+                result["possible"] += 1
+            elif state.startswith("skipped"):
+                result["skipped"] += 1
+            else:
+                result["unmatched"] += 1
+        except Exception:
+            result["errors"] += 1
+            logger.exception("Order rematch failed for message %s", message_doc.get("_id"))
+
+    logger.info(
+        "Order rematch completed for company %s after %s: %s",
+        company_object_id,
+        source,
+        result,
+    )
+    return result
 
 
 async def refresh_confirmed_order_if_needed(
