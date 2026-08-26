@@ -23,6 +23,7 @@ GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 TICKET_GENERATION_POLICY = "verified-order-reference-v1"
 TICKET_GENERATION_RUNTIME = os.getenv("RENDER_GIT_COMMIT", "local")[:12]
 ticket_logger = logging.getLogger("gmail.ticketing")
+sync_logger = logging.getLogger("attentify.gmail.sync")
 ORDER_MENTION_PATTERN = re.compile(r"\border\b", re.IGNORECASE)
 ORDER_REFERENCE_PATTERN = re.compile(
     r"(?<![\w#])#(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{3,}\b"
@@ -388,6 +389,7 @@ async def fetch_and_save_gmail(
 
         stored_count = 0
         updated_count = 0
+        ticket_logs = []
 
         for msg in messages:
             gmail_id = msg["id"]
@@ -528,6 +530,14 @@ async def fetch_and_save_gmail(
                 )
                 if duplicate_index is not None:
                     if not update_existing:
+                        ticket_logs.append({
+                            "event": "duplicate_message_skipped",
+                            "email": account["email"],
+                            "gmail_id": gmail_id,
+                            "thread_id": thread_id,
+                            "ticket": existing_thread.get("ticket", ""),
+                            "subject": subject or existing_thread.get("title", ""),
+                        })
                         continue
                     existing_messages[duplicate_index] = chat_entry.dict()
                     started_at, last_updated = _message_timestamp_bounds(existing_messages)
@@ -546,6 +556,14 @@ async def fetch_and_save_gmail(
                         },
                     )
                     updated_count += 1
+                    ticket_logs.append({
+                        "event": "message_updated_in_ticket",
+                        "email": account["email"],
+                        "gmail_id": gmail_id,
+                        "thread_id": thread_id,
+                        "ticket": existing_thread.get("ticket", ""),
+                        "subject": subject or existing_thread.get("title", ""),
+                    })
                     continue
                 next_messages = existing_messages + [chat_entry.dict()]
                 started_at, last_updated = _message_timestamp_bounds(next_messages)
@@ -565,6 +583,14 @@ async def fetch_and_save_gmail(
                             }
                         }
                 )
+                ticket_logs.append({
+                    "event": "message_appended_to_ticket",
+                    "email": account["email"],
+                    "gmail_id": gmail_id,
+                    "thread_id": thread_id,
+                    "ticket": existing_thread.get("ticket", ""),
+                    "subject": subject or existing_thread.get("title", ""),
+                })
             else:
                 ticket_eligible = await should_generate_ticket_number(
                     db, company_id, subject, content
@@ -604,6 +630,16 @@ async def fetch_and_save_gmail(
                     message_doc["ticket"] = ticket_number
                 message_doc.update({k: v for k, v in message_context.items() if v})
                 await db["messages"].insert_one(message_doc)
+                ticket_logs.append({
+                    "event": "ticket_created" if ticket_number else "message_stored_without_ticket",
+                    "email": account["email"],
+                    "gmail_id": gmail_id,
+                    "thread_id": thread_id,
+                    "ticket": ticket_number,
+                    "subject": subject or "",
+                    "ticket_generation_eligible": ticket_eligible,
+                    "ticket_generation_source": "manual_gmail_sync",
+                })
                 # Trigger AI analysis in background for new email messages
                 asyncio.create_task(_auto_analyze_message(db, message_doc["_id"]))
             stored_count += 1
@@ -621,6 +657,26 @@ async def fetch_and_save_gmail(
         except Exception as e:
             logging.warning(f"Could not update Gmail history_id after sync for {account['email']}: {e}")
 
+        for ticket_log in ticket_logs[-50:]:
+            sync_logger.info(
+                "Gmail ticket sync event email=%s event=%s ticket=%s gmail_id=%s subject=%s",
+                ticket_log.get("email"),
+                ticket_log.get("event"),
+                ticket_log.get("ticket"),
+                ticket_log.get("gmail_id"),
+                ticket_log.get("subject"),
+            )
+
+        sync_logger.info(
+            "Gmail sync result email=%s fetched=%s stored=%s updated=%s ticket_events=%s mode=%s",
+            account["email"],
+            len(messages),
+            stored_count,
+            updated_count,
+            len(ticket_logs),
+            f"{sync_mode}+unread" if include_unread_backfill and not force_full_sync else sync_mode,
+        )
+
         return {
             "email": account["email"],
             "status": "ok",
@@ -628,6 +684,7 @@ async def fetch_and_save_gmail(
             "updated_count": updated_count,
             "fetched_count": len(messages),
             "sync_mode": f"{sync_mode}+unread" if include_unread_backfill and not force_full_sync else sync_mode,
+            "ticket_logs": ticket_logs[-50:],
             "message": f"Fetched {len(messages)} messages, stored {stored_count} new messages, and updated {updated_count} existing messages for {account['email']}",
         }
 

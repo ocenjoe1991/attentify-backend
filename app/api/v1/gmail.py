@@ -115,7 +115,7 @@ async def mark_gmail_account_disconnected(db, account: dict, error_message: str 
     )
 
 
-async def emit_gmail_update(user_id, company_id, email_address: str) -> None:
+async def emit_gmail_update(user_id, company_id, email_address: str, sync_log: dict | None = None) -> None:
     await sio.emit(
         "gmail_update",
         {
@@ -123,6 +123,7 @@ async def emit_gmail_update(user_id, company_id, email_address: str) -> None:
             "company_id": str(company_id),
             "email": email_address,
             "message": f"New messages pushed for {email_address}",
+            "sync_log": sync_log,
         },
     )
 
@@ -1073,10 +1074,28 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             existing_thread = await db["messages"].find_one(
                 {"user_id": user_object_id, "thread_id": thread_id, "channel": "email"}
             )
+            sync_log = None
 
             if existing_thread:
                 if any(m.get("metadata", {}).get("gmail_id") == gmail_id for m in existing_thread.get("messages", [])):
                     logger.debug("Duplicate Gmail %s ignored for thread %s", gmail_id, thread_id)
+                    sync_log = {
+                        "event": "duplicate_message_skipped",
+                        "email": email_address,
+                        "gmail_id": gmail_id,
+                        "thread_id": thread_id,
+                        "ticket": existing_thread.get("ticket", ""),
+                        "subject": subject or existing_thread.get("title", ""),
+                    }
+                    logger.info(
+                        "Gmail Pub/Sub ticket sync event email=%s event=%s ticket=%s gmail_id=%s subject=%s",
+                        sync_log.get("email"),
+                        sync_log.get("event"),
+                        sync_log.get("ticket"),
+                        sync_log.get("gmail_id"),
+                        sync_log.get("subject"),
+                    )
+                    await emit_gmail_update(user_id, company_id, email_address, sync_log=sync_log)
                     continue
 
                 participants = existing_thread.get("participants", [])
@@ -1099,6 +1118,14 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                         }
                     }
                 )
+                sync_log = {
+                    "event": "message_appended_to_ticket",
+                    "email": email_address,
+                    "gmail_id": gmail_id,
+                    "thread_id": thread_id,
+                    "ticket": existing_thread.get("ticket", ""),
+                    "subject": subject or existing_thread.get("title", ""),
+                }
             else:
                 ticket_eligible = await should_generate_ticket_number(
                     db, company_object_id, subject, content
@@ -1140,8 +1167,27 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     message_doc["ticket"] = ticket_number
                 message_doc.update({k: v for k, v in message_context.items() if v})
                 await db["messages"].insert_one(message_doc)
+                sync_log = {
+                    "event": "ticket_created" if ticket_number else "message_stored_without_ticket",
+                    "email": email_address,
+                    "gmail_id": gmail_id,
+                    "thread_id": thread_id,
+                    "ticket": ticket_number,
+                    "subject": subject or "",
+                    "ticket_generation_eligible": ticket_eligible,
+                    "ticket_generation_source": "gmail_pubsub",
+                }
 
-            await emit_gmail_update(user_id, company_id, email_address)
+            if sync_log:
+                logger.info(
+                    "Gmail Pub/Sub ticket sync event email=%s event=%s ticket=%s gmail_id=%s subject=%s",
+                    sync_log.get("email"),
+                    sync_log.get("event"),
+                    sync_log.get("ticket"),
+                    sync_log.get("gmail_id"),
+                    sync_log.get("subject"),
+                )
+            await emit_gmail_update(user_id, company_id, email_address, sync_log=sync_log)
                 
     await db["gmail_accounts"].update_one(
         {"_id": account["_id"]},
