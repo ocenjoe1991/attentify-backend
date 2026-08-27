@@ -764,6 +764,11 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
         return Response(status_code=200)
 
     logger.info("Gmail change detected", extra={"email": email_address, "historyId": history_id})
+    logger.info(
+        "Gmail sync attempt source=pubsub email=%s history_id=%s",
+        email_address,
+        history_id,
+    )
 
     account = await db["gmail_accounts"].find_one({"email": email_address})
     if not account:
@@ -837,6 +842,14 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
         )
         if (sync_result or {}).get("stored_count") or (sync_result or {}).get("updated_count"):
             await emit_gmail_update(user_id, company_id, email_address)
+        logger.info(
+            "Gmail sync success source=pubsub email=%s company_id=%s mode=baseline_reset fetched=%s stored=%s updated=%s",
+            email_address,
+            company_object_id,
+            (sync_result or {}).get("fetched_count", 0),
+            (sync_result or {}).get("stored_count", 0),
+            (sync_result or {}).get("updated_count", 0),
+        )
         return Response(status_code=200)
     else:
         try:
@@ -904,6 +917,14 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 )
                 if (sync_result or {}).get("stored_count") or (sync_result or {}).get("updated_count"):
                     await emit_gmail_update(user_id, company_id, email_address)
+                logger.info(
+                    "Gmail sync success source=pubsub email=%s company_id=%s mode=history_recovery fetched=%s stored=%s updated=%s",
+                    email_address,
+                    company_object_id,
+                    (sync_result or {}).get("fetched_count", 0),
+                    (sync_result or {}).get("stored_count", 0),
+                    (sync_result or {}).get("updated_count", 0),
+                )
                 return Response(status_code=200)
             logger.error("Failed fetching Gmail history for %s", email_address, exc_info=True)
             return Response(status_code=500)
@@ -911,6 +932,8 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             logger.error("Failed fetching Gmail history for %s", email_address, exc_info=True)
             return Response(status_code=500)
 
+    processed_count = 0
+    skipped_count = 0
     for record in history:
         if "messagesAdded" not in record:
             continue
@@ -924,6 +947,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 gmail_id=gmail_id,
             ):
                 logger.debug("Deleted Gmail %s ignored for %s", gmail_id, email_address)
+                skipped_count += 1
                 continue
 
             if not await claim_gmail_message(
@@ -933,6 +957,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 gmail_id=gmail_id,
             ):
                 logger.debug("Already processed Gmail %s ignored for %s", gmail_id, email_address)
+                skipped_count += 1
                 continue
 
             try:
@@ -974,6 +999,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     user_id=user_object_id,
                     gmail_id=gmail_id,
                 )
+                skipped_count += 1
                 continue
             thread_id = full_msg.get("threadId", gmail_id)
             payload = full_msg.get("payload", {}) or {}
@@ -1188,11 +1214,20 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     sync_log.get("subject"),
                 )
             await emit_gmail_update(user_id, company_id, email_address, sync_log=sync_log)
+            processed_count += 1
                 
     await db["gmail_accounts"].update_one(
         {"_id": account["_id"]},
         {"$set": {"history_id": latest_history_id, "status": "connected"}}
     )
 
+    logger.info(
+        "Gmail sync success source=pubsub email=%s company_id=%s mode=history processed=%d skipped=%d latest_history_id=%s",
+        email_address,
+        company_object_id,
+        processed_count,
+        skipped_count,
+        latest_history_id,
+    )
     logger.info("Processed Gmail Pub/Sub for %s up to historyId=%s", email_address, latest_history_id)
     return Response(status_code=200)

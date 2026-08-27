@@ -1458,12 +1458,58 @@ async def sync_orders(
         "status": "connected",
         "access_token": {"$exists": True, "$ne": ""},
     })
+    logger.info(
+        "Shopify sync attempt source=manual_request company_id=%s user_id=%s connected_stores=%d",
+        company_object_id,
+        current_user.get("_id"),
+        connected_count,
+    )
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=current_user,
+        actor_role=membership.get("role", "unknown"),
+        action="Started Shopify order sync",
+        entity_type="shopify_order_sync",
+        details={
+            "source": "manual_request",
+            "connected_stores": connected_count,
+        },
+    )
     if connected_count == 0:
+        await record_audit_log(
+            db,
+            company_id=company_object_id,
+            actor=current_user,
+            actor_role=membership.get("role", "unknown"),
+            action="Failed Shopify order sync",
+            entity_type="shopify_order_sync",
+            details={
+                "source": "manual_request",
+                "reason": "no_connected_stores",
+            },
+        )
         raise HTTPException(
             status_code=400,
             detail="No connected Shopify stores found. Connect a store before syncing orders.",
         )
-    background_tasks.add_task(sync_company_orders, company_object_id)
+    actor_snapshot = {
+        "_id": current_user.get("_id"),
+        "first_name": current_user.get("first_name", ""),
+        "last_name": current_user.get("last_name", ""),
+        "email": current_user.get("email", ""),
+    }
+    background_tasks.add_task(
+        sync_company_orders,
+        company_object_id,
+        actor_snapshot,
+        membership.get("role", "unknown"),
+    )
+    logger.info(
+        "Shopify sync accepted source=manual_request company_id=%s user_id=%s",
+        company_object_id,
+        current_user.get("_id"),
+    )
     return {"msg": "Sync started."}
 
 # Background job: fetch and upsert all orders for all stores
@@ -1503,18 +1549,26 @@ async def sync_all_stores_orders():
             logger.error("Error syncing %s: %s", shop, e)
 
 
-async def sync_company_orders(company_id: ObjectId):
+async def sync_company_orders(company_id: ObjectId, actor: dict | None = None, actor_role: str = "unknown"):
     """Incremental sync: only fetches orders updated since last_synced_at."""
     db = get_db()
     now = datetime.now(timezone.utc)
+    logger.info("Shopify sync background attempt source=manual_request company_id=%s", company_id)
     cursor = db["shopify_cred"].find({"company_id": company_id, "status": "connected"})
     synced_shops = 0
+    total_orders_synced = 0
+    error_count = 0
     async for cred in cursor:
         shop = cred.get("shop")
         access_token = cred.get("access_token")
         if not shop or not access_token:
             continue
         try:
+            logger.info(
+                "Shopify sync attempt source=manual_request company_id=%s shop=%s mode=background_incremental",
+                company_id,
+                shop,
+            )
             scopes = await asyncio.to_thread(fetch_access_scopes, shop, access_token)
             if "read_all_orders" not in scopes:
                 logger.warning(
@@ -1545,10 +1599,24 @@ async def sync_company_orders(company_id: ObjectId):
                     "has_read_all_orders": "read_all_orders" in scopes,
                 }}
             )
+            total_orders_synced += total_synced
+            logger.info(
+                "Shopify sync success source=manual_request company_id=%s shop=%s orders=%d since=%s mode=background_incremental",
+                company_id,
+                shop,
+                total_synced,
+                updated_at_min or "beginning",
+            )
             logger.info("Synced %d orders for shop %s (since %s)", total_synced, shop, updated_at_min or "beginning")
             synced_shops += 1
         except Exception as e:
-            logger.error("Error syncing %s: %s", shop, e)
+            error_count += 1
+            logger.error(
+                "Shopify sync failed source=manual_request company_id=%s shop=%s mode=background_incremental error=%s",
+                company_id,
+                shop,
+                e,
+            )
     if synced_shops == 0:
         logger.warning("No connected Shopify stores with access tokens found for company %s", company_id)
     else:
@@ -1564,6 +1632,27 @@ async def sync_company_orders(company_id: ObjectId):
             logger.info("Recent ticket order rematch after Shopify sync: %s", result)
         except Exception:
             logger.exception("Recent ticket order rematch failed after Shopify sync for company %s", company_id)
+    logger.info(
+        "Shopify sync background complete source=manual_request company_id=%s synced_shops=%d synced_orders=%d errors=%d",
+        company_id,
+        synced_shops,
+        total_orders_synced,
+        error_count,
+    )
+    await record_audit_log(
+        db,
+        company_id=company_id,
+        actor=actor,
+        actor_role=actor_role,
+        action="Completed Shopify order sync" if error_count == 0 else "Completed Shopify order sync with errors",
+        entity_type="shopify_order_sync",
+        details={
+            "source": "manual_request",
+            "synced_shops": synced_shops,
+            "synced_orders": total_orders_synced,
+            "errors": error_count,
+        },
+    )
     # Notify clients that sync completed for this company
     await sio.emit("shopify_sync_complete", {"company_id": str(company_id)})
 

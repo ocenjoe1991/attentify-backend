@@ -699,6 +699,11 @@ async def fetch_and_save_gmail(
     
 async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
     company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
+    sync_logger.info(
+        "Gmail sync attempt source=manual_request company_id=%s user_id=%s",
+        company_object_id,
+        user_id,
+    )
     order_sync_result = await sync_company_orders_incremental(
         db,
         company_object_id,
@@ -716,7 +721,15 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
         "company_id": company_object_id,
     })
     results = []
+    account_count = 0
     async for cred in cursor:
+        account_count += 1
+        sync_logger.info(
+            "Gmail sync attempt source=manual_request company_id=%s user_id=%s email=%s",
+            company_object_id,
+            user_id,
+            cred.get("email", "unknown Gmail account"),
+        )
         try:
             token_data = {
                 "account_id": cred["_id"],
@@ -751,13 +764,49 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
                 include_unread_backfill=True,
             )
             results.append(result)
+            if result.get("status") == "ok":
+                sync_logger.info(
+                    "Gmail sync success source=manual_request company_id=%s user_id=%s email=%s fetched=%s stored=%s updated=%s ticket_events=%s",
+                    company_object_id,
+                    user_id,
+                    result.get("email"),
+                    result.get("fetched_count", 0),
+                    result.get("stored_count", 0),
+                    result.get("updated_count", 0),
+                    len(result.get("ticket_logs") or []),
+                )
+            else:
+                sync_logger.warning(
+                    "Gmail sync failed source=manual_request company_id=%s user_id=%s email=%s reason=%s message=%s",
+                    company_object_id,
+                    user_id,
+                    result.get("email"),
+                    result.get("reason"),
+                    result.get("message"),
+                )
         except Exception as e:
+            sync_logger.exception(
+                "Gmail sync failed source=manual_request company_id=%s user_id=%s email=%s",
+                company_object_id,
+                user_id,
+                cred.get("email", "unknown Gmail account"),
+            )
             results.append({
                 "email": cred.get("email", "unknown Gmail account"),
                 "status": "failed",
                 "reason": "unexpected_error",
                 "message": f"Error: {str(e)}",
             })
+
+    failed_count = sum(1 for item in results if item.get("status") == "failed")
+    sync_logger.info(
+        "Gmail sync summary source=manual_request company_id=%s user_id=%s accounts=%d succeeded=%d failed=%d",
+        company_object_id,
+        user_id,
+        account_count,
+        len(results) - failed_count,
+        failed_count,
+    )
 
     return {
         "order_sync": order_sync_result,

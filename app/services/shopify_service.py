@@ -359,6 +359,11 @@ async def sync_company_orders_incremental(db, company_id, *, source: str = "manu
     """Sync connected Shopify stores before workflows that depend on fresh order data."""
     company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
     now = datetime.now(timezone.utc)
+    logger.info(
+        "Shopify sync attempt source=%s company_id=%s mode=incremental_before_gmail",
+        source,
+        company_object_id,
+    )
     cursor = db["shopify_cred"].find({
         "company_id": company_object_id,
         "status": "connected",
@@ -375,6 +380,12 @@ async def sync_company_orders_incremental(db, company_id, *, source: str = "manu
             continue
 
         try:
+            logger.info(
+                "Shopify sync attempt source=%s company_id=%s shop=%s mode=incremental_before_gmail",
+                source,
+                company_object_id,
+                shop,
+            )
             scopes = await asyncio.to_thread(fetch_access_scopes, shop, access_token)
             if "read_all_orders" not in scopes:
                 logger.warning(
@@ -400,6 +411,14 @@ async def sync_company_orders_incremental(db, company_id, *, source: str = "manu
             synced_shops += 1
             total_synced += shop_synced
             logger.info(
+                "Shopify sync success source=%s company_id=%s shop=%s orders=%d since=%s mode=incremental_before_gmail",
+                source,
+                company_object_id,
+                shop,
+                shop_synced,
+                updated_at_min or "beginning",
+            )
+            logger.info(
                 "Synced %d orders for shop %s before %s Gmail sync (since %s)",
                 shop_synced,
                 shop,
@@ -407,11 +426,26 @@ async def sync_company_orders_incremental(db, company_id, *, source: str = "manu
                 updated_at_min or "beginning",
             )
         except Exception as exc:
-            logger.error("Error syncing %s before %s Gmail sync: %s", shop, source, exc)
+            logger.error(
+                "Shopify sync failed source=%s company_id=%s shop=%s mode=incremental_before_gmail error=%s",
+                source,
+                company_object_id,
+                shop,
+                exc,
+            )
             errors.append({"shop": shop, "error": str(exc)})
 
     if synced_shops == 0:
         logger.warning("No connected Shopify stores with access tokens found for company %s", company_object_id)
+
+    logger.info(
+        "Shopify sync summary source=%s company_id=%s mode=incremental_before_gmail synced_shops=%d synced_orders=%d errors=%d",
+        source,
+        company_object_id,
+        synced_shops,
+        total_synced,
+        len(errors),
+    )
 
     return {
         "synced_shops": synced_shops,

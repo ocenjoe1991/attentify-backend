@@ -438,12 +438,55 @@ async def fetch_all(body: dict, db=Depends(get_database), current_user: dict = D
     company_id = body.get("company_id", "")
     if not ObjectId.is_valid(company_id):
         raise HTTPException(status_code=400, detail="Invalid company ID")
-    
+    company_object_id = ObjectId(company_id)
+    membership = await db["memberships"].find_one({
+        "user_id": current_user["_id"],
+        "company_id": company_object_id,
+        "status": "active",
+    })
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=current_user,
+        actor_role=(membership or {}).get("role", "unknown"),
+        action="Started Gmail sync",
+        entity_type="gmail_sync",
+        details={"source": "manual_request"},
+    )
+
     result = await fetch_all_gmail_accounts(db, user_id=str(current_user["_id"]), company_id= company_id)
     gmail_results = result.get("gmail_sync", []) if isinstance(result, dict) else result
     failures = [item for item in gmail_results if item.get("status") == "failed"]
     if failures:
+        await record_audit_log(
+            db,
+            company_id=company_object_id,
+            actor=current_user,
+            actor_role=(membership or {}).get("role", "unknown"),
+            action="Failed Gmail sync",
+            entity_type="gmail_sync",
+            details={
+                "source": "manual_request",
+                "failed_accounts": len(failures),
+                "failures": failures,
+            },
+        )
         raise HTTPException(status_code=424, detail=failures)
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=current_user,
+        actor_role=(membership or {}).get("role", "unknown"),
+        action="Completed Gmail sync",
+        entity_type="gmail_sync",
+        details={
+            "source": "manual_request",
+            "accounts": len(gmail_results),
+            "stored_messages": sum(item.get("stored_count", 0) for item in gmail_results),
+            "updated_messages": sum(item.get("updated_count", 0) for item in gmail_results),
+            "order_sync": result.get("order_sync") if isinstance(result, dict) else None,
+        },
+    )
     return {"result": result}
 
 def extract_name(email_str: str) -> str:
