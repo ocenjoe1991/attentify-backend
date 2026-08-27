@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("attentify")
 ORDER_TTL_SECONDS = 365 * 24 * 60 * 60
+AUDIT_LOG_TTL_SECONDS = 365 * 24 * 60 * 60
 
 import socketio
 from socketio.exceptions import ConnectionRefusedError
@@ -233,6 +234,12 @@ async def ensure_database_indexes(db):
 
     # Audit logs: lookup by company + date
     await db["audit_logs"].create_index([("company_id", 1), ("created_at", -1)])
+    # TTL: auto-delete audit logs older than 1 year.
+    await db["audit_logs"].create_index(
+        "created_at",
+        expireAfterSeconds=AUDIT_LOG_TTL_SECONDS,
+        name="audit_logs_created_at_ttl_1y",
+    )
 
 
 async def migrate_order_dates(db):

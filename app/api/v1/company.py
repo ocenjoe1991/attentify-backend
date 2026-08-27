@@ -8,6 +8,7 @@ from app.core.security import get_current_user
 from typing import List
 from app.core.security import create_access_token
 from app.core.permissions import (
+    OWNER_ROLES,
     ROLE_ADMIN,
     ROLE_AGENT,
     ROLE_COMPANY_OWNER,
@@ -21,6 +22,7 @@ from pymongo import ASCENDING, DESCENDING
 router = APIRouter()
 
 VALID_MESSAGE_DELETE_ROLES = {"company_owner", "store_owner", "agent", "readonly"}
+AUDIT_LOG_DELETE_CONFIRMATION = "I want to delete audit logs for this company"
 
 def transform_company(company):
     return {
@@ -452,6 +454,49 @@ async def list_audit_logs(
     async for doc in cursor:
         logs.append(serialize_audit_log(doc))
     return {"logs": logs, "total": total, "has_more": skip + len(logs) < total}
+
+@router.delete("/{company_id}/audit-logs", response_model=dict)
+async def delete_audit_logs(
+    company_id: str,
+    body: dict = Body(...),
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_database),
+):
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid company ID")
+
+    company_object_id = ObjectId(company_id)
+    membership = await get_active_membership(db, current_user["_id"], company_object_id)
+    can_delete = current_user.get("role") == ROLE_ADMIN or (
+        membership and membership.get("role") in OWNER_ROLES
+    )
+    if not can_delete:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only company owners can delete audit logs")
+
+    confirmation = str(body.get("confirmation", "")).strip()
+    if confirmation != AUDIT_LOG_DELETE_CONFIRMATION:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Type "{AUDIT_LOG_DELETE_CONFIRMATION}" to delete audit logs',
+        )
+
+    result = await db["audit_logs"].delete_many({"company_id": company_object_id})
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=current_user,
+        actor_role=membership.get("role") if membership else ROLE_ADMIN,
+        action="Deleted audit logs",
+        entity_type="audit_log",
+        details={
+            "deleted_count": result.deleted_count,
+            "confirmation": AUDIT_LOG_DELETE_CONFIRMATION,
+        },
+    )
+    return {
+        "deleted_count": result.deleted_count,
+        "retained_notice": "A deletion audit entry was kept for accountability.",
+    }
 
 @router.get("/{company_id}/dashboard", response_model=dict)
 async def get_company_dashboard(
