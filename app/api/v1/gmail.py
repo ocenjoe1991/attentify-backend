@@ -27,6 +27,7 @@ from app.services.gmail_service import (
     get_gmail_service,
     next_ticket_number,
     should_generate_ticket_number,
+    sync_orders_before_gmail_import,
     TICKET_GENERATION_POLICY,
     TICKET_GENERATION_RUNTIME,
 )
@@ -835,6 +836,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             str(user_object_id),
             str(company_object_id),
             include_unread_backfill=True,
+            sync_source="gmail_pubsub",
         )
         await db["gmail_accounts"].update_one(
             {"_id": account["_id"]},
@@ -910,6 +912,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     str(user_object_id),
                     str(company_object_id),
                     include_unread_backfill=True,
+                    sync_source="gmail_pubsub",
                 )
                 await db["gmail_accounts"].update_one(
                     {"_id": account["_id"]},
@@ -1001,6 +1004,14 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 )
                 skipped_count += 1
                 continue
+
+            await sync_orders_before_gmail_import(
+                db,
+                company_object_id,
+                gmail_id=gmail_id,
+                email=email_address,
+                source="gmail_pubsub",
+            )
             thread_id = full_msg.get("threadId", gmail_id)
             payload = full_msg.get("payload", {}) or {}
             headers = payload.get("headers", [])

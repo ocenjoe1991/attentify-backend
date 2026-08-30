@@ -14,6 +14,7 @@ from app.services.deleted_gmail_service import is_deleted_gmail_message
 from app.services.processed_gmail_service import claim_gmail_message, release_gmail_message_claim
 from app.services.gmail_attachment_service import extract_gmail_attachments
 from app.services.shopify_service import sync_company_orders_incremental
+from app.core.audit import record_audit_log
 from app.utils.message_text import visible_email_text
 from bson import ObjectId
 import logging
@@ -213,6 +214,79 @@ def _message_timestamp_bounds(messages):
     return min(timestamps), max(timestamps)
 
 
+async def sync_orders_before_gmail_import(
+    db,
+    company_id,
+    *,
+    gmail_id: str,
+    email: str,
+    source: str,
+    actor: dict | None = None,
+    actor_role: str = "system",
+) -> dict:
+    """Sync Shopify orders immediately before importing one Gmail message."""
+    company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
+    sync_logger.info(
+        "Shopify sync attempt before Gmail import source=%s company_id=%s email=%s gmail_id=%s",
+        source,
+        company_object_id,
+        email,
+        gmail_id,
+    )
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=actor,
+        actor_role=actor_role,
+        action="Started Shopify order sync before Gmail import",
+        entity_type="shopify_order_sync",
+        details={
+            "source": source,
+            "email": email,
+            "gmail_id": gmail_id,
+        },
+    )
+
+    result = await sync_company_orders_incremental(
+        db,
+        company_object_id,
+        source=f"{source}_email_import",
+    )
+    error_count = len(result.get("errors") or [])
+    sync_logger.info(
+        "Shopify sync %s before Gmail import source=%s company_id=%s email=%s gmail_id=%s synced_shops=%s synced_orders=%s errors=%s",
+        "completed_with_errors" if error_count else "success",
+        source,
+        company_object_id,
+        email,
+        gmail_id,
+        result.get("synced_shops", 0),
+        result.get("synced_orders", 0),
+        error_count,
+    )
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=actor,
+        actor_role=actor_role,
+        action=(
+            "Completed Shopify order sync before Gmail import"
+            if not error_count
+            else "Completed Shopify order sync before Gmail import with errors"
+        ),
+        entity_type="shopify_order_sync",
+        details={
+            "source": source,
+            "email": email,
+            "gmail_id": gmail_id,
+            "synced_shops": result.get("synced_shops", 0),
+            "synced_orders": result.get("synced_orders", 0),
+            "errors": error_count,
+        },
+    )
+    return result
+
+
 async def fetch_and_save_gmail(
     account: dict,
     db,
@@ -221,6 +295,9 @@ async def fetch_and_save_gmail(
     update_existing: bool = False,
     force_full_sync: bool = False,
     include_unread_backfill: bool = False,
+    sync_audit_actor: dict | None = None,
+    sync_audit_actor_role: str = "system",
+    sync_source: str = "manual_gmail_sync",
 ):
     creds = Credentials(
         token=account["access_token"],
@@ -408,6 +485,16 @@ async def fetch_and_save_gmail(
                 gmail_id=gmail_id,
             ):
                 continue
+
+            await sync_orders_before_gmail_import(
+                db,
+                company_id,
+                gmail_id=gmail_id,
+                email=account["email"],
+                source=sync_source,
+                actor=sync_audit_actor,
+                actor_role=sync_audit_actor_role,
+            )
 
             try:
                 full_msg = service.users().messages().get(
@@ -697,7 +784,14 @@ async def fetch_and_save_gmail(
             "message": f"Failed to fetch emails for {account['email']} due to an error.",
         }
     
-async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
+async def fetch_all_gmail_accounts(
+    db,
+    user_id: str,
+    company_id: str,
+    *,
+    audit_actor: dict | None = None,
+    audit_actor_role: str = "unknown",
+):
     company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
     sync_logger.info(
         "Gmail sync attempt source=manual_request company_id=%s user_id=%s",
@@ -762,6 +856,9 @@ async def fetch_all_gmail_accounts(db, user_id: str, company_id: str):
                 user_id,
                 account_company_id,
                 include_unread_backfill=True,
+                sync_audit_actor=audit_actor,
+                sync_audit_actor_role=audit_actor_role,
+                sync_source="manual_gmail_sync",
             )
             results.append(result)
             if result.get("status") == "ok":

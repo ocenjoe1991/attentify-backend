@@ -420,7 +420,7 @@ async def list_audit_logs(
         "orders": ["order"],
         "team": ["membership", "invitation"],
         "settings": ["company"],
-        "integrations": ["shopify_cred", "gmail_account", "phone_account"],
+        "integrations": ["shopify_cred", "shopify_order_sync", "gmail_account", "gmail_sync", "phone_account"],
     }
     if category != "all":
         if category not in category_map:

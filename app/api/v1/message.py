@@ -454,7 +454,13 @@ async def fetch_all(body: dict, db=Depends(get_database), current_user: dict = D
         details={"source": "manual_request"},
     )
 
-    result = await fetch_all_gmail_accounts(db, user_id=str(current_user["_id"]), company_id= company_id)
+    result = await fetch_all_gmail_accounts(
+        db,
+        user_id=str(current_user["_id"]),
+        company_id=company_id,
+        audit_actor=current_user,
+        audit_actor_role=(membership or {}).get("role", "unknown"),
+    )
     gmail_results = result.get("gmail_sync", []) if isinstance(result, dict) else result
     failures = [item for item in gmail_results if item.get("status") == "failed"]
     if failures:
