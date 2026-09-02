@@ -35,6 +35,23 @@ def to_json_safe(value: Any) -> Any:
     return value
 
 
+def flatten_search_values(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        values = []
+        for key, item in value.items():
+            values.append(str(key).replace("_", " "))
+            values.extend(flatten_search_values(item))
+        return values
+    if isinstance(value, (list, tuple, set)):
+        values = []
+        for item in value:
+            values.extend(flatten_search_values(item))
+        return values
+    if value is None:
+        return []
+    return [str(value)]
+
+
 async def record_audit_log(
     db,
     *,
@@ -48,18 +65,36 @@ async def record_audit_log(
     customer: str = "",
     details: dict | None = None,
 ) -> None:
+    safe_details = to_json_safe(details or {})
+    safe_entity_id = to_object_id(entity_id)
+    actor_name = display_user_name(actor)
+    actor_email = actor.get("email", "") if actor else ""
+    search_values = [
+        actor_name,
+        actor_email,
+        actor_role or (actor.get("role", "unknown") if actor else "unknown"),
+        action,
+        entity_type,
+        str(safe_entity_id or ""),
+        ticket,
+        customer,
+        *flatten_search_values(safe_details),
+    ]
+    search_text = " ".join(str(value) for value in search_values if value)[:16000]
+
     await db["audit_logs"].insert_one({
         "company_id": to_object_id(company_id),
         "actor_id": actor.get("_id") if actor else None,
-        "actor_name": display_user_name(actor),
-        "actor_email": actor.get("email", "") if actor else "",
+        "actor_name": actor_name,
+        "actor_email": actor_email,
         "actor_role": actor_role or (actor.get("role", "unknown") if actor else "unknown"),
         "action": action,
         "entity_type": entity_type,
-        "entity_id": to_object_id(entity_id),
+        "entity_id": safe_entity_id,
         "ticket": ticket,
         "customer": customer,
-        "details": to_json_safe(details or {}),
+        "details": safe_details,
+        "search_text": search_text,
         "created_at": datetime.now(timezone.utc),
     })
 

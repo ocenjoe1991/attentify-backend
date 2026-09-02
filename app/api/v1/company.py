@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Query
 from datetime import datetime
+import re
 from app.models.company import CompanyCreate, SimpleCompanyOut, CompanyInDB, UpdateCompanyRequest
 from app.models.user import UserPublic
 from bson import ObjectId
@@ -428,19 +429,43 @@ async def list_audit_logs(
         query["entity_type"] = {"$in": category_map[category]}
 
     if search.strip():
-        search_regex = {"$regex": search.strip(), "$options": "i"}
-        query["$or"] = [
+        search_term = search.strip()
+        search_regex = {"$regex": re.escape(search_term), "$options": "i"}
+        search_conditions = [
+            {"search_text": search_regex},
             {"actor_name": search_regex},
             {"actor_email": search_regex},
+            {"actor_role": search_regex},
             {"action": search_regex},
+            {"entity_type": search_regex},
             {"ticket": search_regex},
             {"customer": search_regex},
             {"details.target_email": search_regex},
             {"details.order_id": search_regex},
+            {"details.shopify_order_id": search_regex},
             {"details.shop": search_regex},
             {"details.email": search_regex},
+            {"details.gmail_id": search_regex},
+            {"details.history_id": search_regex},
+            {"details.message_id": search_regex},
             {"details.phone_number": search_regex},
+            {"details.source": search_regex},
+            {"details.type": search_regex},
+            {"details.reason": search_regex},
+            {"details.label": search_regex},
+            {"details.old_role": search_regex},
+            {"details.new_role": search_regex},
+            {"details.old_status": search_regex},
+            {"details.new_status": search_regex},
+            {"details.ip": search_regex},
+            {"details.user_agent": search_regex},
+            {"details.failures.email": search_regex},
+            {"details.failures.reason": search_regex},
+            {"details.failures.message": search_regex},
         ]
+        if ObjectId.is_valid(search_term):
+            search_conditions.append({"entity_id": ObjectId(search_term)})
+        query["$or"] = search_conditions
 
     total = await db["audit_logs"].count_documents(query)
     cursor = (
