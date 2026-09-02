@@ -798,17 +798,67 @@ async def fetch_all_gmail_accounts(
         company_object_id,
         user_id,
     )
-    order_sync_result = await sync_company_orders_incremental(
+    connected_store_count = await db["shopify_cred"].count_documents({
+        "company_id": company_object_id,
+        "status": "connected",
+        "access_token": {"$exists": True, "$ne": ""},
+    })
+    await record_audit_log(
         db,
-        company_object_id,
-        source="manual",
+        company_id=company_object_id,
+        actor=audit_actor,
+        actor_role=audit_actor_role,
+        action="Started Shopify order sync before manual Gmail sync",
+        entity_type="shopify_order_sync",
+        details={
+            "source": "manual_gmail_sync",
+            "connected_stores": connected_store_count,
+        },
     )
-    if order_sync_result.get("errors"):
+
+    try:
+        order_sync_result = await sync_company_orders_incremental(
+            db,
+            company_object_id,
+            source="manual_gmail_sync",
+        )
+    except Exception as exc:
+        logging.exception(
+            "Shopify order sync failed before manual Gmail sync for company %s",
+            company_object_id,
+        )
+        order_sync_result = {
+            "synced_shops": 0,
+            "synced_orders": 0,
+            "errors": [{"error": str(exc)}],
+        }
+
+    order_sync_errors = order_sync_result.get("errors") or []
+    if order_sync_errors:
         logging.warning(
             "Shopify order sync completed with errors before manual Gmail sync for company %s: %s",
             company_object_id,
-            order_sync_result["errors"],
+            order_sync_errors,
         )
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=audit_actor,
+        actor_role=audit_actor_role,
+        action=(
+            "Completed Shopify order sync before manual Gmail sync"
+            if not order_sync_errors
+            else "Completed Shopify order sync before manual Gmail sync with errors"
+        ),
+        entity_type="shopify_order_sync",
+        details={
+            "source": "manual_gmail_sync",
+            "connected_stores": connected_store_count,
+            "synced_shops": order_sync_result.get("synced_shops", 0),
+            "synced_orders": order_sync_result.get("synced_orders", 0),
+            "errors": len(order_sync_errors),
+        },
+    )
 
     cursor = db["gmail_accounts"].find({
         "user_id": ObjectId(user_id),
