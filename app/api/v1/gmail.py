@@ -781,17 +781,71 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
     user_object_id = user_id if isinstance(user_id, ObjectId) else ObjectId(user_id)
     company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
 
-    order_sync_result = await sync_company_orders_incremental(
+    connected_store_count = await db["shopify_cred"].count_documents({
+        "company_id": company_object_id,
+        "status": "connected",
+        "access_token": {"$exists": True, "$ne": ""},
+    })
+    await record_audit_log(
         db,
-        company_object_id,
-        source="pubsub",
+        company_id=company_object_id,
+        actor=None,
+        actor_role="system",
+        action="Started Shopify order sync before automatic Gmail sync",
+        entity_type="shopify_order_sync",
+        details={
+            "source": "gmail_pubsub",
+            "email": email_address,
+            "history_id": history_id,
+            "connected_stores": connected_store_count,
+        },
     )
-    if order_sync_result.get("errors"):
+
+    try:
+        order_sync_result = await sync_company_orders_incremental(
+            db,
+            company_object_id,
+            source="gmail_pubsub",
+        )
+    except Exception as exc:
+        logger.exception(
+            "Shopify order sync failed before Gmail Pub/Sub processing for %s",
+            email_address,
+        )
+        order_sync_result = {
+            "synced_shops": 0,
+            "synced_orders": 0,
+            "errors": [{"error": str(exc)}],
+        }
+
+    order_sync_errors = order_sync_result.get("errors") or []
+    if order_sync_errors:
         logger.warning(
             "Shopify order sync completed with errors before Gmail Pub/Sub processing for %s; continuing Gmail processing: %s",
             email_address,
-            order_sync_result["errors"],
+            order_sync_errors,
         )
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=None,
+        actor_role="system",
+        action=(
+            "Completed Shopify order sync before automatic Gmail sync"
+            if not order_sync_errors
+            else "Completed Shopify order sync before automatic Gmail sync with errors"
+        ),
+        entity_type="shopify_order_sync",
+        details={
+            "source": "gmail_pubsub",
+            "email": email_address,
+            "history_id": history_id,
+            "connected_stores": connected_store_count,
+            "synced_shops": order_sync_result.get("synced_shops", 0),
+            "synced_orders": order_sync_result.get("synced_orders", 0),
+            "errors": len(order_sync_errors),
+        },
+    )
 
     try:
         service = get_gmail_service(account)
