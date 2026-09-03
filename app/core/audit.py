@@ -67,7 +67,7 @@ async def record_audit_log(
 ) -> None:
     safe_details = to_json_safe(details or {})
     safe_entity_id = to_object_id(entity_id)
-    actor_name = display_user_name(actor)
+    actor_name = display_user_name(actor) if actor else ("System" if actor_role == "system" else "Unknown user")
     actor_email = actor.get("email", "") if actor else ""
     search_values = [
         actor_name,

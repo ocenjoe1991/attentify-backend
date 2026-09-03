@@ -781,6 +781,21 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
     user_object_id = user_id if isinstance(user_id, ObjectId) else ObjectId(user_id)
     company_object_id = company_id if isinstance(company_id, ObjectId) else ObjectId(company_id)
 
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=None,
+        actor_role="system",
+        action="Started automatic Gmail sync",
+        entity_type="gmail_sync",
+        details={
+            "source": "gmail_pubsub",
+            "email": email_address,
+            "history_id": history_id,
+            "runtime": TICKET_GENERATION_RUNTIME,
+        },
+    )
+
     connected_store_count = await db["shopify_cred"].count_documents({
         "company_id": company_object_id,
         "status": "connected",
@@ -906,6 +921,23 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
             (sync_result or {}).get("stored_count", 0),
             (sync_result or {}).get("updated_count", 0),
         )
+        await record_audit_log(
+            db,
+            company_id=company_object_id,
+            actor=None,
+            actor_role="system",
+            action="Completed automatic Gmail sync",
+            entity_type="gmail_sync",
+            details={
+                "source": "gmail_pubsub",
+                "email": email_address,
+                "history_id": history_id,
+                "sync_mode": "baseline_reset",
+                "stored_messages": (sync_result or {}).get("stored_count", 0),
+                "updated_messages": (sync_result or {}).get("updated_count", 0),
+                "runtime": TICKET_GENERATION_RUNTIME,
+            },
+        )
         return Response(status_code=200)
     else:
         try:
@@ -981,6 +1013,23 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     (sync_result or {}).get("fetched_count", 0),
                     (sync_result or {}).get("stored_count", 0),
                     (sync_result or {}).get("updated_count", 0),
+                )
+                await record_audit_log(
+                    db,
+                    company_id=company_object_id,
+                    actor=None,
+                    actor_role="system",
+                    action="Completed automatic Gmail sync",
+                    entity_type="gmail_sync",
+                    details={
+                        "source": "gmail_pubsub",
+                        "email": email_address,
+                        "history_id": history_id,
+                        "sync_mode": "history_recovery",
+                        "stored_messages": (sync_result or {}).get("stored_count", 0),
+                        "updated_messages": (sync_result or {}).get("updated_count", 0),
+                        "runtime": TICKET_GENERATION_RUNTIME,
+                    },
                 )
                 return Response(status_code=200)
             logger.error("Failed fetching Gmail history for %s", email_address, exc_info=True)
@@ -1059,7 +1108,7 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 skipped_count += 1
                 continue
 
-            await sync_orders_before_gmail_import(
+            message_order_sync = await sync_orders_before_gmail_import(
                 db,
                 company_object_id,
                 gmail_id=gmail_id,
@@ -1270,6 +1319,12 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                 }
 
             if sync_log:
+                sync_log["order_sync"] = {
+                    "triggered": True,
+                    "synced_shops": message_order_sync.get("synced_shops", 0),
+                    "synced_orders": message_order_sync.get("synced_orders", 0),
+                    "errors": len(message_order_sync.get("errors") or []),
+                }
                 logger.info(
                     "Gmail Pub/Sub ticket sync event email=%s event=%s ticket=%s gmail_id=%s subject=%s",
                     sync_log.get("email"),
@@ -1277,6 +1332,28 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
                     sync_log.get("ticket"),
                     sync_log.get("gmail_id"),
                     sync_log.get("subject"),
+                )
+                await record_audit_log(
+                    db,
+                    company_id=company_object_id,
+                    actor=None,
+                    actor_role="system",
+                    action="Imported Gmail message after Shopify order sync attempt",
+                    entity_type="gmail_sync",
+                    ticket=sync_log.get("ticket", ""),
+                    customer=sender,
+                    details={
+                        "source": "gmail_pubsub",
+                        "email": email_address,
+                        "gmail_id": gmail_id,
+                        "thread_id": thread_id,
+                        "subject": subject or "",
+                        "order_sync_triggered": True,
+                        "synced_shops": message_order_sync.get("synced_shops", 0),
+                        "synced_orders": message_order_sync.get("synced_orders", 0),
+                        "errors": len(message_order_sync.get("errors") or []),
+                        "runtime": TICKET_GENERATION_RUNTIME,
+                    },
                 )
             await emit_gmail_update(user_id, company_id, email_address, sync_log=sync_log)
             processed_count += 1
@@ -1293,6 +1370,23 @@ async def pubsub_push(request: Request, db=Depends(get_database)):
         processed_count,
         skipped_count,
         latest_history_id,
+    )
+    await record_audit_log(
+        db,
+        company_id=company_object_id,
+        actor=None,
+        actor_role="system",
+        action="Completed automatic Gmail sync",
+        entity_type="gmail_sync",
+        details={
+            "source": "gmail_pubsub",
+            "email": email_address,
+            "history_id": latest_history_id,
+            "sync_mode": "history",
+            "processed_messages": processed_count,
+            "skipped_messages": skipped_count,
+            "runtime": TICKET_GENERATION_RUNTIME,
+        },
     )
     logger.info("Processed Gmail Pub/Sub for %s up to historyId=%s", email_address, latest_history_id)
     return Response(status_code=200)
