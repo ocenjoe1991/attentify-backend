@@ -197,6 +197,45 @@ def _stored_scopes(account: dict) -> set[str]:
     return scopes
 
 
+def _gmail_sync_failure(exc: Exception, email: str, stage: str) -> tuple[str, str]:
+    if isinstance(exc, RefreshError):
+        return (
+            "gmail_reconnect_required",
+            f"Google authorization for {email} has expired or was revoked. Reconnect this Gmail account.",
+        )
+
+    if isinstance(exc, HttpError):
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        error_text = str(exc).lower()
+        if status == 400 and (
+            "mail service not enabled" in error_text
+            or "failedprecondition" in error_text
+        ):
+            return (
+                "gmail_mail_service_disabled",
+                f"Gmail is not enabled for {email}. A Google Workspace administrator must enable Gmail and assign a Gmail-capable license to this account.",
+            )
+        if status in (401, 403):
+            return (
+                "gmail_permission_denied",
+                f"Google denied Gmail access for {email}. Reconnect this Gmail account and approve read/send access.",
+            )
+        if status == 429:
+            return (
+                "gmail_rate_limited",
+                f"Google temporarily rate-limited Gmail sync for {email}. Wait briefly and try again.",
+            )
+        return (
+            "gmail_api_error",
+            f"Google Gmail API failed while {stage} for {email} (HTTP {status or 'unknown'}).",
+        )
+
+    return (
+        "gmail_processing_error",
+        f"Gmail sync failed while {stage} for {email}. Check Audit Log for the failure stage.",
+    )
+
+
 def _message_timestamp_bounds(messages):
     timestamps = []
     for item in messages:
@@ -379,8 +418,10 @@ async def fetch_and_save_gmail(
     except Exception as e:
         logging.warning(f"Token scope check failed: {e}")
 
+    sync_stage = "initializing Gmail API"
+    claimed_gmail_id = None
     try:
-        service = build("gmail", "v1", credentials=creds)
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
         messages = []
         seen_gmail_ids = set()
         latest_history_id = None
@@ -393,6 +434,7 @@ async def fetch_and_save_gmail(
                 seen_gmail_ids.add(gmail_id)
 
         if force_full_sync:
+            sync_stage = "listing Gmail messages"
             page_token = None
             while True:
                 request = service.users().messages().list(
@@ -409,6 +451,7 @@ async def fetch_and_save_gmail(
         else:
             last_history_id = account.get("history_id")
             if not last_history_id:
+                sync_stage = "reading the Gmail profile"
                 profile = service.users().getProfile(userId="me").execute()
                 latest_history_id = profile.get("historyId")
                 if latest_history_id:
@@ -419,6 +462,7 @@ async def fetch_and_save_gmail(
                 sync_mode = "baseline"
 
             else:
+                sync_stage = "reading Gmail history"
                 page_token = None
                 try:
                     while True:
@@ -450,6 +494,7 @@ async def fetch_and_save_gmail(
                         raise
 
             if include_unread_backfill:
+                sync_stage = "listing unread Gmail messages"
                 page_token = None
                 while True:
                     result = service.users().messages().list(
@@ -470,6 +515,7 @@ async def fetch_and_save_gmail(
 
         for msg in messages:
             gmail_id = msg["id"]
+            sync_stage = f"preparing Gmail message {gmail_id}"
             if await is_deleted_gmail_message(
                 db,
                 company_id=company_id,
@@ -485,7 +531,9 @@ async def fetch_and_save_gmail(
                 gmail_id=gmail_id,
             ):
                 continue
+            claimed_gmail_id = gmail_id
 
+            sync_stage = f"syncing Shopify orders before Gmail message {gmail_id}"
             await sync_orders_before_gmail_import(
                 db,
                 company_id,
@@ -496,6 +544,7 @@ async def fetch_and_save_gmail(
                 actor_role=sync_audit_actor_role,
             )
 
+            sync_stage = f"fetching Gmail message {gmail_id}"
             try:
                 full_msg = service.users().messages().get(
                     userId="me", id=gmail_id, format="full"
@@ -625,6 +674,7 @@ async def fetch_and_save_gmail(
                             "ticket": existing_thread.get("ticket", ""),
                             "subject": subject or existing_thread.get("title", ""),
                         })
+                        claimed_gmail_id = None
                         continue
                     existing_messages[duplicate_index] = chat_entry.dict()
                     started_at, last_updated = _message_timestamp_bounds(existing_messages)
@@ -651,7 +701,9 @@ async def fetch_and_save_gmail(
                         "ticket": existing_thread.get("ticket", ""),
                         "subject": subject or existing_thread.get("title", ""),
                     })
+                    claimed_gmail_id = None
                     continue
+                sync_stage = f"saving Gmail message {gmail_id}"
                 next_messages = existing_messages + [chat_entry.dict()]
                 started_at, last_updated = _message_timestamp_bounds(next_messages)
                 await db["messages"].update_one(
@@ -679,6 +731,7 @@ async def fetch_and_save_gmail(
                     "subject": subject or existing_thread.get("title", ""),
                 })
             else:
+                sync_stage = f"creating a ticket for Gmail message {gmail_id}"
                 ticket_eligible = await should_generate_ticket_number(
                     db, company_id, subject, content
                 )
@@ -730,8 +783,10 @@ async def fetch_and_save_gmail(
                 # Trigger AI analysis in background for new email messages
                 asyncio.create_task(_auto_analyze_message(db, message_doc["_id"]))
             stored_count += 1
+            claimed_gmail_id = None
 
         try:
+            sync_stage = "updating Gmail history"
             if not latest_history_id:
                 profile = service.users().getProfile(userId="me").execute()
                 latest_history_id = profile.get("historyId")
@@ -739,7 +794,15 @@ async def fetch_and_save_gmail(
             if history_id:
                 await db["gmail_accounts"].update_one(
                     {"_id": account["account_id"]},
-                    {"$set": {"history_id": history_id, "status": "connected"}},
+                    {
+                        "$set": {"history_id": history_id, "status": "connected"},
+                        "$unset": {
+                            "last_error": "",
+                            "last_error_stage": "",
+                            "last_error_type": "",
+                            "last_error_at": "",
+                        },
+                    },
                 )
         except Exception as e:
             logging.warning(f"Could not update Gmail history_id after sync for {account['email']}: {e}")
@@ -776,12 +839,62 @@ async def fetch_and_save_gmail(
         }
 
     except Exception as e:
-        logging.exception(f"Error fetching emails for {account['email']}: {str(e)}")
+        if claimed_gmail_id:
+            try:
+                await release_gmail_message_claim(
+                    db,
+                    company_id=company_id,
+                    user_id=user_id,
+                    gmail_id=claimed_gmail_id,
+                )
+            except Exception:
+                logging.exception("Failed to release Gmail message claim after sync failure")
+
+        reason, user_message = _gmail_sync_failure(e, account["email"], sync_stage)
+        logging.exception(
+            "Gmail sync failed email=%s stage=%s reason=%s error_type=%s",
+            account["email"],
+            sync_stage,
+            reason,
+            type(e).__name__,
+        )
+        account_update = {
+            "last_error": user_message,
+            "last_error_stage": sync_stage,
+            "last_error_type": type(e).__name__,
+            "last_error_at": datetime.now(timezone.utc),
+        }
+        if reason in {"gmail_reconnect_required", "gmail_permission_denied"}:
+            account_update["status"] = "disconnected"
+        try:
+            await db["gmail_accounts"].update_one(
+                {"_id": account["account_id"]},
+                {"$set": account_update},
+            )
+            await record_audit_log(
+                db,
+                company_id=company_id,
+                actor=sync_audit_actor,
+                actor_role=sync_audit_actor_role,
+                action="Failed Gmail sync",
+                entity_type="gmail_sync",
+                details={
+                    "source": sync_source,
+                    "email": account["email"],
+                    "gmail_id": claimed_gmail_id or "",
+                    "failure_stage": sync_stage,
+                    "reason": reason,
+                    "error_type": type(e).__name__,
+                },
+            )
+        except Exception:
+            logging.exception("Failed to persist Gmail sync diagnostics for %s", account["email"])
         return {
             "email": account["email"],
             "status": "failed",
-            "reason": "fetch_failed",
-            "message": f"Failed to fetch emails for {account['email']} due to an error.",
+            "reason": reason,
+            "failure_stage": sync_stage,
+            "message": user_message,
         }
     
 async def fetch_all_gmail_accounts(
